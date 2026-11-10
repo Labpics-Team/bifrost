@@ -71,11 +71,27 @@ func (r *Runner) Keys(ctx context.Context) ([]EvalKey, error) {
 	return r.keys(ctx)
 }
 
-// Job is one evaluator run on one input.
+// ModelRef names the model a job calls, which decides the eval key it waits on.
+type ModelRef struct {
+	Provider string
+	Model    string
+}
+
+// Job is one unit of work for the runner. Most jobs are one evaluator run on one
+// input. A job can instead bring its own work in Exec, with the model it calls in
+// Model: a test run uses this to send a target's model call through the same per-key
+// queues, so every model call an evaluation makes is under the same concurrency cap.
 type Job struct {
 	ID         string
 	Definition Definition
 	Input      Input
+	// Model routes a job with Exec to an eval key. Nil means the job calls no model
+	// and runs on the local topic. A job without Exec is routed by its definition.
+	Model *ModelRef
+	// Exec, when set, is run in place of the evaluator. It gets a context that carries
+	// the eval key the job runs on. The store sets it when it loads the job: a job is
+	// sent through the queue by ID only.
+	Exec func(ctx context.Context) Result
 	// KeyID is the key whose queue the job waits on, or "" when it has not been routed
 	// to one. The store fills it in; callers that submit a job leave it empty.
 	KeyID string
@@ -325,8 +341,20 @@ func (r *Runner) retryResume(ctx context.Context) {
 	}
 }
 
+// Resume puts back on the queue a job that a queue which forgets its messages lost.
+// Unlike Submit, it starts from where the store says the job is: on the queue of
+// job.KeyID, and started if job.Started. A job routed to a key that is still eligible
+// goes back to that key's queue; one routed to a key that is gone moves to another, or
+// ends with an error when it had already started.
+func (r *Runner) Resume(ctx context.Context, job *Job) error {
+	if job == nil || job.ID == "" {
+		return errors.New("an evaluation job needs an ID")
+	}
+	return r.resumeJob(ctx, job)
+}
+
 func (r *Runner) resumeJob(ctx context.Context, job *Job) error {
-	_, _, needsModel := r.engine.modelOf(job.Definition)
+	_, _, needsModel := r.modelOf(job)
 	switch {
 	case job.KeyID != "" && r.isEligible(job.KeyID):
 		// Back on the queue it was on. A job that had started runs again from the top.
@@ -442,7 +470,7 @@ func (r *Runner) Sweep(ctx context.Context) error {
 		if job.KeyID == "" {
 			// Never routed. A job that needs no model sits on the local topic by design; one
 			// that needs a model was stored and then never published.
-			if _, _, needsModel := r.engine.modelOf(job.Definition); !needsModel {
+			if _, _, needsModel := r.modelOf(job); !needsModel {
 				continue
 			}
 		} else if r.isEligible(job.KeyID) {
@@ -591,7 +619,7 @@ func (r *Runner) publish(ctx context.Context, job *Job, messageID, fromKey strin
 	}
 	topic := runnerLocalTopic
 	headers := map[string]string{}
-	if provider, model, needsModel := r.engine.modelOf(job.Definition); needsModel {
+	if provider, model, needsModel := r.modelOf(job); needsModel {
 		if _, err := r.refresh(ctx); err != nil {
 			return err
 		}
@@ -629,6 +657,18 @@ func (r *Runner) publish(ctx context.Context, job *Job, messageID, fromKey strin
 		return err
 	}
 	return nil
+}
+
+// modelOf reports the model a job calls, if any: the one it names when it brings its
+// own work, and the one its evaluator needs otherwise.
+func (r *Runner) modelOf(job *Job) (provider, model string, needsModel bool) {
+	if job.Exec != nil {
+		if job.Model == nil {
+			return "", "", false
+		}
+		return job.Model.Provider, job.Model.Model, true
+	}
+	return r.engine.modelOf(job.Definition)
 }
 
 // pickKey chooses an eligible key for a provider and model. Keys are weighted by their
@@ -723,7 +763,12 @@ func (r *Runner) handler(keyID string) queue.Handler {
 		if !claimed {
 			return nil // another delivery of this job holds it
 		}
-		result := r.engine.Run(WithKeyID(ctx, keyID), job.Definition, job.Input)
+		var result Result
+		if job.Exec != nil {
+			result = job.Exec(WithKeyID(ctx, keyID))
+		} else {
+			result = r.engine.Run(WithKeyID(ctx, keyID), job.Definition, job.Input)
+		}
 		return r.complete(ctx, job, result)
 	}
 }
