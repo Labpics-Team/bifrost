@@ -5,6 +5,7 @@ import (
 
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/plugins/routing"
 )
 
 // ListAllModels includes callable routing names in the native model catalog.
@@ -14,7 +15,17 @@ func (s *BifrostHTTPServer) ListAllModels(ctx *schemas.BifrostContext, req *sche
 		req = &schemas.BifrostListModelsRequest{}
 	}
 	// Without routing, preserve the core catalog and its provider failures.
-	if _, err := s.getRoutingPlugin(); err != nil {
+	// Absence is normal here: do not allocate a configuration error for it.
+	hasRouting := false
+	if plugins := s.Config.BasePlugins.Load(); plugins != nil {
+		for _, plugin := range *plugins {
+			if p, ok := plugin.(*routing.RoutingPlugin); ok && p != nil {
+				hasRouting = true
+				break
+			}
+		}
+	}
+	if !hasRouting {
 		return s.Client.ListAllModels(ctx, req)
 	}
 	unpaged := *req
@@ -25,7 +36,13 @@ func (s *BifrostHTTPServer) ListAllModels(ctx *schemas.BifrostContext, req *sche
 	}
 	response, err := s.Client.ListAllModels(ctx, &unpaged)
 	if err != nil {
-		return nil, err
+		// A provider's discovery failure does not invalidate an authorized
+		// name from routing. Keep request-level validation and cancellation.
+		if len(aliases.Data) == 0 || err.ExtraFields.Provider == "" || ctx.Err() != nil {
+			return nil, err
+		}
+		aliases.KeyStatuses = err.ExtraFields.KeyStatuses
+		return aliases.ApplyPagination(req.PageSize, req.PageToken), nil
 	}
 	seen := make(map[string]bool, len(response.Data)+len(aliases.Data))
 	for _, model := range response.Data {

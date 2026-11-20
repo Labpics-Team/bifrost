@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -22,15 +23,21 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-func TestUnifiedModelCatalogHTTP(t *testing.T) {
+func newUnifiedModelCatalog(t testing.TB, providerStatus int) (*BifrostHTTPServer, *routing.RoutingPlugin, *router.Router) {
+	t.Helper()
 	log := bifrost.NewNoOpLogger()
 	SetLogger(log)
 	handlers.SetLogger(log)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if providerStatus != http.StatusOK {
+			w.WriteHeader(providerStatus)
+			_, _ = w.Write([]byte(`{"error":{"message":"discovery unavailable"}}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"physical","object":"model","owned_by":"test"}]}`))
 	}))
-	defer upstream.Close()
+	t.Cleanup(upstream.Close)
 	config := &lib.Config{
 		ClientConfig: &configstore.ClientConfig{}, ModelCatalog: modelcatalog.NewTestCatalog(nil),
 		Providers: map[schemas.ModelProvider]configstore.ProviderConfig{
@@ -54,11 +61,16 @@ func TestUnifiedModelCatalogHTTP(t *testing.T) {
 	config.BasePlugins.Store(&plugins)
 	client, err := bifrost.Init(context.Background(), schemas.BifrostConfig{Account: lib.NewBaseAccount(config), Logger: log, LLMPlugins: []schemas.LLMPlugin{routes, gov}})
 	require.NoError(t, err)
-	defer client.Shutdown()
+	t.Cleanup(client.Shutdown)
 	s := &BifrostHTTPServer{Config: config, Client: client, Ctx: schemas.NewBifrostContext(context.Background(), time.Time{})}
 	r := router.New()
 	handlers.NewInferenceHandler(s, client, config).RegisterRoutes(r)
 	handlers.NewIntegrationHandler(client, config, s, nil, nil, nil, nil).RegisterRoutes(r)
+	return s, routes, r
+}
+
+func TestUnifiedModelCatalogHTTP(t *testing.T) {
+	s, routes, r := newUnifiedModelCatalog(t, http.StatusOK)
 	read := func(path, key string) (int, schemas.BifrostListModelsResponse) {
 		ctx := &fasthttp.RequestCtx{}
 		ctx.Request.Header.SetMethod("GET")
@@ -96,10 +108,76 @@ func TestUnifiedModelCatalogHTTP(t *testing.T) {
 	require.Equal(t, "Base", updated.Data[0].ID)
 
 	// Deployments without routing retain the native provider catalog.
-	plugins = []schemas.BasePlugin{gov}
-	config.BasePlugins.Store(&plugins)
+	plugins := (*s.Config.BasePlugins.Load())[:1]
+	s.Config.BasePlugins.Store(&plugins)
 	status, native := read("/v1/models", "sk-bf-reader")
 	require.Equal(t, http.StatusOK, status)
 	require.Len(t, native.Data, 1)
 	require.Equal(t, "openai/physical", native.Data[0].ID)
+}
+
+func TestUnifiedModelCatalogProviderFailure(t *testing.T) {
+	s, _, r := newUnifiedModelCatalog(t, http.StatusServiceUnavailable)
+	for _, path := range []string{"/v1/models", "/openai/v1/models"} {
+		request := &fasthttp.RequestCtx{}
+		request.Request.Header.SetMethod("GET")
+		request.Request.SetRequestURI(path)
+		request.Request.Header.Set("x-bf-vk", "sk-bf-reader")
+		r.Handler(request)
+		require.Equal(t, http.StatusOK, request.Response.StatusCode(), string(request.Response.Body()))
+		var catalog schemas.BifrostListModelsResponse
+		require.NoError(t, json.Unmarshal(request.Response.Body(), &catalog))
+		require.Len(t, catalog.Data, 1)
+		require.Equal(t, "Frontier", catalog.Data[0].ID)
+	}
+	httpCtx := &fasthttp.RequestCtx{}
+	httpCtx.Request.Header.Set("x-bf-vk", "sk-bf-reader")
+	ctx, cancel := lib.ConvertToBifrostContext(httpCtx, s.Config)
+	defer cancel()
+	response, err := s.ListAllModels(ctx, nil)
+	require.Nil(t, err, "%v", err)
+	require.Equal(t, []schemas.Model{{ID: "Frontier"}}, response.Data)
+
+	ctx.SetValue(schemas.BifrostContextKeyDirectKey, schemas.Key{Value: *schemas.NewSecretVar("sk-direct")})
+	_, err = s.ListAllModels(ctx, nil)
+	require.NotNil(t, err, "a direct key must still name its provider")
+	require.Equal(t, http.StatusBadRequest, *err.StatusCode)
+}
+
+// nativeModelCatalog preserves the pre-change dispatch for the benchmark.
+type nativeModelCatalog struct{ *BifrostHTTPServer }
+
+func (n nativeModelCatalog) ListAllModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return n.Client.ListAllModels(ctx, req)
+}
+
+func BenchmarkModelCatalog(b *testing.B) {
+	for _, mode := range []string{"native", "without_routing", "with_routing_names"} {
+		b.Run(mode, func(b *testing.B) {
+			s, _, r := newUnifiedModelCatalog(b, http.StatusOK)
+			if mode == "native" {
+				r = router.New()
+				handlers.NewInferenceHandler(nativeModelCatalog{s}, s.Client, s.Config).RegisterRoutes(r)
+			}
+			if mode == "without_routing" {
+				plugins := (*s.Config.BasePlugins.Load())[:1]
+				s.Config.BasePlugins.Store(&plugins)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				ctx := &fasthttp.RequestCtx{}
+				ctx.Request.Header.SetMethod("GET")
+				ctx.Request.SetRequestURI("/v1/models")
+				ctx.Request.Header.Set("x-bf-vk", "sk-bf-reader")
+				r.Handler(ctx)
+				if ctx.Response.StatusCode() != http.StatusOK || !bytes.Contains(ctx.Response.Body(), []byte(`"openai/physical"`)) {
+					b.Fatalf("provider model missing: %s", ctx.Response.Body())
+				}
+				if bytes.Contains(ctx.Response.Body(), []byte(`"Frontier"`)) != (mode == "with_routing_names") {
+					b.Fatalf("unexpected routing model: %s", ctx.Response.Body())
+				}
+			}
+		})
+	}
 }
