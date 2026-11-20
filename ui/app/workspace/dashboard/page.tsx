@@ -35,9 +35,6 @@ const nextFrames = () =>
 
 export default function DashboardPage() {
 	const { t } = useTranslation("observability");
-	// MCP filter data
-	const { data: mcpFilterData } = useGetMCPAvailableFilterDataQuery();
-
 	const defaultTimeRange = useMemo(() => dateUtils.getDefaultTimeRange(), []);
 
 	const [timezone, setTimezone] = useTimezonePreference();
@@ -491,6 +488,10 @@ export default function DashboardPage() {
 	}, []);
 
 	const activeTab = (urlState.tab || "overview") as DashboardTab;
+	const { data: mcpFilterData } = useGetMCPAvailableFilterDataQuery(
+		{ dimensions: ["tool_names", "server_labels"] },
+		{ skip: activeTab !== "mcp" },
+	);
 
 	return (
 		<div

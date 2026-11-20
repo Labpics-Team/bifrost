@@ -354,6 +354,7 @@ var logstoreMigrationSteps = []migrationStep{
 	{IDs: []string{"relay_logs_add_large_payload_response"}, run: migrationAddRelayLogLargePayloadResponse},
 	{IDs: []string{"relay_logs_add_correlation_columns"}, run: migrationAddRelayLogCorrelationColumns},
 	{IDs: []string{"mcp_tool_logs_add_round_trip_id_column"}, run: migrationAddRoundTripIDColumnToMCPToolLogs},
+	{IDs: []string{"logs_add_sqlite_filter_indexes"}, run: migrationAddSQLiteFilterIndexes},
 }
 
 // areThereAnyPendingMigrations returns true if there are any pending migrations to be applied.
