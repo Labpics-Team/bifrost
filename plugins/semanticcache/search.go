@@ -276,6 +276,7 @@ func (plugin *Plugin) buildResponseFromResult(ctx *schemas.BifrostContext, state
 		if _, ok := plugin.store.(vectorstore.FilteredDeleter); ok {
 			// The retention worker deletes conditionally. An ID-only delete here
 			// could race with a concurrent upsert and remove a fresh response.
+			plugin.wakeMaintenance()
 			return nil, nil
 		}
 		// Async best-effort cleanup of the stale entry. Tracked on writersWg

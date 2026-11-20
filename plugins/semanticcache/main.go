@@ -172,7 +172,7 @@ type Plugin struct {
 	// writes spawned in PostLLMHook). WaitForPendingOperations blocks on this
 	// — tests use it to flush writes before asserting on the store.
 	writersWg sync.WaitGroup
-	// writersMu serializes admission with Cleanup closing stopCh. Wait runs
+	// writersMu serializes admission with namespace failure and Cleanup. Wait runs
 	// after admission is closed, so no new Add can race the final drain.
 	writersMu sync.Mutex
 	// cleanupWg tracks the stream, cacheState and persistent retention loops.
@@ -183,7 +183,7 @@ type Plugin struct {
 	// One maintenance worker owns namespace recovery and persistent expiration.
 	maintenanceCancel    context.CancelFunc
 	namespaceUnavailable atomic.Bool
-	namespaceRetry       chan struct{}
+	maintenanceWake      chan struct{}
 	// stopCh is closed by Cleanup to signal the background reaper loops to exit.
 	stopCh chan struct{}
 	// cleanupOnce guards Cleanup so close(stopCh) doesn't panic if the harness
@@ -318,11 +318,11 @@ func Init(ctx context.Context, config *Config, logger schemas.Logger, store vect
 	}
 
 	plugin := &Plugin{
-		store:          store,
-		config:         config,
-		logger:         logger,
-		stopCh:         make(chan struct{}),
-		namespaceRetry: make(chan struct{}, 1),
+		store:           store,
+		config:          config,
+		logger:          logger,
+		stopCh:          make(chan struct{}),
+		maintenanceWake: make(chan struct{}, 1),
 	}
 
 	if config.Provider == "" && config.Dimension == 1 {
@@ -393,6 +393,9 @@ func (plugin *Plugin) startRetentionCleanup() {
 			retryTimer.Stop()
 		}
 		lastError := ""
+		// One accelerated pass per interval bounds work even when deletion fails
+		// quickly or a legacy expired payload is outside the retention filter.
+		earlyRetentionAllowed := true
 		recoverNamespace := func() {
 			if !plugin.namespaceUnavailable.Load() || ctx.Err() != nil {
 				return
@@ -413,8 +416,11 @@ func (plugin *Plugin) startRetentionCleanup() {
 				retry = retryTimer.C
 				return
 			}
+			plugin.writersMu.Lock()
 			plugin.namespaceUnavailable.Store(false)
+			plugin.writersMu.Unlock()
 			lastError = ""
+			earlyRetentionAllowed = true
 			retryTimer.Stop()
 			retry = nil
 			plugin.logger.Info("Semantic cache namespace recovered")
@@ -426,11 +432,17 @@ func (plugin *Plugin) startRetentionCleanup() {
 			select {
 			case <-ctx.Done():
 				return
-			case <-plugin.namespaceRetry:
-				recoverNamespace()
+			case <-plugin.maintenanceWake:
+				if plugin.namespaceUnavailable.Load() {
+					recoverNamespace()
+				} else if hasRetention && earlyRetentionAllowed {
+					earlyRetentionAllowed = false
+					plugin.deleteExpiredEntries(ctx, deleter)
+				}
 			case <-retry:
 				recoverNamespace()
 			case <-retention:
+				earlyRetentionAllowed = true
 				if !plugin.namespaceUnavailable.Load() {
 					plugin.deleteExpiredEntries(ctx, deleter)
 				}
@@ -440,11 +452,18 @@ func (plugin *Plugin) startRetentionCleanup() {
 }
 
 func (plugin *Plugin) requestNamespaceRecovery() {
-	if plugin.namespaceUnavailable.CompareAndSwap(false, true) {
-		select {
-		case plugin.namespaceRetry <- struct{}{}:
-		default:
-		}
+	plugin.writersMu.Lock()
+	changed := plugin.namespaceUnavailable.CompareAndSwap(false, true)
+	plugin.writersMu.Unlock()
+	if changed {
+		plugin.wakeMaintenance()
+	}
+}
+
+func (plugin *Plugin) wakeMaintenance() {
+	select {
+	case plugin.maintenanceWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -1080,6 +1099,10 @@ func (plugin *Plugin) cacheWriter(storageID string, write func(ctx context.Conte
 		plugin.writersMu.Unlock()
 		return false
 	default:
+	}
+	if plugin.namespaceUnavailable.Load() {
+		plugin.writersMu.Unlock()
+		return false
 	}
 	plugin.writersWg.Add(1)
 	plugin.writersMu.Unlock()

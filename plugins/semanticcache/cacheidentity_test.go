@@ -376,10 +376,27 @@ func TestCacheIdentitySemanticGrouping(t *testing.T) {
 	if len(store.searches) != 2 {
 		t.Fatalf("expected two semantic searches, got %d", len(store.searches))
 	}
-	a, _ := filterValue(store.searches[0], "params_hash")
-	b, _ := filterValue(store.searches[1], "params_hash")
+	paramsHash := func(index int) string {
+		t.Helper()
+		value, exists := filterValue(store.searches[index], "params_hash")
+		hash, ok := value.(string)
+		if !exists || !ok || hash == "" {
+			t.Fatal("semantic searches must carry nonempty parameter hashes")
+		}
+		return hash
+	}
+	a, b := paramsHash(0), paramsHash(1)
 	if a != b {
 		t.Error("prompt polluted semantic parameter grouping")
+	}
+	changed := identityContext(t, "test", identityRef{vk: "a"})
+	changed.SetValue(CacheTypeKey, CacheTypeSemantic)
+	cacheHits(t, p, changed, identityTestChatRequest("first phrasing", map[string]interface{}{"temperature": 0.1}))
+	if len(store.searches) != 3 {
+		t.Fatalf("changed parameters did not reach semantic search: %d searches", len(store.searches))
+	}
+	if paramsHash(2) == a {
+		t.Fatal("changed inference parameters must change the semantic group")
 	}
 	ctx := identityContext(t, "test", identityRef{vk: "a"})
 	ctx.SetValue(CacheTypeKey, CacheTypeSemantic)
@@ -387,7 +404,7 @@ func TestCacheIdentitySemanticGrouping(t *testing.T) {
 	req := identityTestChatRequest("native prompt", nil)
 	req.ChatRequest.RawRequestBody = []byte(`{"messages":[],"unknown_native_content":{"text":"sensitive"}}`)
 	cacheHits(t, p, ctx, req)
-	if embeddings != 2 {
+	if embeddings != 3 {
 		t.Error("raw passthrough spent embeddings on an unsafe semantic lookup")
 	}
 }

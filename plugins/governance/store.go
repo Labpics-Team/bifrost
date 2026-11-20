@@ -2775,7 +2775,7 @@ func (gs *LocalGovernanceStore) rateLimitResetTarget(resetDuration *string, cale
 		anchor = lastReset
 	}
 	target := configstoreTables.RollingWindowStart(anchor, duration, now)
-	if target.After(lastReset) {
+	if target.After(lastReset) && !target.After(now) {
 		return &target
 	}
 	return nil
@@ -2813,6 +2813,9 @@ func (gs *LocalGovernanceStore) rateLimitNextReset(resetDuration *string, calend
 	}
 	if anchor.IsZero() {
 		anchor = lastReset
+	}
+	if anchor.After(horizon) {
+		return anchor // A future CreatedAt is itself the first due boundary.
 	}
 	next := configstoreTables.RollingWindowStart(anchor, duration, horizon).Add(duration)
 	if !next.After(now) || !next.After(lastReset) {

@@ -40,3 +40,58 @@ models:
     - BearerAuth: []
     - VirtualKeyAuth: []
     - ApiKeyAuth: []
+
+routing-models:
+  get:
+    operationId: listRoutingModels
+    summary: List public routing model names
+    description: |
+      Lists public model names declared by enabled, global, terminal routing rules
+      whose condition is an equality between `model` and a string literal.
+      Conditional, chained and scoped rules are not advertised. Names are sorted
+      and deduplicated using the first declaration with a selectable target in
+      routing priority order. A denied first selectable declaration does not
+      expose a later declaration of the same name.
+
+      Governance validates the caller's identity and required headers, and filters out names whose
+      selectable targets are not all allowed by the caller's provider, model and
+      key restrictions. This metadata read does not consume inference quota and
+      remains available when an otherwise valid caller exhausts a budget or rate
+      limit. It does not call providers or guarantee that inference will succeed.
+    tags:
+    - Models
+    parameters:
+    - name: page_size
+      in: query
+      description: Maximum number of names to return; zero or omitted returns all names
+      schema:
+        type: integer
+        minimum: 0
+    - name: page_token
+      in: query
+      description: Continuation token returned by the previous page
+      schema:
+        type: string
+    responses:
+      '200':
+        description: Public routing names visible to the caller
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/models.yaml#/ListModelsResponse'
+      '400':
+        $ref: '../../openapi.yaml#/components/responses/BadRequest'
+      '401':
+        $ref: '../../openapi.yaml#/components/responses/Unauthorized'
+      '403':
+        $ref: '../../openapi.yaml#/components/responses/Forbidden'
+      '503':
+        description: Routing model catalog unavailable
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/common.yaml#/BifrostError'
+    security:
+    - BearerAuth: []
+    - VirtualKeyAuth: []
+    - ApiKeyAuth: []

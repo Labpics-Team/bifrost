@@ -31,7 +31,9 @@
       "TestCacheAvailabilityQdrantNamespaceRPCPreservesSchemaAndAccessErrors",
       "TestCacheAvailabilityQdrantLostCollectionAllowsRecoveryAndPointMissDoesNot",
       "TestCacheAvailabilityQdrantPointOperationsPreserveSchemaAndAccessErrors",
-      "TestCacheAvailabilityIsUnavailable"
+      "TestCacheAvailabilityIsUnavailable",
+      "TestCacheRetentionQdrantRequiresIntegerFilters",
+      "TestCacheRetentionQdrantUsesSingleFilteredDeleteRPC"
     ],
     "github.com/maximhq/bifrost/plugins/semanticcache": [
       "TestCacheIdentityExactInput",
@@ -54,7 +56,10 @@
       "TestCacheAvailabilityEmbeddingKeepsCallerDeadline",
       "TestCacheAvailabilityStoreReadDeadlines",
       "TestCacheAvailabilityCallerCancellationPreservesNamespace",
-      "TestCacheAvailabilityHangingStartupAndCleanup"
+      "TestCacheAvailabilityHangingStartupAndCleanup",
+      "TestCacheAvailabilityWriterAdmissionDuringRecovery",
+      "TestCacheRetentionExpiredHitWakesSerialWorker",
+      "TestCacheRetentionWakeBackoff"
     ],
     "github.com/maximhq/bifrost/transports/v2/bifrost-http/lib": [
       "TestConvertToBifrostContextCancelsWhenClientDisconnects",
@@ -75,7 +80,8 @@
       "TestStreamingResponsePanicErrorFrameStripsExtraFieldsInHeadersMode",
       "TestStreamingResponseTeardownPanicIsRecovered",
       "TestCacheAvailabilityReadinessAndDiagnosticHealth",
-      "TestCacheAvailabilityReadinessKeepsAdminAuthentication"
+      "TestCacheAvailabilityReadinessKeepsAdminAuthentication",
+      "TestNativeBetaHeadersPreserveHookKey"
     ],
     "github.com/maximhq/bifrost/transports/v2/bifrost-http/integrations": [
       "TestStreamErrorEventFramingPerRoute",
@@ -105,7 +111,9 @@
       "TestStreamTTFTLeavesTimelyOrUnconfiguredPrimaryAlone",
       "TestRetryBackoffStopsWhenRequestCancelled",
       "TestRetryBackoffStopsWhenRequestDeadlineExpires",
-      "TestScenarioEveryKeyRefusedIsTriedOnce"
+      "TestScenarioEveryKeyRefusedIsTriedOnce",
+      "TestOwnedStreamCancellationDoesNotWaitForReader",
+      "TestOwnedStreamCancellationIsNotCleanEOF"
     ],
     "github.com/maximhq/bifrost/core/providers/utils": [
       "TestContextTransport_TruncatedContentLengthStreamReportsUnexpectedEOFAndDiscardsConn",
@@ -123,20 +131,24 @@
       "TestCancellationKeepsFirstError",
       "TestCancellationCausePreservesFirstCancellation",
       "TestCancellationPreservesParentTimeoutCause",
-      "TestListModelsPaginationLargePage"
+      "TestListModelsPaginationLargePage",
+      "TestFasthttpContextCancellationReachesChildrenSynchronously",
+      "TestFasthttpContextChildDeadlineStaysIndependent"
     ],
     "github.com/maximhq/bifrost/plugins/governance": [
       "TestRateLimitFeedbackWindows",
       "TestRateLimitFeedbackOverlappingWindows",
       "TestRateLimitFeedbackResolver",
       "TestRateLimitFeedbackRefusal",
-      "TestRateLimitFeedbackAdmission"
+      "TestRateLimitFeedbackAdmission",
+      "TestRateLimitFeedbackFutureAnchor"
     ],
     "github.com/maximhq/bifrost/plugins/routing": [
       "TestRoutingModelsLiveDeclaration",
       "TestRoutingModelsDeclarationAndTargetPermissions",
       "TestRoutingModelsFirstDeclarationAndSortedNames",
-      "TestRoutingModelsFollowsNativeProviderNamespace"
+      "TestRoutingModelsFollowsNativeProviderNamespace",
+      "TestRoutingModelsSkipsTargetlessFirstDeclaration"
     ],
     "github.com/maximhq/bifrost/plugins/routing/complexity": [
       "TestSemanticClassifierDeclaresItsQueryFilterIndexes"

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/iotest"
@@ -1168,12 +1169,16 @@ func TestContextTransportAcceptedPooledRequestIsNotRepeated(t *testing.T) {
 	}
 	t.Cleanup(func() { ln.Close() })
 	var accepted atomic.Int32
+	var connections atomic.Int32
+	var bodiesMu sync.Mutex
+	var bodyConnections []int32
 	go func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
+			connectionID := connections.Add(1)
 			go func() {
 				defer conn.Close()
 				reader := bufio.NewReader(conn)
@@ -1187,6 +1192,9 @@ func TestContextTransportAcceptedPooledRequestIsNotRepeated(t *testing.T) {
 					if err != nil {
 						return
 					}
+					bodiesMu.Lock()
+					bodyConnections = append(bodyConnections, connectionID)
+					bodiesMu.Unlock()
 					if accepted.Add(1) != 1 {
 						return
 					}
@@ -1211,5 +1219,10 @@ func TestContextTransportAcceptedPooledRequestIsNotRepeated(t *testing.T) {
 	}
 	if got := accepted.Load(); got != 2 {
 		t.Fatalf("warm request + accepted inference produced %d bodies; want 2", got)
+	}
+	bodiesMu.Lock()
+	defer bodiesMu.Unlock()
+	if len(bodyConnections) != 2 || bodyConnections[0] != 1 || bodyConnections[1] != 1 {
+		t.Fatalf("both POST bodies must use the first pooled connection, got connection IDs %v", bodyConnections)
 	}
 }

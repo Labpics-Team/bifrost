@@ -3,6 +3,7 @@ package schemas
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -93,7 +94,7 @@ func TestKeyStatusMarshalJSON_PreservesErrorFields(t *testing.T) {
 		StatusCode:     &statusCode,
 		Error:          &ErrorField{Message: "unauthorized"},
 		ExtraFields: BifrostErrorExtraFields{
-			Provider:       "openai",
+			Provider:               "openai",
 			OriginalModelRequested: "gpt-4",
 		},
 	}
@@ -239,4 +240,16 @@ func TestApplyPagination_CollectsEveryRowOnceAcrossShiftingListings(t *testing.T
 func TestApplyPagination_StableListingUnchanged(t *testing.T) {
 	l := pageModels("a", "b", "c", "d", "e")
 	assert.Equal(t, []string{"a", "b", "c", "d", "e"}, collectAllPages(2, l, l, l))
+}
+
+func TestListModelsPaginationLargePage(t *testing.T) {
+	response := &BifrostListModelsResponse{Data: []Model{{ID: "A"}, {ID: "B"}, {ID: "C"}}}
+	first := response.ApplyPagination(1, "")
+	if first.NextPageToken == "" {
+		t.Fatal("first page must have a continuation")
+	}
+	last := response.ApplyPagination(int(^uint(0)>>1), first.NextPageToken)
+	if !reflect.DeepEqual(last.Data, response.Data[1:]) || last.NextPageToken != "" {
+		t.Fatalf("large page must contain the remaining models: %#v", last)
+	}
 }

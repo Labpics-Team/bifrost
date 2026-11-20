@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
@@ -9564,6 +9565,77 @@ func TestNilContextFiniteStreamCompletesBeforeRead(t *testing.T) {
 	}
 	if client.ctx.Err() != nil {
 		t.Fatal("request completion cancelled the client")
+	}
+}
+
+func TestOwnedStreamCancellationIsNotCleanEOF(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		bufferedFinal bool
+		closedSource  bool
+	}{
+		{name: "buffered_final=false"},
+		{name: "buffered_final=true", bufferedFinal: true, closedSource: true},
+		{name: "closed_source", closedSource: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for i := range 32 {
+				ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+				source := make(chan *schemas.BifrostStreamChunk, 1)
+				terminal := &schemas.BifrostStreamChunk{BifrostChatResponse: &schemas.BifrostChatResponse{
+					Choices: []schemas.BifrostResponseChoice{{FinishReason: schemas.Ptr("stop")}},
+				}}
+				if tc.bufferedFinal {
+					source <- terminal
+				}
+				if tc.closedSource {
+					close(source)
+				}
+				ctx.Cancel()
+				output := finishOwnedRequestStream(ctx, source)
+				observedTerminal := false
+				for chunk := range output {
+					if chunk == terminal {
+						observedTerminal = true
+					}
+					if chunk.BifrostError != nil && chunk.BifrostError.Error != nil && chunk.BifrostError.Error.Type != nil && *chunk.BifrostError.Error.Type == schemas.RequestCancelled {
+						observedTerminal = true
+					}
+				}
+				if !observedTerminal {
+					t.Fatalf("iteration %d: cancellation ended the stream without its final chunk or a cancellation error", i)
+				}
+			}
+		})
+	}
+}
+
+func TestOwnedStreamCancellationDoesNotWaitForReader(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		defer ctx.Cancel()
+		source := make(chan *schemas.BifrostStreamChunk, 1)
+		_ = finishOwnedRequestStream(ctx, source)
+		source <- &schemas.BifrostStreamChunk{}
+		synctest.Wait()
+		source <- &schemas.BifrostStreamChunk{}
+		synctest.Wait()
+		ctx.Cancel()
+		// The bubble must exit even though its returned stream is never read.
+		synctest.Wait()
+	})
+}
+
+func BenchmarkOwnedRequestStream(b *testing.B) {
+	chunk := &schemas.BifrostStreamChunk{}
+	b.ReportAllocs()
+	for b.Loop() {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		source := make(chan *schemas.BifrostStreamChunk, 1)
+		source <- chunk
+		close(source)
+		for range finishOwnedRequestStream(ctx, source) {
+		}
 	}
 }
 

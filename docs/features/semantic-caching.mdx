@@ -591,7 +591,7 @@ ctx = context.WithValue(ctx, semanticcache.CacheNoStoreKey, true)
 </Tabs>
 
 <Note>
-In direct-only mode (no embedding provider), `x-bf-cache-type` and `x-bf-cache-threshold` have no effect — every request uses direct matching.
+In direct-only mode (no embedding provider), omit `x-bf-cache-type` or set it to `direct`. Selecting `semantic` skips caching for that request because no semantic path is configured. `x-bf-cache-threshold` only controls semantic matching and does not affect direct matching.
 </Note>
 
 ---

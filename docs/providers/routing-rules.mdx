@@ -59,6 +59,25 @@ Evaluation order:
 First match → Decision
 ```
 
+## Discover public model names
+
+`GET /v1/routing/models` (`GET /bifrost/v1/routing/models` when `server.base_path`
+is `/bifrost`) lists public names declared by enabled global rules such as
+`model == "fast-chat"`. A rule must be terminal and have a selectable target;
+rules with additional conditions, chained rules and rules scoped to a virtual
+key, team or customer are not advertised. The response uses the same `data` and
+`next_page_token` fields as `/v1/models` (`/bifrost/v1/models` with that prefix),
+with `page_size` and `page_token` for pagination. Each model's `id` is its public
+routing name. Duplicate names follow the first declaration with a selectable
+target in routing priority order.
+
+The catalog applies the caller's identity and provider, model and key
+restrictions. A name is visible only when all of its selectable targets are
+allowed. Reading it does not consume inference quota, so an exhausted budget or
+rate limit does not hide otherwise permitted names. The catalog describes
+configured routing declarations; it does not contact providers or promise that a
+subsequent inference request will succeed.
+
 ## CEL Expression Guide
 
 ### Available Variables

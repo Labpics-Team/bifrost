@@ -140,7 +140,7 @@ func NewBifrostContext(parent context.Context, deadline time.Time) *BifrostConte
 	if isNonCancellingContext(parent) {
 		// fasthttp recycles RequestCtx and does not cancel it. Its deadline was
 		// captured above; never leave a cancellation observer reading it later.
-		cancellationParent = context.WithoutCancel(parent)
+		cancellationParent = context.Background()
 		if hasInheritedDeadline && (deadline.IsZero() || !deadline.Before(inherited)) {
 			deadline = inherited
 		}
@@ -389,14 +389,10 @@ func (bc *BifrostContext) Value(key any) any {
 		return nil
 	}
 
-	// Never read through to a pooled *fasthttp.RequestCtx parent — it's recycled once the handler returns.
-	if isNonCancellingContext(bc.parent) {
-		return nil
-	}
-
 	// Resolve inherited values through our native cancellation context. It
 	// exposes this request's cancellation identity before inherited metadata,
-	// so Cause stays with the same first cancellation as Done and Err.
+	// so Cause stays with the same first cancellation as Done and Err. A
+	// fasthttp-derived cancellation context is detached from the pooled parent.
 	if bc.cancellation == nil {
 		return nil
 	}

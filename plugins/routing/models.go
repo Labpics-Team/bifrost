@@ -35,7 +35,6 @@ func (p *RoutingPlugin) ListModels(ctx context.Context, access schemas.Access) (
 		if name == "" || requestModel != name || seen[name] {
 			continue
 		}
-		seen[name] = true // A denied first declaration cannot reveal a later one.
 		positive := false
 		for _, target := range rule.Targets {
 			positive = positive || target.Weight > 0
@@ -67,7 +66,11 @@ func (p *RoutingPlugin) ListModels(ctx context.Context, access schemas.Access) (
 				}
 			}
 		}
-		if allowed && selectable {
+		if !selectable {
+			continue // The routing engine skips rules without a usable target.
+		}
+		seen[name] = true // A denied first declaration cannot reveal a later one.
+		if allowed {
 			models = append(models, schemas.Model{ID: name})
 		}
 	}

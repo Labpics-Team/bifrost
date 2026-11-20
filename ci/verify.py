@@ -72,6 +72,13 @@ def workspace(root):
     env = {**os.environ, "GOWORK": str(root / "go.work")}
     if not (root / "go.work").exists():
         run(["go", "work", "init"], root, env)
+    existing = json.loads(run(["go", "work", "edit", "-json"], root, env))
+    # A plugin can disappear after a branch switch. Remove its stale use entry
+    # before `go work use` tries to load every module in the existing workspace.
+    missing = [entry["DiskPath"] for entry in existing.get("Use") or []
+               if not (root / entry["DiskPath"] / "go.mod").is_file()]
+    if missing:
+        run(["go", "work", "edit", *[f"-dropuse={path}" for path in missing]], root, env)
     run(["go", "work", "use", *[str(path) for path in modules.values()]], root, env)
     for name, expected in modules.items():
         result = run(["go", "list", "-m", "-f", "{{.Dir}}|{{.Main}}", name], root, env).strip()
@@ -94,7 +101,10 @@ def changed_go_files(root, manifest):
         ["git", "diff", "--name-only", "-z", "--no-renames", "--diff-filter=ACDMRT",
          base, "--", "*.go"], cwd=root,
     )
-    return [os.fsdecode(path) for path in changed.split(b"\0") if path]
+    untracked = subprocess.check_output(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", "*.go"], cwd=root,
+    )
+    return sorted({os.fsdecode(path) for path in (changed + untracked).split(b"\0") if path})
 
 
 def check_format(root, manifest):

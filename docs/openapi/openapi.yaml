@@ -175,6 +175,8 @@ paths:
   # ==================== Unified Inference API ====================
   /v1/models:
     $ref: "./paths/inference/models.yaml#/models"
+  /v1/routing/models:
+    $ref: "./paths/inference/models.yaml#/routing-models"
   /v1/chat/completions:
     $ref: "./paths/inference/chat-completions.yaml#/chat-completions"
   /v1/completions:
@@ -745,6 +747,8 @@ paths:
   # Health
   /health:
     $ref: "./paths/management/health.yaml#/health"
+  /readyz:
+    $ref: "./paths/management/health.yaml#/readiness"
 
   # Configuration
   /api/config:

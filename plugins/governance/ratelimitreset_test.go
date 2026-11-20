@@ -960,6 +960,51 @@ func TestRateLimitFeedbackWindows(t *testing.T) {
 	}
 }
 
+func TestRateLimitFeedbackFutureAnchor(t *testing.T) {
+	now := time.Now()
+	store := newStandaloneStoreForResetBenchmark()
+	row := &configstoreTables.TableRateLimit{
+		ID: "future-anchor", CreatedAt: now.Add(time.Hour),
+		TokenMaxLimit: new(int64(1)), TokenCurrentUsage: 1,
+		RequestMaxLimit: new(int64(1)), RequestCurrentUsage: 1,
+		TokenResetDuration: new("1m"), RequestResetDuration: new("1m"),
+		TokenLastReset: now.Add(-time.Minute), RequestLastReset: now.Add(-time.Minute),
+	}
+	ctx := context.Background()
+	decision, err := store.checkRateLimit(ctx, EntityWiseRateLimits{"key": {row}}, nil, nil, now)
+	if decision != DecisionRateLimited || err == nil {
+		t.Fatalf("future reset cannot admit an exhausted counter: %s, %v", decision, err)
+	}
+	if next := store.rateLimitNextReset(row.RequestResetDuration, false, row.CreatedAt, row.RequestLastReset, now); !next.Equal(row.CreatedAt) {
+		t.Fatalf("first due reset = %v, want anchor %v", next, row.CreatedAt)
+	}
+	store.rateLimits.Store(row.ID, row)
+	if err := store.BumpRateLimitUsage(ctx, row.ID, 1, true, true); err != nil {
+		t.Fatal(err)
+	}
+	got := store.LoadRateLimit(ctx, row.ID)
+	if got.TokenCurrentUsage != 2 || got.RequestCurrentUsage != 2 || !got.TokenLastReset.Equal(row.TokenLastReset) || !got.RequestLastReset.Equal(row.RequestLastReset) {
+		t.Fatalf("usage bump prematurely reset a future window: %+v", got)
+	}
+	if decision, err := store.checkRateLimit(ctx, EntityWiseRateLimits{"key": {row}}, nil, nil, row.CreatedAt); decision != DecisionAllow || err != nil {
+		t.Fatalf("due anchor must admit the unswept counter: %s, %v", decision, err)
+	}
+}
+
+func BenchmarkRateLimitResetTarget(b *testing.B) {
+	store := newStandaloneStoreForResetBenchmark()
+	now := time.Date(2026, time.November, 20, 0, 0, 0, 0, time.UTC)
+	anchor := now.Add(-time.Hour)
+	lastReset := now.Add(-30 * time.Second)
+	duration := "1m"
+	b.ReportAllocs()
+	for b.Loop() {
+		if store.rateLimitResetTarget(&duration, false, anchor, lastReset, now) == nil {
+			b.Fatal("due reset was lost")
+		}
+	}
+}
+
 func TestRateLimitFeedbackOverlappingWindows(t *testing.T) {
 	now := time.Date(2026, time.November, 7, 10, 20, 7, 0, time.UTC)
 	requestLimit := func(id, duration string, elapsed time.Duration) *configstoreTables.TableRateLimit {

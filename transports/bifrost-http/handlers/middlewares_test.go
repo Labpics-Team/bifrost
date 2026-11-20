@@ -5771,6 +5771,7 @@ func TestCacheIdentityNativeBetaHeaders(t *testing.T) {
 	for _, name := range []string{"Anthropic-Beta", "OpenAI-Beta"} {
 		t.Run(name, func(t *testing.T) {
 			var ctx fasthttp.RequestCtx
+			ctx.Init(&fasthttp.Request{}, nil, nil)
 			ctx.Request.Header.SetMethod("POST")
 			ctx.Request.SetRequestURI("/v1/messages")
 			ctx.Request.Header.Add(name, "feature-a")
@@ -5788,8 +5789,67 @@ func TestCacheIdentityNativeBetaHeaders(t *testing.T) {
 			if got := string(ctx.Request.Header.Peek(name)); got != "feature-a,feature-b" {
 				t.Fatalf("provider received incomplete flags: %q", got)
 			}
+			if values := ctx.Request.Header.PeekAll(name); len(values) != 1 {
+				t.Fatalf("joined flags left duplicate wire fields: %q", values)
+			}
+			inference, cancel := lib.ConvertToBifrostContext(&ctx, nil)
+			defer cancel()
+			headers, _ := inference.Value(schemas.BifrostContextKeyRequestHeaders).(map[string]string)
+			if got := headers[strings.ToLower(name)]; got != "feature-a,feature-b" {
+				t.Fatalf("final cache/governance snapshot lost flags: %q", got)
+			}
 			if got := string(ctx.Request.Header.Peek("X-App-Id")); got != "app" {
 				t.Fatal("ordinary header changed")
+			}
+		})
+	}
+}
+
+func BenchmarkNativeBetaHeaderProjection(b *testing.B) {
+	for _, withBeta := range []bool{false, true} {
+		b.Run(fmt.Sprintf("beta=%v", withBeta), func(b *testing.B) {
+			var original fasthttp.Request
+			original.Header.SetMethod("POST")
+			original.SetRequestURI("/v1/messages")
+			original.Header.Set("X-App-Id", "app")
+			if withBeta {
+				original.Header.Add("Anthropic-Beta", "feature-a")
+				original.Header.Add("Anthropic-Beta", "feature-b")
+			}
+			var ctx fasthttp.RequestCtx
+			b.ReportAllocs()
+			for b.Loop() {
+				original.CopyTo(&ctx.Request)
+				req := schemas.AcquireHTTPRequest()
+				fasthttpToHTTPRequest(&ctx, req)
+				if !applyHTTPRequestToCtx(&ctx, req) {
+					b.Fatal("header projection rewrote route")
+				}
+				schemas.ReleaseHTTPRequest(req)
+			}
+		})
+	}
+}
+
+func TestNativeBetaHeadersPreserveHookKey(t *testing.T) {
+	for _, name := range []string{"Anthropic-Beta", "Openai-Beta"} {
+		t.Run(name, func(t *testing.T) {
+			ctx := preAuthTestCtx()
+			ctx.Request.Header.Add(name, "feature-a")
+			ctx.Request.Header.Add(name, "feature-b")
+			req := schemas.AcquireHTTPRequest()
+			defer schemas.ReleaseHTTPRequest(req)
+			fasthttpToHTTPRequest(ctx, req)
+			if req.Headers[name] != "feature-a,feature-b" {
+				t.Fatalf("native hook key %q was changed: %v", name, req.Headers)
+			}
+			req.Headers[name] = "from-hook"
+			if !applyHTTPRequestToCtx(ctx, req) {
+				t.Fatal("header-only hook rewrite was rejected")
+			}
+			values := ctx.Request.Header.PeekAll(name)
+			if len(values) != 1 || string(values[0]) != "from-hook" {
+				t.Fatalf("hook rewrite did not reach the wire exactly once: %q", values)
 			}
 		})
 	}
@@ -5806,7 +5866,7 @@ func TestCacheIdentityUsesFinalHTTPProtocolOptions(t *testing.T) {
 	}{
 		{
 			name:    "header",
-			rewrite: func(req *schemas.HTTPRequest, value string) { req.Headers["anthropic-beta"] = value },
+			rewrite: func(req *schemas.HTTPRequest, value string) { req.Headers["Anthropic-Beta"] = value },
 			final:   func(ctx *fasthttp.RequestCtx) string { return string(ctx.Request.Header.Peek("anthropic-beta")) },
 		},
 		{

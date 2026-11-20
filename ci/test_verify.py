@@ -129,6 +129,24 @@ class TestEventTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("go"), "Go is needed for local workspace checks")
 class WorkspaceTests(unittest.TestCase):
+    def test_removed_plugin_is_pruned_from_an_existing_workspace(self):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root = Path(directory).resolve()
+            for name in ("core", "framework", "transports", "plugins/retired"):
+                module = root / name
+                module.mkdir(parents=True)
+                (module / "go.mod").write_text(f"module example.org/{name}\n\ngo 1.20\n", encoding="utf-8")
+            env = {"GOTOOLCHAIN": "local", "GOPROXY": "off", "GOSUMDB": "off", "GOFLAGS": ""}
+            with patch.dict(os.environ, env):
+                verify.workspace(root)
+                shutil.rmtree(root / "plugins/retired")
+                local_env, modules = verify.workspace(root)
+                actual = subprocess.check_output(
+                    ["go", "list", "-m", "-f", "{{.Path}}", "all"],
+                    cwd=root, env=local_env, text=True, encoding="utf-8",
+                ).splitlines()
+            self.assertCountEqual(actual, modules)
+
     def test_new_plugin_is_discovered_and_an_external_workspace_is_ignored(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -183,6 +201,21 @@ class FormatTests(unittest.TestCase):
             self.assertIn("untouched.go", subprocess.check_output(
                 ["gofmt", "-l", "untouched.go"], cwd=root, text=True, encoding="utf-8",
             ))
+
+    def test_untracked_go_files_are_checked_but_ignored_files_are_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve() / "repo"
+            value = self.initial_repository(root)
+            (root / ".gitignore").write_text("ignored.go\n", encoding="utf-8")
+            changed = root / "new file.go"
+            changed.write_text("package fixture\nfunc added(){}\n", encoding="utf-8")
+            (root / "ignored.go").write_text("package ignored\nfunc ignored(){}\n", encoding="utf-8")
+            self.assertEqual(verify.changed_go_files(root, value), ["new file.go"])
+            with self.assertRaisesRegex(verify.VerificationError, "new file.go"):
+                verify.check_format(root, value)
+            subprocess.run(["gofmt", "-w", str(changed)], check=True)
+            with redirect_stdout(io.StringIO()):
+                verify.check_format(root, value)
 
     def test_shallow_checkout_fetches_the_missing_upstream_base(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -258,6 +291,17 @@ class ChangedPackageTests(unittest.TestCase):
                 self.assertTrue({"-short", "-race", "-count=1"}.issubset(command))
                 self.assertFalse(any(arg.startswith("-run") for arg in command))
                 self.assertEqual(command[-1], call.args[2])
+
+    def test_untracked_new_package_is_included_in_unit_verification(self):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root = Path(directory).resolve()
+            value = self.baseline(root, {"core/source.go": "package core\nvar Value = 1\n"})
+            self.write_files(root, {
+                "core/new_package/new_test.go": "package new_package\nimport \"testing\"\nfunc TestNew(t *testing.T) { t.Fatal(\"must run\") }\n",
+            })
+            with patch.object(verify, "run_test_package") as execute:
+                verify.check_unit(root, value)
+            self.assertEqual([call.args[2] for call in execute.call_args_list], ["example.org/core/new_package"])
 
     def test_deletions_run_remaining_package_tests_and_ignore_removed_packages(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):

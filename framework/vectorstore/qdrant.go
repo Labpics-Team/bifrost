@@ -99,6 +99,18 @@ func (s *QdrantStore) CreateNamespace(ctx context.Context, namespace string, dim
 			if existing.GetDataType() != schemaType {
 				return fmt.Errorf("collection %q index %q has type %s, expected %s", namespace, fieldName, existing.GetDataType(), schemaType)
 			}
+			if schemaType == qdrant.PayloadSchemaType_Integer {
+				// Filterable integers support both equality and range Query operators.
+				// Omitted flags default to true; preserve every other index setting.
+				if params := existing.GetParams().GetIntegerIndexParams(); params != nil {
+					if params.Range != nil && !*params.Range {
+						return fmt.Errorf("collection %q integer index %q disables range filtering", namespace, fieldName)
+					}
+					if params.Lookup != nil && !*params.Lookup {
+						return fmt.Errorf("collection %q integer index %q disables lookup filtering", namespace, fieldName)
+					}
+				}
+			}
 			// Keep operator-selected memory placement and other index parameters.
 			continue
 		}

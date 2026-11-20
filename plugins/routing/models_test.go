@@ -115,6 +115,32 @@ func TestRoutingModelsFirstDeclarationAndSortedNames(t *testing.T) {
 	require.Equal(t, []schemas.Model{{ID: "A"}, {ID: "Z"}}, got)
 }
 
+func TestRoutingModelsSkipsTargetlessFirstDeclaration(t *testing.T) {
+	ctx := context.Background()
+	store, err := rules.NewLocalStore(ctx, bifrost.NewNoOpLogger(), nil)
+	require.NoError(t, err)
+	require.NoError(t, store.UpsertRule(ctx, &tables.TableRoutingRule{ID: "empty", Scope: "global", Priority: 0, CelExpression: `model == "Public"`}))
+	require.NoError(t, store.UpsertRule(ctx, &tables.TableRoutingRule{ID: "usable", Scope: "global", Priority: 1, CelExpression: `model == "Public"`, Targets: []tables.TableRoutingTarget{{Provider: bifrost.Ptr("openai"), Model: bifrost.Ptr("allowed"), Weight: 1}}}))
+	access := routingModelsAccess(schemas.ProviderPermit{Provider: "openai", AllowedModels: schemas.WhiteList{"allowed"}, KeyIDs: schemas.WhiteList{"*"}})
+	got, err := (&RoutingPlugin{rules: store}).ListModels(ctx, access)
+	require.NoError(t, err)
+	require.Equal(t, []schemas.Model{{ID: "Public"}}, got)
+}
+
+func BenchmarkRoutingModels(b *testing.B) {
+	ctx := context.Background()
+	store, err := rules.NewLocalStore(ctx, bifrost.NewNoOpLogger(), nil)
+	require.NoError(b, err)
+	require.NoError(b, store.UpsertRule(ctx, &tables.TableRoutingRule{ID: "public", Scope: "global", CelExpression: `model == "Public"`, Targets: []tables.TableRoutingTarget{{Provider: bifrost.Ptr("openai"), Model: bifrost.Ptr("physical"), Weight: 1}}}))
+	plugin := &RoutingPlugin{rules: store}
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := plugin.ListModels(ctx, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func routingModelsAccess(permits ...schemas.ProviderPermit) schemas.Access {
 	return grant.NewAccess([]schemas.Permit{grant.NewPermit(grant.PermitVirtualKey, "caller", "Caller", true, false, permits, nil)}, nil, "", nil)
 }

@@ -6060,22 +6060,46 @@ func finishOwnedRequestStream(ctx *schemas.BifrostContext, source chan *schemas.
 		ctx.Cancel()
 		return nil
 	}
-	output := make(chan *schemas.BifrostStreamChunk, cap(source))
+	// An owned request has no caller-supplied context to expose cancellation.
+	// Keep room to publish its terminal error even for an unbuffered source.
+	output := make(chan *schemas.BifrostStreamChunk, max(1, cap(source)))
 	go func() {
 		defer close(output)
 		defer ctx.Cancel()
+		reportCancellation := func() {
+			chunk := &schemas.BifrostStreamChunk{BifrostError: newBifrostCtxDoneError(ctx, "while receiving stream")}
+			select {
+			case output <- chunk:
+				return
+			default:
+			}
+			// A stopped reader must not retain the relay. Replace one queued
+			// chunk with the error that makes this truncation explicit. Only
+			// this goroutine sends, so receiving here guarantees a free slot;
+			// a concurrent reader can only make more room.
+			select {
+			case <-output:
+			default:
+			}
+			output <- chunk
+		}
 		for {
 			select {
 			case chunk, ok := <-source:
 				if !ok {
+					if ctx.Err() != nil {
+						reportCancellation()
+					}
 					return
 				}
 				select {
 				case output <- chunk:
 				case <-ctx.Done():
+					reportCancellation()
 					return
 				}
 			case <-ctx.Done():
+				reportCancellation()
 				return
 			}
 		}
