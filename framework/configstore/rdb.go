@@ -15,6 +15,7 @@ import (
 	"math"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -7636,58 +7637,67 @@ func (s *RDBConfigStore) updateComplexityAnalyzerConfigWithTx(ctx context.Contex
 	}, txDB)
 }
 
-// GetAuthConfig retrieves the auth configuration from the database.
+// GetAuthConfig retrieves one committed snapshot of the dashboard auth settings.
 func (s *RDBConfigStore) GetAuthConfig(ctx context.Context) (*AuthConfig, error) {
-	var username *string
-	var password *string
-	var isEnabled bool
-	var oidcRow tables.TableGovernanceConfig
-	if err := s.DB().WithContext(ctx).First(&oidcRow, "key = ?", tables.ConfigOIDCKey).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+	return readAuthConfig(s.DB().WithContext(ctx))
+}
+
+// readAuthConfig also accepts a transaction with a row-lock clause. The same
+// snapshot is used to decide whether an auth update must revoke sessions.
+func readAuthConfig(db *gorm.DB) (*AuthConfig, error) {
+	var rows []tables.TableGovernanceConfig
+	if err := db.Where("key IN ?", []string{
+		tables.ConfigAdminUsernameKey, tables.ConfigAdminPasswordKey,
+		tables.ConfigIsAuthEnabledKey, tables.ConfigOIDCKey,
+	}).Order("key").Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	oidcConfig, err := decodeOIDCConfig(oidcRow.Value)
+	values := make(map[string]string, len(rows))
+	for _, row := range rows {
+		values[row.Key] = row.Value
+	}
+	oidcConfig, err := decodeOIDCConfig(values[tables.ConfigOIDCKey])
 	if err != nil {
 		return nil, fmt.Errorf("failed to read oidc configuration: %w", err)
 	}
-	if err := s.DB().WithContext(ctx).First(&tables.TableGovernanceConfig{}, "key = ?", tables.ConfigAdminUsernameKey).Select("value").Scan(&username).Error; err != nil {
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, err
-		}
-	}
-	if err := s.DB().WithContext(ctx).First(&tables.TableGovernanceConfig{}, "key = ?", tables.ConfigAdminPasswordKey).Select("value").Scan(&password).Error; err != nil {
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, err
-		}
-	}
-	if err := s.DB().WithContext(ctx).First(&tables.TableGovernanceConfig{}, "key = ?", tables.ConfigIsAuthEnabledKey).Select("value").Scan(&isEnabled).Error; err != nil {
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, err
-		}
-	}
-	if (username == nil || password == nil) && oidcConfig == nil {
+	username, hasUsername := values[tables.ConfigAdminUsernameKey]
+	password, hasPassword := values[tables.ConfigAdminPasswordKey]
+	if (!hasUsername || !hasPassword) && oidcConfig == nil {
 		return nil, nil
 	}
-	if username == nil {
-		username = new(string)
-	}
-	if password == nil {
-		password = new(string)
+	isEnabled := false
+	if value := values[tables.ConfigIsAuthEnabledKey]; value != "" {
+		isEnabled, err = strconv.ParseBool(value)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read auth enabled setting: %w", err)
+		}
 	}
 	return &AuthConfig{
-		AdminUserName: schemas.NewSecretVar(*username),
-		AdminPassword: schemas.NewSecretVar(*password),
+		AdminUserName: schemas.NewSecretVar(username),
+		AdminPassword: schemas.NewSecretVar(password),
 		IsEnabled:     isEnabled,
 		OIDC:          oidcConfig,
 	}, nil
 }
 
-// UpdateAuthConfig updates the auth configuration in the database.
+// UpdateAuthConfig atomically replaces dashboard authentication settings and
+// revokes existing sessions when the stored credentials or policy change.
 func (s *RDBConfigStore) UpdateAuthConfig(ctx context.Context, config *AuthConfig) error {
+	if config == nil {
+		return fmt.Errorf("auth config is nil")
+	}
 	oidcValue, err := encodeOIDCConfig(config.OIDC)
 	if err != nil {
 		return err
 	}
 	return s.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		previous, err := readAuthConfig(tx.Clauses(clause.Locking{Strength: "UPDATE"}))
+		if err != nil {
+			return err
+		}
+		if previous.Equals(config) {
+			return nil
+		}
 		if err := tx.Save(&tables.TableGovernanceConfig{Key: tables.ConfigOIDCKey, Value: oidcValue}).Error; err != nil {
 			return err
 		}
@@ -7709,7 +7719,7 @@ func (s *RDBConfigStore) UpdateAuthConfig(ctx context.Context, config *AuthConfi
 		}).Error; err != nil {
 			return err
 		}
-		return nil
+		return tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&tables.SessionsTable{}).Error
 	})
 }
 

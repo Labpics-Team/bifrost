@@ -58,7 +58,7 @@ func TestOIDCSignIn(t *testing.T) {
 	SetLogger(&mockLogger{})
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
-	for _, test := range []string{"success", "verified-email", "cookie", "state", "nonce", "audience", "issuer", "expiry", "signature", "unapproved", "unverified-email", "reconfigured", "expired-flow", "provider-error", "encrypted-session"} {
+	for _, test := range []string{"success", "verified-email", "cookie", "state", "nonce", "audience", "issuer", "expiry", "signature", "unapproved", "unverified-email", "reconfigured", "expired-flow", "provider-error", "token-error", "encrypted-session"} {
 		t.Run(test, func(t *testing.T) {
 			lib.SetBasePath("/bifrost")
 			t.Cleanup(func() { lib.SetBasePath("") })
@@ -72,6 +72,10 @@ func TestOIDCSignIn(t *testing.T) {
 				case "/keys":
 					json.NewEncoder(w).Encode(map[string]any{"keys": []any{map[string]any{"kty": "RSA", "kid": "test", "alg": "RS256", "use": "sig", "n": base64.RawURLEncoding.EncodeToString(key.N.Bytes()), "e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.E)).Bytes())}}})
 				case "/token":
+					if test == "token-error" {
+						http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+						return
+					}
 					require.NoError(t, r.ParseForm())
 					client, secret, _ := r.BasicAuth()
 					require.Equal(t, "bifrost", client)
@@ -121,7 +125,11 @@ func TestOIDCSignIn(t *testing.T) {
 			}
 			h := NewSessionHandler(store, nil)
 			login := &fasthttp.RequestCtx{}
-			login.Request.SetRequestURI("https://ai.example/api/session/oidc/login?goto=%2Fworkspace%2Flogs%3Fmodel%3Dtest")
+			destination := "/workspace/logs?model=test"
+			if test == "provider-error" {
+				destination = "/oauth/consent?client_id=test&response_type=code"
+			}
+			login.Request.SetRequestURI("https://ai.example/api/session/oidc/login?goto=" + url.QueryEscape(destination))
 			h.oidcLogin(login)
 			require.Equal(t, fasthttp.StatusSeeOther, login.Response.StatusCode())
 			authorize, err := url.Parse(string(login.Response.Header.Peek("Location")))
@@ -155,6 +163,7 @@ func TestOIDCSignIn(t *testing.T) {
 			callback.Request.SetRequestURI("https://ai.example/api/session/oidc/callback?state=" + state + "&code=code")
 			callback.Request.Header.Set("X-Forwarded-Proto", "https")
 			callback.Request.Header.SetCookie(oidcFlowCookie, cookie)
+			callback.QueryArgs().Set("goto", "/workspace/untrusted")
 			if test == "provider-error" {
 				callback.QueryArgs().Set("error", "access_denied")
 			}
@@ -164,7 +173,24 @@ func TestOIDCSignIn(t *testing.T) {
 			if test != "success" && test != "verified-email" && test != "encrypted-session" {
 				require.Empty(t, store.sessions)
 				require.False(t, callback.Response.Header.Cookie(sessionCookie))
-				require.Equal(t, "/bifrost/login?oidc_error=failed", string(callback.Response.Header.Peek("Location")))
+				failureURL, err := url.Parse(string(callback.Response.Header.Peek("Location")))
+				require.NoError(t, err)
+				require.Equal(t, "/bifrost/login", failureURL.Path)
+				require.Equal(t, "failed", failureURL.Query().Get("oidc_error"))
+				if test == "cookie" || test == "state" {
+					require.Empty(t, failureURL.Query().Get("goto"), "unverified callbacks cannot supply a return destination")
+				} else {
+					require.Equal(t, destination, failureURL.Query().Get("goto"), "retry must retain the browser-bound flow destination")
+				}
+				if test == "provider-error" || test == "token-error" {
+					retry := &fasthttp.RequestCtx{}
+					retry.Request.SetRequestURI("https://ai.example/api/session/oidc/login?goto=" + url.QueryEscape(failureURL.Query().Get("goto")))
+					h.oidcLogin(retry)
+					require.Equal(t, fasthttp.StatusSeeOther, retry.Response.StatusCode())
+					authorize, err := url.Parse(string(retry.Response.Header.Peek("Location")))
+					require.NoError(t, err)
+					require.Equal(t, destination, h.oidc.flows[authorize.Query().Get("state")].gotoPath)
+				}
 				return
 			}
 			require.Equal(t, "/bifrost/workspace/logs?model=test", string(callback.Response.Header.Peek("Location")))

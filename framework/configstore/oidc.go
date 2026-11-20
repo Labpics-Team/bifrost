@@ -108,6 +108,15 @@ func (c *AuthConfig) HasPassword() bool {
 	return c != nil && c.AdminUserName.GetValue() != "" && c.AdminPassword.GetValue() != ""
 }
 
+// Equals compares the persisted credentials and dashboard access policy.
+func (c *AuthConfig) Equals(other *AuthConfig) bool {
+	if c == nil || other == nil {
+		return c == other
+	}
+	return c.IsEnabled == other.IsEnabled && c.AdminUserName.GetValue() == other.AdminUserName.GetValue() &&
+		c.AdminPassword.GetValue() == other.AdminPassword.GetValue() && c.OIDC.Equals(other.OIDC)
+}
+
 // The existing governance-config key/value store keeps OIDC settings together.
 // Secret references retain only their reference; literal credentials use the
 // same at-rest encryption key as the rest of Bifrost's config store.

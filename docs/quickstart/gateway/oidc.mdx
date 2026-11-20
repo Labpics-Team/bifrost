@@ -37,7 +37,11 @@ secret. To replace a confidential client with a public client, replace the
 OIDC configuration through the configuration file with `client_secret` omitted.
 
 Initial setup uses the existing setup token. Saving authentication changes
-invalidates existing dashboard sessions; sign in again with the new method.
+invalidates existing dashboard sessions in the same database transaction; a
+failed write retains the old policy and sessions, and can be retried. Saving
+unchanged authentication settings preserves sessions. Sign in again after a
+successful change. A failed sign-in preserves the original workspace or consent
+page for the next attempt once its browser-bound state has been verified.
 If protection is disabled and no local password exists, the setup token is the
 recovery proof for re-enabling it. Keep that operator credential available.
 

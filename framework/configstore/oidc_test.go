@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/encrypt"
 	"github.com/stretchr/testify/require"
 )
@@ -44,6 +45,7 @@ func TestOIDCConfig(t *testing.T) {
 
 func TestOIDCConfigStoreRoundTrip(t *testing.T) {
 	store := setupRDBTestStore(t)
+	require.NoError(t, store.DB().AutoMigrate(&tables.SessionsTable{}))
 	conf := &AuthConfig{IsEnabled: true, OIDC: &OIDCConfig{Enabled: true, IssuerURL: "https://id.example", ClientID: "bifrost", ClientSecret: schemas.NewSecretVar("literal-secret"), RedirectURL: "https://ai.example/api/session/oidc/callback", AllowedSubjects: []string{"admin"}}}
 	require.NoError(t, store.UpdateAuthConfig(context.Background(), conf))
 	loaded, err := store.GetAuthConfig(context.Background())

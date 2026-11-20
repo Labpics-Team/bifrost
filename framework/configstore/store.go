@@ -562,6 +562,8 @@ type ConfigStore interface {
 
 	// Auth config CRUD
 	GetAuthConfig(ctx context.Context) (*AuthConfig, error)
+	// UpdateAuthConfig commits auth settings and revokes existing dashboard sessions
+	// atomically when credentials or policy change. A no-op preserves sessions.
 	UpdateAuthConfig(ctx context.Context, config *AuthConfig) error
 
 	// Proxy config CRUD

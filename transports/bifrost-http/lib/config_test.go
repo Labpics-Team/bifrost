@@ -1409,6 +1409,9 @@ func (m *MockConfigStore) GetAuthConfig(ctx context.Context) (*configstore.AuthC
 }
 
 func (m *MockConfigStore) UpdateAuthConfig(ctx context.Context, config *configstore.AuthConfig) error {
+	if !m.authConfig.Equals(config) {
+		m.flushSessionsCalled = true
+	}
 	m.authConfig = config
 	return nil
 }

@@ -91,33 +91,38 @@ func setOIDCFlowCookie(ctx *fasthttp.RequestCtx, value string, expires time.Time
 	ctx.Response.Header.SetCookie(cookie)
 }
 
-func oidcFailure(ctx *fasthttp.RequestCtx) {
+func oidcFailure(ctx *fasthttp.RequestCtx, gotoPath string) {
+	location := lib.WithBasePath("/login?oidc_error=failed")
+	if gotoPath != "" {
+		location += "&goto=" + url.QueryEscape(safeOIDCGoto(gotoPath))
+	}
 	ctx.Response.Header.Set("Cache-Control", "no-store")
-	ctx.Response.Header.Set("Location", lib.WithBasePath("/login?oidc_error=failed"))
+	ctx.Response.Header.Set("Location", location)
 	ctx.SetStatusCode(fasthttp.StatusSeeOther)
 }
 
 func (h *SessionHandler) oidcLogin(ctx *fasthttp.RequestCtx) {
 	ctx.Response.Header.Set("Cache-Control", "no-store")
+	gotoPath := safeOIDCGoto(string(ctx.QueryArgs().Peek("goto")))
 	if h.configStore == nil {
-		oidcFailure(ctx)
+		oidcFailure(ctx, gotoPath)
 		return
 	}
 	auth, err := h.configStore.GetAuthConfig(ctx)
 	if err != nil || !auth.OIDCEnabled() || auth.OIDC.Validate() != nil {
-		oidcFailure(ctx)
+		oidcFailure(ctx, gotoPath)
 		return
 	}
 	provider, err := h.oidc.getProvider(auth.OIDC.IssuerURL)
 	if err != nil {
 		logger.Warn("OIDC discovery failed: %v", err)
-		oidcFailure(ctx)
+		oidcFailure(ctx, gotoPath)
 		return
 	}
 	state := oauth2.GenerateVerifier()
 	flow := oidcFlow{config: auth.OIDC.Clone(), provider: provider, verifier: oauth2.GenerateVerifier(),
 		nonce: oauth2.GenerateVerifier(), cookie: oauth2.GenerateVerifier(),
-		gotoPath: safeOIDCGoto(string(ctx.QueryArgs().Peek("goto"))), expires: time.Now().Add(10 * time.Minute)}
+		gotoPath: gotoPath, expires: time.Now().Add(10 * time.Minute)}
 	h.oidc.mu.Lock()
 	for key, pending := range h.oidc.flows {
 		if time.Now().After(pending.expires) {
@@ -147,18 +152,22 @@ func (h *SessionHandler) oidcCallback(ctx *fasthttp.RequestCtx) {
 		delete(h.oidc.flows, state)
 	}
 	h.oidc.mu.Unlock()
-	if !valid || time.Now().After(flow.expires) {
-		oidcFailure(ctx)
+	if !valid {
+		oidcFailure(ctx, "")
+		return
+	}
+	if time.Now().After(flow.expires) {
+		oidcFailure(ctx, flow.gotoPath)
 		return
 	}
 	setOIDCFlowCookie(ctx, "", time.Now().Add(-time.Hour), strings.HasPrefix(flow.config.RedirectURL, "https://"))
 	if h.configStore == nil || len(ctx.QueryArgs().Peek("error")) > 0 || len(ctx.QueryArgs().Peek("code")) == 0 {
-		oidcFailure(ctx)
+		oidcFailure(ctx, flow.gotoPath)
 		return
 	}
 	auth, err := h.configStore.GetAuthConfig(ctx)
 	if err != nil || !auth.OIDCEnabled() || !auth.OIDC.Equals(flow.config) {
-		oidcFailure(ctx)
+		oidcFailure(ctx, flow.gotoPath)
 		return
 	}
 	networkCtx, cancel := context.WithTimeout(oidc.ClientContext(ctx, h.oidc.client), 10*time.Second)
@@ -168,17 +177,17 @@ func (h *SessionHandler) oidcCallback(ctx *fasthttp.RequestCtx) {
 	if err != nil {
 		// Provider errors may contain credentials or codes; never log their body.
 		logger.Warn("OIDC code exchange failed")
-		oidcFailure(ctx)
+		oidcFailure(ctx, flow.gotoPath)
 		return
 	}
 	rawIDToken, ok := token.Extra("id_token").(string)
 	if !ok {
-		oidcFailure(ctx)
+		oidcFailure(ctx, flow.gotoPath)
 		return
 	}
 	idToken, err := flow.provider.Verifier(&oidc.Config{ClientID: flow.config.ClientID}).Verify(networkCtx, rawIDToken)
 	if err != nil || subtle.ConstantTimeCompare([]byte(idTokenNonce(idToken)), []byte(flow.nonce)) != 1 {
-		oidcFailure(ctx)
+		oidcFailure(ctx, flow.gotoPath)
 		return
 	}
 	var claims struct {
@@ -186,14 +195,14 @@ func (h *SessionHandler) oidcCallback(ctx *fasthttp.RequestCtx) {
 		EmailVerified bool   `json:"email_verified"`
 	}
 	if err := idToken.Claims(&claims); err != nil || !flow.config.Allows(idToken.Subject, claims.Email, claims.EmailVerified) {
-		oidcFailure(ctx)
+		oidcFailure(ctx, flow.gotoPath)
 		return
 	}
 	// Recheck after network I/O and again after insertion. If policy changes
 	// after insertion, the normal settings update flushes this session too.
 	auth, err = h.configStore.GetAuthConfig(ctx)
 	if err != nil || !auth.OIDCEnabled() || !auth.OIDC.Equals(flow.config) {
-		oidcFailure(ctx)
+		oidcFailure(ctx, flow.gotoPath)
 		return
 	}
 	expires := time.Now().Add(8 * time.Hour)
@@ -203,7 +212,7 @@ func (h *SessionHandler) oidcCallback(ctx *fasthttp.RequestCtx) {
 	sessionToken := uuid.NewString()
 	session := &tables.SessionsTable{Token: sessionToken, ExpiresAt: expires, CreatedAt: time.Now(), UpdatedAt: time.Now()}
 	if err := h.configStore.CreateSession(ctx, session); err != nil {
-		oidcFailure(ctx)
+		oidcFailure(ctx, flow.gotoPath)
 		return
 	}
 	auth, err = h.configStore.GetAuthConfig(ctx)
@@ -211,7 +220,7 @@ func (h *SessionHandler) oidcCallback(ctx *fasthttp.RequestCtx) {
 		if err := h.configStore.DeleteSession(ctx, sessionToken); err != nil {
 			logger.Error("failed to revoke session after OIDC configuration changed")
 		}
-		oidcFailure(ctx)
+		oidcFailure(ctx, flow.gotoPath)
 		return
 	}
 	setSessionTokenCookie(ctx, sessionToken, expires)
