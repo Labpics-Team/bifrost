@@ -12,10 +12,12 @@
 При проверке импорта пересмотрены отличия, которые подменяли штатные настройки
 upstream; действующие границы описаны ниже.
 
-Первый срез ограничен исходниками, документацией и проверками этого репозитория.
-Infra продолжает собирать закреплённый upstream с прежними патчами. Переход
-на исходники форка, публикация образа и обновление работающего сервиса требуют
-отдельного поручения; merge в `labpics` запускает только проверки форка.
+Для выпусков Infra использует исходники этого форка: закрепляет коммит в
+[source.json](https://github.com/Labpics-Team/labpics-infra/blob/main/services/bifrost/build/source.json),
+собирает проверенный образ и публикует его в GHCR. Внешний набор патчей Infra
+удалён при [переходе на форк](https://github.com/Labpics-Team/labpics-infra/pull/2683).
+Merge в `labpics` запускает проверки форка, но сам по себе не выпускает образ
+и не обновляет работающий сервис.
 
 ## Почему изменения сохранены
 
@@ -194,24 +196,31 @@ entry point использует `go:embed all:ui`, поэтому Go-сборк
 обеспечивают workspace и `LOCAL=1`; её результат не является опубликованным
 образом или проверкой production runtime.
 
-## Отдельная поставка
+## Сборка и поставка
 
-Действующий [рецепт Infra](https://github.com/Labpics-Team/labpics-infra/tree/21660ec01806179dea062f54904c0e995678acc1/services/bifrost/build)
-получает upstream `7cb75fb2`, применяет восемь патчей из своего `upstream.json`,
-собирает UI и образ, выполняет native race-проверки и runtime smoke. Начальный
-набор обязательных тестов форка сохранён из этого manifest. Перенос исходников
-в этот репозиторий ещё не переключает рецепт Infra на форк.
+[Рецепт Infra](https://github.com/Labpics-Team/labpics-infra/blob/main/services/bifrost/build/Dockerfile)
+получает полный commit форка из
+[source.json](https://github.com/Labpics-Team/labpics-infra/blob/main/services/bifrost/build/source.json),
+собирает UI и Go-модули из его исходников и проверяет native regressions и
+production runtime перед публикацией. База upstream и обязательные тесты
+принадлежат [ci/verification.json](ci/verification.json) этого форка:
+Infra больше не применяет внешний набор патчей и не ведёт его копию тестов.
+Рецепт переключён в [Infra #2683](https://github.com/Labpics-Team/labpics-infra/pull/2683).
 
-После отдельного поручения рецепт Infra можно перевести на полный commit форка
-и его `ci/verification.json`, заменив применение патчей. Тогда идентичность
-исходников форка и ревизия рецепта сборки фиксируются отдельно, а уже собранный
-образ проходит существующие native и runtime проверки перед публикацией.
-
-Действующие образы публикует Infra в `ghcr.io/labpics-team/bifrost`.
-Установленная версия закреплена по digest в
+[Workflow Infra](https://github.com/Labpics-Team/labpics-infra/blob/main/.github/workflows/build-bifrost.yml)
+публикует проверенный образ в `ghcr.io/labpics-team/bifrost`, сохраняя
+идентичность исходного коммита форка и ревизии сборки Infra.
+Чтобы выпустить следующее изменение форка, нужно обновить pin в `source.json`
+через PR в Infra, дождаться проверок и публикации, затем закрепить полученный
+digest отдельным GitOps PR в
 [декларации сервиса](https://github.com/Labpics-Team/labpics-infra/blob/main/services/bifrost/k8s/workload.yaml).
-Обновление образа проходит обычный GitOps PR с проверкой фактического imageID
-и запроса потребителя. Runtime policy, ключи и данные не хранятся в этом форке.
+Первый переход на образ форка выполнен в
+[Infra #2685](https://github.com/Labpics-Team/labpics-infra/pull/2685).
+
+После применения GitOps проверяются фактический imageID запущенного контейнера,
+готовность и авторизованный запрос через публичный путь. Успешный merge или
+публикация образа не заменяют эту проверку. Runtime policy, ключи и данные
+не хранятся в этом форке.
 
 ## Обновление upstream
 
