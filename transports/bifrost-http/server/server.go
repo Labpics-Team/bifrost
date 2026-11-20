@@ -1146,6 +1146,9 @@ func (s *BifrostHTTPServer) RemoveModelConfig(ctx context.Context, id string) er
 // write that called it added the provider rather than edited one; the reload is the same either
 // way, and a server that wraps this one can tell an operator's edit apart by it.
 func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas.ModelProvider, isNew bool) (*tables.TableProvider, error) {
+	if s.Config != nil && s.Config.AdaptiveRouter != nil {
+		s.Config.AdaptiveRouter.ResetProvider(provider)
+	}
 	s.syncIgnoreProviderCost(provider)
 	if s.Config == nil || s.Config.ConfigStore == nil {
 		return nil, fmt.Errorf("config store not found")
@@ -1263,6 +1266,9 @@ func (s *BifrostHTTPServer) syncIgnoreProviderCost(provider schemas.ModelProvide
 
 // RemoveProvider removes a provider from the in-memory store
 func (s *BifrostHTTPServer) RemoveProvider(ctx context.Context, provider schemas.ModelProvider) error {
+	if s.Config != nil && s.Config.AdaptiveRouter != nil {
+		s.Config.AdaptiveRouter.ResetProvider(provider)
+	}
 	err := s.Client.RemoveProvider(provider)
 	if err != nil && !strings.Contains(err.Error(), "not found") {
 		logger.Error("failed to remove provider from client: %v", err)
@@ -1320,6 +1326,9 @@ func (s *BifrostHTTPServer) OnKeyAdded(ctx context.Context, provider schemas.Mod
 // changed even when Value didn't), refreshes the keyconfig, then refetches
 // for just that key. 2 calls regardless of N keys on the provider.
 func (s *BifrostHTTPServer) OnKeyUpdated(ctx context.Context, provider schemas.ModelProvider, key schemas.Key) error {
+	if s.Config != nil && s.Config.AdaptiveRouter != nil {
+		s.Config.AdaptiveRouter.ResetKey(provider, key.ID)
+	}
 	if s.Config == nil || s.Config.ModelCatalog == nil {
 		return fmt.Errorf("model catalog not found")
 	}
@@ -1347,6 +1356,9 @@ func (s *BifrostHTTPServer) OnKeyUpdated(ctx context.Context, provider schemas.M
 // keyconfig. No list-models calls — the provider's remaining keys' cached
 // entries stay valid.
 func (s *BifrostHTTPServer) OnKeyDeleted(ctx context.Context, provider schemas.ModelProvider, keyID string) error {
+	if s.Config != nil && s.Config.AdaptiveRouter != nil {
+		s.Config.AdaptiveRouter.ResetKey(provider, keyID)
+	}
 	if s.Config == nil || s.Config.ModelCatalog == nil {
 		return fmt.Errorf("model catalog not found")
 	}
@@ -3179,6 +3191,9 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 	if routingHandler != nil {
 		routingHandler.RegisterRoutes(s.Router, middlewares...)
 	}
+	if s.Config.AdaptiveRouter != nil {
+		handlers.RegisterAdaptiveRoutingRoutes(s.Router, s.Config.AdaptiveRouter, middlewares...)
+	}
 	if loggingHandler != nil {
 		loggingHandler.RegisterRoutes(s.Router, middlewares...)
 		if s.RelaysHandler != nil {
@@ -3623,6 +3638,12 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 	// Create account backed by the high-performance store (all processing is done in LoadFromDatabase)
 	// The account interface now benefits from ultra-fast config access times via in-memory storage
 	account := lib.NewBaseAccount(s.Config)
+	var adaptiveKeySelector schemas.KeySelector
+	var adaptiveObserver schemas.ProviderAttemptObserver
+	if s.Config.AdaptiveRouter != nil {
+		adaptiveKeySelector = s.Config.AdaptiveRouter.SelectKey
+		adaptiveObserver = s.Config.AdaptiveRouter
+	}
 	// An interface holding a nil store pointer would not read as unset.
 	var sharedDiscoveryStore, perUserDiscoveryStore schemas.MCPDiscoveryStore
 	if s.Config.MCPSharedDiscoveryStore != nil {
@@ -3632,19 +3653,21 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 		perUserDiscoveryStore = s.Config.MCPPerUserDiscoveryStore
 	}
 	s.Client, err = bifrost.Init(ctx, schemas.BifrostConfig{
-		Account:            account,
-		InitialPoolSize:    s.Config.ClientConfig.InitialPoolSize,
-		DropExcessRequests: s.Config.ClientConfig.DropExcessRequests,
-		LLMPlugins:         s.Config.GetLoadedLLMPlugins(),
-		MCPPlugins:         s.Config.GetLoadedMCPPlugins(),
-		A2APlugins:         s.Config.GetLoadedA2APlugins(),
-		RelayPlugins:       s.Config.GetLoadedRelayPlugins(),
-		MCPConfig:          mcpConfig,
-		OAuth2Provider:     s.Config.OAuthProvider,
-		MCPHeadersProvider: s.Config.MCPHeadersProvider,
-		Logger:             logger,
-		KVStore:            s.Config.KVStore,
-		ModelCatalog:       s.Config.ModelCatalog,
+		Account:                 account,
+		KeySelector:             adaptiveKeySelector,
+		ProviderAttemptObserver: adaptiveObserver,
+		InitialPoolSize:         s.Config.ClientConfig.InitialPoolSize,
+		DropExcessRequests:      s.Config.ClientConfig.DropExcessRequests,
+		LLMPlugins:              s.Config.GetLoadedLLMPlugins(),
+		MCPPlugins:              s.Config.GetLoadedMCPPlugins(),
+		A2APlugins:              s.Config.GetLoadedA2APlugins(),
+		RelayPlugins:            s.Config.GetLoadedRelayPlugins(),
+		MCPConfig:               mcpConfig,
+		OAuth2Provider:          s.Config.OAuthProvider,
+		MCPHeadersProvider:      s.Config.MCPHeadersProvider,
+		Logger:                  logger,
+		KVStore:                 s.Config.KVStore,
+		ModelCatalog:            s.Config.ModelCatalog,
 
 		MCPSharedDiscoveryStore:  sharedDiscoveryStore,
 		MCPPerUserDiscoveryStore: perUserDiscoveryStore,
@@ -3653,6 +3676,13 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 		return fmt.Errorf("failed to initialize bifrost: %v", err)
 	}
 	s.Client.SetMCPInProcessServerFactory(openAPIFactory)
+	if c := s.Config.AdaptiveRouter; c != nil && s.Config.ModelCatalog != nil {
+		c.SetCatalog(s.Config.ModelCatalog.GetProvidersForModel, account.GetKeysForProvider, s.Client.KeySupportsModel)
+		if err := c.RestoreHolds(ctx); err != nil {
+			logger.Warn("[Routing] could not restore held keys: %v", err)
+		}
+		c.Start(ctx, logger)
+	}
 	logger.Info("bifrost client initialized")
 	// Sync plugin execution order from config to core (defensive — Init receives sorted list,
 	// but this ensures order consistency if the loading path changes in the future)
@@ -3993,6 +4023,11 @@ func (s *BifrostHTTPServer) Start() error {
 			s.CloseAgentGateway()
 			logger.Info("shutting down bifrost client...")
 			s.Client.Shutdown()
+			if c := s.Config.AdaptiveRouter; c != nil {
+				if err := c.Close(); err != nil {
+					logger.Warn("[Routing] could not save held keys at shutdown: %v", err)
+				}
+			}
 			logger.Info("bifrost client shutdown completed")
 			logger.Info("cleaning up storage engines...")
 			// Cleanup server-specific components

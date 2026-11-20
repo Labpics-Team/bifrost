@@ -159,8 +159,9 @@ type Bifrost struct {
 	dropExcessRequests         atomic.Bool                           // If true, in cases where the queue is full, requests will not wait for the queue to be empty and will be dropped instead.
 	keySelector                schemas.KeySelector                   // Custom key selector function
 	keyPoolFilter              schemas.KeyPoolFilter                 // optional hook to veto keys before selection (nil = all eligible)
-	kvStore                    schemas.KVStore                       // optional KV store for session stickiness (nil = disabled)
-	sessionAffinity            schemas.SessionAffinity               // decides which key a session stays on; never nil after Init
+	providerAttemptObserver    schemas.ProviderAttemptObserver
+	kvStore                    schemas.KVStore         // optional KV store for session stickiness (nil = disabled)
+	sessionAffinity            schemas.SessionAffinity // decides which key a session stays on; never nil after Init
 }
 
 // ProviderQueue wraps a provider's request channel with lifecycle management
@@ -303,20 +304,21 @@ func Init(ctx context.Context, config schemas.BifrostConfig) (*Bifrost, error) {
 
 	bifrostCtx, cancel := schemas.NewBifrostContextWithCancel(ctx)
 	bifrost := &Bifrost{
-		ctx:           bifrostCtx,
-		cancel:        cancel,
-		account:       config.Account,
-		llmPlugins:    atomic.Pointer[[]schemas.LLMPlugin]{},
-		mcpPlugins:    atomic.Pointer[[]schemas.MCPPlugin]{},
-		a2aPlugins:    atomic.Pointer[[]schemas.A2APlugin]{},
-		requestQueues: sync.Map{},
-		waitGroups:    sync.Map{},
-		keySelector:   config.KeySelector,
-		keyPoolFilter: config.KeyPoolFilter,
-		mcpCredStore:  credstore.NewCredStore(config.OAuth2Provider, config.MCPHeadersProvider, config.Logger),
-		logger:        config.Logger,
-		kvStore:       config.KVStore,
-		modelCatalog:  config.ModelCatalog,
+		ctx:                     bifrostCtx,
+		cancel:                  cancel,
+		account:                 config.Account,
+		llmPlugins:              atomic.Pointer[[]schemas.LLMPlugin]{},
+		mcpPlugins:              atomic.Pointer[[]schemas.MCPPlugin]{},
+		a2aPlugins:              atomic.Pointer[[]schemas.A2APlugin]{},
+		requestQueues:           sync.Map{},
+		waitGroups:              sync.Map{},
+		keySelector:             config.KeySelector,
+		keyPoolFilter:           config.KeyPoolFilter,
+		providerAttemptObserver: config.ProviderAttemptObserver,
+		mcpCredStore:            credstore.NewCredStore(config.OAuth2Provider, config.MCPHeadersProvider, config.Logger),
+		logger:                  config.Logger,
+		kvStore:                 config.KVStore,
+		modelCatalog:            config.ModelCatalog,
 
 		mcpSharedDiscoveryStore:  config.MCPSharedDiscoveryStore,
 		mcpPerUserDiscoveryStore: config.MCPPerUserDiscoveryStore,
@@ -8532,6 +8534,7 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 		// returned to the pool via its deferred finalizer.
 		if IsStreamRequestType(req.RequestType) {
 			stream, bifrostError = executeRequestWithRetries(req.Context, config, func(k schemas.Key) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+				attempt := bifrost.beginProviderAttempt(req.Context, provider.GetProviderKey(), originalModelRequested, k, &req.BifrostRequest)
 				// Arm this attempt's TTFT deadline before the provider dials: it
 				// covers the header wait and the first output chunk. The retry loop
 				// disarms and clears it once the first-chunk check settles.
@@ -8592,6 +8595,9 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 				}
 				startup := providerUtils.NewStreamStartupState(isPreamble, providerUtils.AttemptAbortFromContext(req.Context) != nil)
 				postHookRunner := func(ctx *schemas.BifrostContext, result *schemas.BifrostResponse, err *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError) {
+					if attempt != nil {
+						attempt.Observe(result, err)
+					}
 					// Populate extra fields before RunPostLLMHooks so plugins (e.g. logging)
 					// can read requestType/provider/model from the chunk or error.
 					// Uses the per-attempt snapshot — capturing the outer resolvedModel by
@@ -8639,6 +8645,9 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 				var finalizerOnce sync.Once
 				postHookSpanFinalizer := func(ctx context.Context) {
 					finalizerOnce.Do(func() {
+						if attempt != nil {
+							attempt.End()
+						}
 						pipeline.FinalizeStreamingPostHookSpans(ctx)
 						bifrost.releasePluginPipeline(pipeline)
 					})
@@ -8662,6 +8671,10 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 				// no deferred finalizer will run — release the pipeline directly
 				// so a retry doesn't inherit a leaked pool entry.
 				if streamErr != nil && streamCh == nil {
+					if attempt != nil {
+						attempt.Observe(nil, streamErr)
+						attempt.End()
+					}
 					finalizerOnce.Do(func() {
 						bifrost.releasePluginPipeline(pipeline)
 					})
@@ -8669,7 +8682,13 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 				return streamCh, streamErr
 			}, keyProvider, req.RequestType, provider.GetProviderKey(), model, &req.BifrostRequest, bifrost.logger)
 		} else {
-			result, bifrostError = executeRequestWithRetries(req.Context, config, func(k schemas.Key) (*schemas.BifrostResponse, *schemas.BifrostError) {
+			result, bifrostError = executeRequestWithRetries(req.Context, config, func(k schemas.Key) (response *schemas.BifrostResponse, responseErr *schemas.BifrostError) {
+				if attempt := bifrost.beginProviderAttempt(req.Context, provider.GetProviderKey(), originalModelRequested, k, &req.BifrostRequest); attempt != nil {
+					defer func() {
+						attempt.Observe(response, responseErr)
+						attempt.End()
+					}()
+				}
 				if aliasConfig := k.Aliases.ResolveConfig(originalModelRequested); aliasConfig != nil {
 					resolvedModel = aliasConfig.ModelID
 					req.Context.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Key: originalModelRequested, Config: aliasConfig})
