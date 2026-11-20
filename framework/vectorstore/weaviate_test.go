@@ -221,6 +221,9 @@ func TestWeaviateConfig_Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if testing.Short() && !tt.expectError {
+				t.Skip("valid Weaviate configuration opens an external connection")
+			}
 			store, err := newWeaviateStore(ctx, &tt.config, logger)
 
 			if tt.expectError {
@@ -240,6 +243,9 @@ func TestWeaviateConfig_Validation(t *testing.T) {
 }
 
 func TestDefaultClassName(t *testing.T) {
+	if testing.Short() {
+		t.Skip("opens an external Weaviate connection")
+	}
 	config := WeaviateConfig{
 		Scheme: "http",
 		Host:   schemas.NewSecretVar("localhost:8080"),

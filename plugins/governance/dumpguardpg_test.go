@@ -27,6 +27,9 @@ func pgEnvOr(key, fallback string) string {
 // the budget and rate limit tables, or skips when no server is reachable.
 func openDumpGuardPostgres(t *testing.T) *gorm.DB {
 	t.Helper()
+	if testing.Short() {
+		t.Skip("requires an external Postgres fixture")
+	}
 	cfg := &postgresconn.Config{
 		Host:     schemas.NewSecretVar(pgEnvOr("BIFROST_TEST_PG_HOST", "localhost")),
 		Port:     schemas.NewSecretVar(pgEnvOr("BIFROST_TEST_PG_PORT", "5432")),

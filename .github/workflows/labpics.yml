@@ -1,0 +1,91 @@
+name: Labpics verification
+
+on:
+  pull_request:
+    branches: [labpics]
+  push:
+    branches: [labpics]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: labpics-verification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Fork verification
+    runs-on: ${{ fromJSON(github.event.repository.visibility == 'public' && '["ubuntu-latest"]' || vars.CI_RUNNER || '') }}
+    timeout-minutes: 45
+    env:
+      VERIFY_CONTAINER: bifrost-verify-${{ github.run_id }}-${{ github.run_attempt }}
+      GO_IMAGE: golang:1.27.4-alpine3.24@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf
+    services:
+      qdrant:
+        image: qdrant/qdrant:v1.19.0@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc
+        env:
+          QDRANT_NUM_CPUS: '2'
+          QDRANT__TELEMETRY_DISABLED: 'true'
+        ports:
+          - 6334/tcp
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Locate the Go cache
+        run: printf 'GO_CACHE_PATH=%s/bifrost-go-cache\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Cache Go modules and compilation
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.GO_CACHE_PATH }}
+          key: go-${{ runner.os }}-${{ runner.arch }}-${{ env.GO_IMAGE }}-${{ hashFiles('**/go.mod', '**/go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ runner.arch }}-${{ env.GO_IMAGE }}-
+      - name: Wait for Qdrant gRPC
+        env:
+          QDRANT_PORT: ${{ job.services.qdrant.ports['6334'] }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import socket
+          import time
+
+          deadline = time.monotonic() + 60
+          while True:
+              try:
+                  with socket.create_connection(('127.0.0.1', int(os.environ['QDRANT_PORT'])), timeout=2):
+                      break
+              except OSError:
+                  if time.monotonic() >= deadline:
+                      raise
+                  time.sleep(1)
+          PY
+      - name: Verify the workspace, formatting, short suites and required tests
+        env:
+          QDRANT_PORT: ${{ job.services.qdrant.ports['6334'] }}
+        run: |
+          mkdir -p "$GO_CACHE_PATH/mod" "$GO_CACHE_PATH/build"
+          docker run --rm --init --name "$VERIFY_CONTAINER" --network host \
+            --volume "$GITHUB_WORKSPACE:/src" --workdir /src \
+            --volume "$GO_CACHE_PATH:/go-cache" \
+            --env GOMODCACHE=/go-cache/mod --env GOCACHE=/go-cache/build \
+            --env "CACHE_UID=$(id -u)" --env "CACHE_GID=$(id -g)" \
+            --env CGO_ENABLED=1 --env GOOS=linux --env GOMAXPROCS=2 \
+            --env 'GOFLAGS=-p=2 -tags=sqlite_static' --env GOTOOLCHAIN=local \
+            --env QDRANT_HOST=127.0.0.1 --env QDRANT_PORT \
+            "$GO_IMAGE" \
+            sh -eu -c '
+              trap "chown -R $CACHE_UID:$CACHE_GID /go-cache" EXIT
+              apk add --no-cache gcc musl-dev sqlite-dev binutils binutils-gold git python3
+              git config --global --add safe.directory /src
+              python3 -m unittest discover -s ci -p "test_*.py"
+              python3 ci/verify.py workspace
+              python3 ci/verify.py format
+              python3 ci/verify.py unit
+              python3 ci/verify.py test
+            '
+      - name: Remove the verifier container
+        if: always()
+        run: docker rm --force "$VERIFY_CONTAINER" >/dev/null 2>&1 || true

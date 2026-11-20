@@ -239,6 +239,9 @@ func TestRedisConfig_Validation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if testing.Short() && !tt.expectError {
+				t.Skip("valid Redis configuration requires an external Redis fixture")
+			}
 			store, err := newRedisStore(ctx, tt.config, logger)
 
 			if tt.expectError {
@@ -248,8 +251,7 @@ func TestRedisConfig_Validation(t *testing.T) {
 					assert.Contains(t, err.Error(), tt.errorMsg)
 				}
 			} else {
-				// For valid configs, store creation should succeed
-				// (connection will fail later when actually using Redis)
+				// Valid configs reach the constructor's PING of the Redis fixture.
 				assert.NoError(t, err)
 				assert.NotNil(t, store)
 			}
@@ -270,6 +272,9 @@ func readTestCACert(t *testing.T) string {
 }
 
 func TestNewRedisStore_ConfiguresStandaloneTLSClient(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires an external Redis TLS fixture")
+	}
 	logger := bifrost.NewDefaultLogger(schemas.LogLevelInfo)
 
 	store, err := newRedisStore(context.Background(), RedisConfig{
@@ -288,6 +293,9 @@ func TestNewRedisStore_ConfiguresStandaloneTLSClient(t *testing.T) {
 }
 
 func TestNewRedisStore_ConfiguresStandaloneTLSClientWithCACert(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires an external Redis TLS fixture")
+	}
 	logger := bifrost.NewDefaultLogger(schemas.LogLevelInfo)
 
 	store, err := newRedisStore(context.Background(), RedisConfig{
@@ -306,6 +314,9 @@ func TestNewRedisStore_ConfiguresStandaloneTLSClientWithCACert(t *testing.T) {
 }
 
 func TestNewRedisStore_ConfiguresClusterTLSClient(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires an external Redis TLS fixture")
+	}
 	logger := bifrost.NewDefaultLogger(schemas.LogLevelInfo)
 
 	store, err := newRedisStore(context.Background(), RedisConfig{
@@ -324,6 +335,9 @@ func TestNewRedisStore_ConfiguresClusterTLSClient(t *testing.T) {
 }
 
 func TestNewRedisStore_ConfiguresClusterTLSClientWithCACert(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires an external Redis TLS fixture")
+	}
 	logger := bifrost.NewDefaultLogger(schemas.LogLevelInfo)
 
 	store, err := newRedisStore(context.Background(), RedisConfig{

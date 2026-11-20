@@ -1,5 +1,18 @@
 # AGENTS.md — Bifrost AI Gateway
 
+## Labpics fork
+
+The maintained branch is `labpics`. Read [FORK.md](FORK.md) for the source,
+build, verification and upstream-update contracts. Local changes and their
+regressions belong in this repository. Use `python3 ci/verify.py workspace`
+before building, and preserve local-module resolution; a build using published
+upstream modules does not verify this fork. `ci/verification.json` is the single
+source of the upstream base and required native tests.
+
+The initial migration imports previously deployed source and tests without a
+wire or request-path change. Preserve that equivalence when reviewing the
+migration; later behavior changes follow the applicable testing guidance below.
+
 > Context for AI agents (Claude Code, Copilot, Cursor, etc.) working on this codebase. Read this fully before making changes.
 
 ## What is Bifrost?
