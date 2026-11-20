@@ -27,7 +27,10 @@ func (c *Controller) reserveProbe(ctx *schemas.BifrostContext, d direction) bool
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if d.due.HoldUntil.IsZero() || d.due.ProbeUntil.After(c.now()) {
+	now := c.now()
+	heldDue := !d.due.HoldUntil.IsZero() && !d.due.HoldUntil.After(now)
+	recoveryDue := d.due.HoldUntil.IsZero() && !d.due.FailedUntil.IsZero() && !d.due.FailedUntil.After(now)
+	if (!heldDue && !recoveryDue) || d.due.ProbeUntil.After(now) {
 		return false
 	}
 	d.due.ProbeUntil = c.now().Add(5 * time.Minute)
@@ -58,6 +61,9 @@ func (c *Controller) direction(ctx *schemas.BifrostContext, provider schemas.Mod
 		total += c.weightLocked(id, now)
 		if r := c.routes[id]; r != nil {
 			latency += r.LatencyMS
+			if !r.FailedUntil.IsZero() && !r.FailedUntil.After(now) && !r.ProbeUntil.After(now) && c.holdLocked(id, now) == nil {
+				d.due = r
+			}
 		}
 		if h := c.holdLocked(id, now); h != nil && !h.HoldUntil.After(now) && !h.ProbeUntil.After(now) {
 			d.due = h
@@ -129,10 +135,25 @@ func (c *Controller) Route(ctx *schemas.BifrostContext, req *schemas.BifrostRequ
 			return nil
 		}
 		selected.Provider = directions[0].provider
-		// Give an all-held provider exactly one due recheck, with healthy
-		// directions behind it. Key selection reserves the actual key.
+		// Keep real traffic on every usable direction, as we do for keys.
+		// Always taking the maximum would freeze a recovered provider's last
+		// bad score forever behind a healthy provider that keeps serving.
+		total := 0.0
 		for _, d := range directions {
-			if d.score == 0 && c.reserveProbe(ctx, d) {
+			total += d.score
+		}
+		draw := rand.Float64() * total
+		for _, d := range directions {
+			draw -= d.score
+			if draw < 0 {
+				selected.Provider = d.provider
+				break
+			}
+		}
+		// A due hold or an expired failure cooldown gets one real recheck,
+		// with healthy directions behind it. The slot also names the key.
+		for _, d := range directions {
+			if c.reserveProbe(ctx, d) {
 				selected.Provider = d.provider
 				break
 			}

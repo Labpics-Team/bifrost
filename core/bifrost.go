@@ -8538,8 +8538,9 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 				// Arm this attempt's TTFT deadline before the provider dials: it
 				// covers the header wait and the first output chunk. The retry loop
 				// disarms and clears it once the first-chunk check settles.
-				if abort := providerUtils.NewAttemptAbort(req.firstTokenTimeout); abort != nil {
-					req.Context.SetValue(schemas.BifrostContextKeyStreamAttemptAbort, abort)
+				attemptAbort := providerUtils.NewAttemptAbort(req.firstTokenTimeout)
+				if attemptAbort != nil {
+					req.Context.SetValue(schemas.BifrostContextKeyStreamAttemptAbort, attemptAbort)
 				}
 				if aliasConfig := k.Aliases.ResolveConfig(originalModelRequested); aliasConfig != nil {
 					resolvedModel = aliasConfig.ModelID
@@ -8645,9 +8646,7 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 				var finalizerOnce sync.Once
 				postHookSpanFinalizer := func(ctx context.Context) {
 					finalizerOnce.Do(func() {
-						if attempt != nil {
-							attempt.End()
-						}
+						finishProviderAttempt(attempt, attemptAbort)
 						pipeline.FinalizeStreamingPostHookSpans(ctx)
 						bifrost.releasePluginPipeline(pipeline)
 					})
@@ -8673,7 +8672,7 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 				if streamErr != nil && streamCh == nil {
 					if attempt != nil {
 						attempt.Observe(nil, streamErr)
-						attempt.End()
+						finishProviderAttempt(attempt, attemptAbort)
 					}
 					finalizerOnce.Do(func() {
 						bifrost.releasePluginPipeline(pipeline)

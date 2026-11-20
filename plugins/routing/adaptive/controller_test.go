@@ -3,11 +3,14 @@ package adaptive
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/maximhq/bifrost/core/keyselectors"
+	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
@@ -160,6 +163,44 @@ func TestAdaptiveStreamsMeasureFirstResponseAndIgnoreCancellation(t *testing.T) 
 	ctx.SetValue(schemas.BifrostContextKeyDirectKey, schemas.Key{ID: "caller"})
 	if c.BeginProviderAttempt(ctx, schemas.ProviderAttemptInfo{KeyID: "caller", Model: "m"}) != nil {
 		t.Fatal("direct credential was tracked")
+	}
+}
+
+func TestAdaptiveTransportTimeoutDistinguishesCallerDeadline(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	defer srv.Close()
+	for _, callerDeadline := range []bool{true, false} {
+		t.Run(map[bool]string{true: "caller deadline", false: "provider timeout"}[callerDeadline], func(t *testing.T) {
+			parent := context.Background()
+			client := &http.Client{Timeout: 30 * time.Millisecond}
+			if callerDeadline {
+				var cancel context.CancelFunc
+				parent, cancel = context.WithTimeout(parent, 30*time.Millisecond)
+				defer cancel()
+				client.Timeout = time.Second
+			}
+			ctx := schemas.NewBifrostContext(parent, schemas.NoDeadline)
+			c := New(DefaultConfig())
+			a := c.BeginProviderAttempt(ctx, schemas.ProviderAttemptInfo{Provider: schemas.OpenAI, Model: "m", KeyID: "a"})
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, transportErr := providerUtils.DoHTTPRequest(client, req)
+			if transportErr == nil {
+				t.Fatal("stalled transport did not time out")
+			}
+			a.Observe(nil, providerUtils.NewBifrostTimeoutError(schemas.ErrProviderRequestTimedOut, transportErr))
+			a.End()
+			status := c.Status()[0]
+			if callerDeadline {
+				if ctx.Err() == nil || status.Samples != 0 || status.ErrorRate != 0 || status.Inflight != 0 {
+					t.Fatalf("caller deadline reduced key health: %+v", status)
+				}
+			} else if ctx.Err() != nil || status.Samples != 1 || status.FailureClass != schemas.FailureClassTimeout {
+				t.Fatalf("provider timeout was ignored: %+v", status)
+			}
+		})
 	}
 }
 

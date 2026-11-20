@@ -2,6 +2,7 @@ package bifrost
 
 import (
 	"context"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -88,6 +89,42 @@ func TestProviderAttemptObserverSeesEachRetryAndStreamingTeardown(t *testing.T) 
 			}
 			requireHits(t, u, map[string]int{"sk-a": 1, "sk-b": 1})
 		})
+	}
+}
+
+func TestProviderAttemptObserverSeesTTFTFailureBeforeHealthyFallback(t *testing.T) {
+	upstream := newTTFTUpstream()
+	fallback := newTTFTUpstream()
+	client := newTTFTTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { upstream.stall(r, time.Second) }), fallback.slowAnthropicHandler(0))
+	observer := &recordingProviderObserver{done: make(chan *recordedProviderAttempt, 8)}
+	client.providerAttemptObserver = observer
+	ctx := ttftContext(30 * time.Millisecond)
+	stream, err := client.ChatCompletionStreamRequest(ctx, ttftChatRequest(anthropicFallback))
+	if err != nil {
+		t.Fatal(err.GetErrorString())
+	}
+	for chunk := range stream {
+		if chunk.BifrostError != nil {
+			t.Fatal(chunk.BifrostError.GetErrorString())
+		}
+	}
+	seen := map[schemas.ModelProvider]*recordedProviderAttempt{}
+	for i := 0; i < 2; i++ {
+		select {
+		case a := <-observer.done:
+			seen[a.info.Provider] = a
+		case <-time.After(2 * time.Second):
+			t.Fatal("stream attempt did not finish")
+		}
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("TTFT cancelled caller context: %v", ctx.Err())
+	}
+	if a := seen[schemas.OpenAI]; a == nil || a.failure != schemas.FailureClassTimeout {
+		t.Fatalf("TTFT header refusal not observed as timeout: %+v", a)
+	}
+	if a := seen[schemas.Anthropic]; a == nil || !a.success || a.failure != "" {
+		t.Fatalf("healthy fallback not observed: %+v", a)
 	}
 }
 

@@ -99,6 +99,83 @@ func TestAdaptiveProviderDueCheckIsReservedAcrossRequests(t *testing.T) {
 	}
 }
 
+func TestAdaptiveProviderRecoversFromTransientFailureOnRealTraffic(t *testing.T) {
+	c, now := providerController()
+	for _, key := range testKeys {
+		for i := 0; i < 3; i++ {
+			observe(c, "p1", "m", key.ID, responseError(503))
+		}
+		observe(c, "p2", "m", key.ID, nil)
+	}
+	r := routeRequest("")
+	c.Route(testContext(), r)
+	if p, _, _ := r.GetRequestFields(); p != "p2" {
+		t.Fatalf("failed provider received ordinary traffic: %s", p)
+	}
+	*now = now.Add(31 * time.Second)
+	// Every formerly failed key gets one real attempt even though the healthy
+	// provider keeps succeeding. Its success updates the score used next time.
+	for range testKeys {
+		ctx := testContext()
+		r = routeRequest("")
+		c.Route(ctx, r)
+		p, _, fallbacks := r.GetRequestFields()
+		if p != "p1" {
+			t.Fatalf("recovered provider starved behind p2: %s", p)
+		}
+		if len(fallbacks) == 0 || fallbacks[0].Provider != "p2" {
+			t.Fatal("recheck lost healthy fallback")
+		}
+		key, err := c.SelectKey(ctx, testKeys, p, "m")
+		if err != nil {
+			t.Fatal(err)
+		}
+		observe(c, p, "m", key.ID, nil)
+	}
+	for _, r := range c.Status() {
+		if r.Provider == "p1" && (r.Samples != 4 || r.ErrorRate >= 1 || r.State != "recovering") {
+			t.Fatalf("successful recovery not observed: %+v", r)
+		}
+	}
+}
+
+func TestAdaptivePruningFollowsNativeNamedProviderSettings(t *testing.T) {
+	for _, test := range []struct {
+		name                                  string
+		append, redirect, failPrimary, pruned bool
+	}{
+		{"only prune keeps named fallback", false, false, false, false},
+		{"no redirect keeps named fallback", false, true, false, false},
+		{"append allows prune", true, false, false, true},
+		{"actual redirect allows prune", false, true, true, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, _ := providerController()
+			cfg := c.Config()
+			cfg.PruneFailedFallbacks = true
+			cfg.AppendFallbacksToPinned = test.append
+			cfg.RerouteFailedDirections = test.redirect
+			c.Apply(cfg)
+			failProvider(c, "failed")
+			if test.failPrimary {
+				failProvider(c, "p1")
+			}
+			r := routeRequest("p1", schemas.Fallback{Provider: "failed", Model: "m"})
+			c.Route(testContext(), r)
+			_, _, fallbacks := r.GetRequestFields()
+			hasFailed := false
+			for _, fb := range fallbacks {
+				if fb.Provider == "failed" {
+					hasFailed = true
+				}
+			}
+			if hasFailed == test.pruned {
+				t.Fatalf("fallback pruning contradicted named-provider policy: %+v", fallbacks)
+			}
+		})
+	}
+}
+
 func BenchmarkAdaptiveProviderRouting(b *testing.B) {
 	c, _ := providerController()
 	ctx := testContext()
@@ -106,6 +183,22 @@ func BenchmarkAdaptiveProviderRouting(b *testing.B) {
 		r := routeRequest("p1")
 		b.ReportAllocs()
 		for b.Loop() {
+			c.Route(ctx, r)
+		}
+	})
+	b.Run("unnamed_two_providers", func(b *testing.B) {
+		for _, provider := range []schemas.ModelProvider{"p1", "p2"} {
+			for _, key := range testKeys {
+				observe(c, provider, "m", key.ID, nil)
+			}
+		}
+		r := routeRequest("")
+		b.ReportAllocs()
+		for b.Loop() {
+			r.SetProvider("")
+			r.SetFallbacks(nil)
+			ctx.ClearValue(schemas.BifrostContextKeyRoutingEngineLogs)
+			ctx.ClearValue(schemas.BifrostContextKeyRoutingEnginesUsed)
 			c.Route(ctx, r)
 		}
 	})

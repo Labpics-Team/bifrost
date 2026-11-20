@@ -365,7 +365,7 @@ func (a *attempt) End() {
 	failure := a.failure
 	// A caller's deadline or abandoned stream says nothing about this key.
 	// Provider/first-token timeouts arrive as a classified provider error above.
-	if failure == "" && a.ctx.Err() != nil {
+	if a.ctx.Err() != nil {
 		failure = schemas.FailureClassCancelled
 	}
 	if !a.observed || a.ignore {
@@ -409,11 +409,13 @@ func (c *Controller) complete(r *route, failure schemas.FailureClass, retryAfter
 	}
 	r.LastSeen = now
 	if failure == schemas.FailureClassCancelled || failure == schemas.FailureClassCallerFault {
+		r.ProbeUntil = time.Time{}
 		if h := c.holdLocked(r.routeID, now); h != nil && !h.HoldUntil.After(started) {
 			h.ProbeUntil = time.Time{}
 		}
 		return
 	}
+	r.ProbeUntil = time.Time{}
 	before := c.stateLocked(r, now)
 	failed := failure != ""
 	r.Samples++

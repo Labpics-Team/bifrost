@@ -62,6 +62,8 @@ the same catalog as real model names; per-key alias resolution stays in core.
 
 A provider already named by the caller, a rule or a virtual key remains selected
 by default. The optional append, redirect and prune settings adjust this policy.
+For a named provider, pruning applies only when appending alternatives is enabled
+or the request was actually redirected, following the native settings contract.
 Explicit caller/rule key pins and direct credentials retain their native
 precedence. Adaptive routing does not change core's retry loop or session
 affinity. A session binding can still name its existing provider/key; native
@@ -73,6 +75,10 @@ weights apply when adaptive key selection is off. Both modes skip held managed
 keys; an all-held pool still sends a real request rather than manufacturing a
 gateway failure. Cancellation and caller faults do not reduce key health. Long
 successful streams measure the first response, not the duration of generation.
+
+Usable providers receive traffic weighted by observed health. An expired failure
+cooldown also gets a single real checking request, so a successful alternative
+cannot leave the recovered provider permanently stuck on its last bad score.
 
 Holds use core's existing `FailureClass`, with the
 [documented scopes and wait ladder](https://docs.getbifrost.ai/enterprise/adaptive-routing/how-it-works#held-keys).
