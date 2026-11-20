@@ -103,6 +103,7 @@ type chatRequest struct {
 	Seed           *int          `json:"seed,omitempty"`
 	Stream         *bool         `json:"stream,omitempty"`
 	Tools          []chatTool    `json:"tools,omitempty"`
+	ToolChoice     string        `json:"tool_choice,omitempty"`
 	PromptCacheKey *string       `json:"prompt_cache_key,omitempty"`
 	ServiceTier    *string       `json:"service_tier,omitempty"`
 	Store          *bool         `json:"store,omitempty"`

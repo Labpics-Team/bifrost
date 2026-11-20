@@ -820,7 +820,7 @@ func TestContextTransport_FreshDialCloseBeforeHeadersNotRetried(t *testing.T) {
 // TestContextTransport_PooledStaleConnStillRetried guards what the fresh-dial
 // rule must not take away (issue #4496): a request that lands on a pooled
 // keep-alive socket the upstream has since closed is retried by fasthttp on a
-// new socket, transparently to the caller.
+// new socket when its method is idempotent.
 func TestContextTransport_PooledStaleConnStillRetried(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -860,6 +860,7 @@ func TestContextTransport_PooledStaleConnStillRetried(t *testing.T) {
 	target := "http://" + ln.Addr().String()
 	for i := 1; i <= 2; i++ {
 		req, resp := newSilentStreamingRequest(target)
+		req.Header.SetMethod(http.MethodGet)
 		if err := client.Do(req, resp); err != nil {
 			t.Fatalf("request %d failed: %v (upstream accepted %d)", i, err, accepted.Load())
 		}

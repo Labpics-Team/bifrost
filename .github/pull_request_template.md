@@ -1,72 +1,26 @@
-## Summary
+## Result
 
-Briefly explain the purpose of this PR and the problem it solves.
+Describe the problem and the resulting behavior. For a behavior change, give a
+concrete before/after example and mention any compatibility or data migration.
 
-## Changes
+## Validation
 
-- What was changed and why
-- Any notable design decisions or trade-offs
-
-## Type of change
-
-- [ ] Bug fix
-- [ ] Feature
-- [ ] Refactor
-- [ ] Documentation
-- [ ] Chore/CI
-
-## Affected areas
-
-- [ ] Core (Go)
-- [ ] Transports (HTTP)
-- [ ] Providers/Integrations
-- [ ] Plugins
-- [ ] UI (React)
-- [ ] Docs
-
-## How to test
-
-Describe the steps to validate this change. Include commands and expected outcomes.
+Use the fork workspace and describe the checks actually completed:
 
 ```sh
-# Core/Transports
-go version
-go test ./...
-
-# UI
-cd ui
-pnpm i || npm i
-pnpm test || npm test
-pnpm build || npm run build
+python3 ci/verify.py workspace
+python3 ci/verify.py format
+python3 ci/verify.py unit
+python3 ci/verify.py test
 ```
 
-If adding new configs or environment variables, document them here.
+The last command needs an isolated Qdrant fixture, as configured in CI.
+Add screenshots for UI changes and measurements for performance claims.
+Image/UI builds and runtime qualification run in Infra when its source pin is
+updated; link that delivery PR when this change is being released.
 
-## Screenshots/Recordings
+## Upstream and contracts
 
-If UI changes, add before/after screenshots or short clips.
-
-## Breaking changes
-
-- [ ] Yes
-- [ ] No
-
-If yes, describe impact and migration instructions.
-
-## Related issues
-
-Link related issues and discussions. Example: Closes #123
-
-## Security considerations
-
-Note any security implications (auth, secrets, PII, sandboxing, etc.).
-
-## Checklist
-
-- [ ] I read `docs/contributing/README.md` and followed the guidelines
-- [ ] I added/updated tests where appropriate
-- [ ] I updated documentation where needed
-- [ ] I verified builds succeed (Go and UI)
-- [ ] I verified the CI pipeline passes locally if applicable
-
-
+Link relevant upstream changes or primary sources. Update [FORK.md](../FORK.md)
+when a supported contract changes. Keep mandatory behavior tests when replacing
+a local implementation with upstream code.

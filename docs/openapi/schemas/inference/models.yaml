@@ -17,7 +17,7 @@ Model:
   properties:
     id:
       type: string
-      description: Model ID in provider/model format
+      description: Model ID in provider/model format for provider listings, or a public name from the routing catalog
     canonical_slug:
       type: string
     name:

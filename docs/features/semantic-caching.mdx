@@ -360,12 +360,30 @@ bifrostConfig := schemas.BifrostConfig{
 | **Embedding provider** | Not needed | Required |
 | **Cost per miss** | Zero embedding cost | One embedding call per miss |
 | **Added latency** | One vector store round-trip per request | Store round-trip, plus an embedding call + similarity search on every direct miss |
-| **Best for** | Stable, repeated prompts; strict dedup | Paraphrased / varied user queries |
+| **Best for** | Repeated prompts after normalization | Paraphrased / varied user queries |
 | **`dimension`** | `1` | The model's real vector size (`> 1`) |
+
+### Normalization and parameter matching
+
+Direct matching follows the upstream cache contract: text is lowercased and leading and trailing whitespace is trimmed before hashing. `Hello`, `hello`, and ` hello ` therefore share a direct entry when the other cache dimensions match. Internal whitespace is preserved. The upstream [normalization change](https://github.com/maximhq/bifrost/commit/ef07c60e3666523c468fb6ec9e40bf876bcbcb14) states its purpose as “for better cache hit rates”. Direct-only mode keeps this normalization; it does not select byte-for-byte text comparison.
+
+Parameters use the native per-request metadata extractors and deterministic hashing. Fields treated as sets, including tools, stop sequences, modalities and include flags, are sorted before hashing; tools are sorted by name. [PR #3210](https://github.com/maximhq/bifrost/pull/3210) introduced this handling to reduce avoidable misses from order changes, including MCP map iteration. This is a response-cache matching rule; it does not reorder the request sent to the provider or change [provider prompt caching](/features/prompt-caching).
+
+The fork adds no separate HTTP-header, query or raw-body identity to this contract. Response decoding is a separate concern: cached opaque `raw_response` JSON preserves its numbers, including integers larger than `2^53`, when replayed.
+
+### Inherited matching limitations
+
+The matching behavior retained from the [pinned upstream extractors](https://github.com/maximhq/bifrost/blob/7cb75fb2f8276ca48d0792c857fecb67b8879e2f/plugins/semanticcache/utils.go) has these Responses limitations:
+
+- Structured `tool_choice` contributes only `name`. An `allowed_tools` choice without a name does not add its mode or allowed-tool list to the key.
+- `text.format` contributes only `type`; its JSON schema and `strict` flag do not participate in the key. Requests differing only in these omitted constraints can share a cache entry.
+- Tools with the same or missing names retain their input order during sorting. Reordering them can cause an additional cache miss.
+
+These are candidates for upstream fixes, separate from the fork's retained availability, conditional expiration cleanup, and lossless replay corrections.
 
 ### Direct-only setup
 
-Direct mode hashes each request deterministically from its normalized input, parameters, and stream flag. Identical requests hit; any difference is a miss. The deterministic cache ID keeps repeated lookups consistent across retries, streaming, and restarts.
+Direct mode hashes each request deterministically from its normalized input, native parameter metadata, and stream flag. Requests with the same normalized cache identity share an entry. The deterministic cache ID keeps repeated lookups consistent across retries, streaming, and restarts.
 
 To enable direct-only mode, set `dimension: 1` and **omit** `provider` and `embedding_model`. In the UI, pick the **Direct only** tab.
 
@@ -431,7 +449,7 @@ bifrost:
 
 </Tabs>
 
-In direct-only mode, all requests use hash matching regardless of the `x-bf-cache-type` header — no embeddings are generated and no embedding credentials are needed.
+In direct-only mode, omit `x-bf-cache-type` or set it to `direct`. No embeddings are generated and no embedding credentials are needed. Explicitly selecting `semantic` when no semantic path is configured skips caching for that request.
 
 ### Vector stores in direct-only mode
 
@@ -570,7 +588,7 @@ ctx = context.WithValue(ctx, semanticcache.CacheNoStoreKey, true)
 </Tabs>
 
 <Note>
-In direct-only mode (no embedding provider), `x-bf-cache-type` and `x-bf-cache-threshold` have no effect — every request uses direct matching.
+In direct-only mode (no embedding provider), omit `x-bf-cache-type` or set it to `direct`. Selecting `semantic` skips caching for that request because no semantic path is configured. `x-bf-cache-threshold` only controls semantic matching and does not affect direct matching.
 </Note>
 
 ---

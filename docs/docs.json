@@ -834,7 +834,8 @@
                 "group": "Models",
                 "expanded": false,
                 "pages": [
-                  "GET /v1/models"
+                  "GET /v1/models",
+                  "GET /v1/routing/models"
                 ]
               },
               {
@@ -1262,7 +1263,8 @@
                 "group": "Health",
                 "expanded": false,
                 "pages": [
-                  "GET /health"
+                  "GET /health",
+                  "GET /readyz"
                 ]
               },
               {

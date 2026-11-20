@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/vectorstore"
 )
 
 // chunkSortKey returns the (Index, ChunkIndex) tuple used to order
@@ -136,6 +137,9 @@ func (plugin *Plugin) processAccumulatedStream(ctx context.Context, requestID st
 	finalMetadata["stream_chunks"] = streamResponses
 
 	if err := plugin.store.Add(ctx, plugin.config.VectorStoreNamespace, accumulator.StorageID, accumulator.Embedding, finalMetadata); err != nil {
+		if vectorstore.IsUnavailable(err) {
+			plugin.requestNamespaceRecovery()
+		}
 		return fmt.Errorf("failed to store complete streaming cache entry: %w", err)
 	}
 

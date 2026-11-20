@@ -97,12 +97,9 @@ var pluginLogStorePool = sync.Pool{
 // value inheritance when derived from another BifrostContext.
 type BifrostContext struct {
 	parent                context.Context
-	deadline              time.Time
-	hasDeadline           bool
-	done                  chan struct{}
-	doneOnce              sync.Once
-	err                   error
-	errMu                 sync.RWMutex
+	cancellation          context.Context
+	cancelContext         context.CancelFunc
+	done                  <-chan struct{}
 	userValues            map[any]any
 	realtimeTurnKeys      map[any]struct{} // opt-in keys copied from HTTP setup into a realtime or Live session
 	trustedValues         map[any]any      // read only by a holder of the key; see SetTrustedValue
@@ -124,11 +121,9 @@ func NewBifrostContext(parent context.Context, deadline time.Time) *BifrostConte
 	if parent == nil {
 		parent = context.Background()
 	}
-	// Unwrap pooled scoped BifrostContexts to their delegate root. A scoped
-	// context (from WithPluginScope) is reset and returned to a sync.Pool when
-	// ReleasePluginScope is called, which can happen before a derived context's
-	// watchCancellation goroutine has finished observing parent.Deadline()/Done().
-	// Pointing the derived parent at the long-lived root avoids that race.
+	// Inherit the request context without retaining per-hook logging or span
+	// metadata. Plugin scopes share cancellation with their delegate, whereas
+	// an ordinary derived BifrostContext has its own cancellation boundary.
 	for {
 		bc, ok := parent.(*BifrostContext)
 		if !ok || bc.valueDelegate == nil {
@@ -136,23 +131,36 @@ func NewBifrostContext(parent context.Context, deadline time.Time) *BifrostConte
 		}
 		parent = bc.valueDelegate
 	}
+	// Let the standard context own cancellation, its cause and its deadline.
+	// An inherited deadline keeps the parent's timer and timeout cause; only
+	// an earlier deadline supplied here needs a separate timer.
+	inherited, hasInheritedDeadline := parent.Deadline()
+	needsDeadline := !deadline.IsZero() && (!hasInheritedDeadline || deadline.Before(inherited))
+	cancellationParent := parent
+	if isNonCancellingContext(parent) {
+		// fasthttp recycles RequestCtx and does not cancel it. Its deadline was
+		// captured above; never leave a cancellation observer reading it later.
+		cancellationParent = context.Background()
+		if hasInheritedDeadline && (deadline.IsZero() || !deadline.Before(inherited)) {
+			deadline = inherited
+		}
+		needsDeadline = !deadline.IsZero()
+	}
+	var cancellation context.Context
+	var cancel context.CancelFunc
+	if needsDeadline {
+		cancellation, cancel = context.WithDeadline(cancellationParent, deadline)
+	} else {
+		cancellation, cancel = context.WithCancel(cancellationParent)
+	}
 	ctx := &BifrostContext{
 		parent:                parent,
-		deadline:              deadline,
-		hasDeadline:           !deadline.IsZero(),
-		done:                  make(chan struct{}),
+		cancellation:          cancellation,
+		cancelContext:         cancel,
+		done:                  cancellation.Done(),
 		blockRestrictedWrites: atomic.Bool{},
 	}
 	ctx.blockRestrictedWrites.Store(false)
-	// Only start goroutine if there's something to watch:
-	// - If we have a deadline, we need the timer
-	// - If parent can be cancelled (Done() != nil) AND is not a non-cancelling context
-	// - If parent has a deadline, we need a timer (parent may not properly cancel via Done())
-	_, parentHasDeadline := parent.Deadline()
-	parentCanCancel := parent.Done() != nil && !isNonCancellingContext(parent)
-	if ctx.hasDeadline || parentCanCancel || parentHasDeadline {
-		go ctx.watchCancellation()
-	}
 	return ctx
 }
 
@@ -189,14 +197,10 @@ func (bc *BifrostContext) WithValue(key any, value any) *BifrostContext {
 // the receiver itself; for plugin-scoped contexts it is the underlying root
 // that scoped Value/SetValue calls delegate to.
 //
-// PLUGIN AUTHORS: capture Root() synchronously inside Pre/PostLLMHook (or
-// any other hook) when you need to write to the context from a goroutine
-// that outlives the hook. The plugin-scoped *BifrostContext passed into your
-// hook is reclaimed by an internal sync.Pool the moment the hook returns —
-// any later SetValue/Value call on it lands in detached storage that nobody
-// downstream can read (and can leak into a future pool reuse). The root,
-// in contrast, lives for the entire request, so a pointer captured here is
-// safe to use for the lifetime of the request even after your hook returns.
+// PLUGIN AUTHORS: capture Root() synchronously inside a hook for goroutines
+// that continue request work after the hook returns. The scoped context carries
+// per-hook logging and span metadata; ReleasePluginScope drops its log-store
+// reference. The request root stays valid for the lifetime of the request.
 //
 // Example:
 //
@@ -209,11 +213,8 @@ func (bc *BifrostContext) WithValue(key any, value any) *BifrostContext {
 //	    return req, &schemas.LLMPluginShortCircuit{Stream: ch}, nil
 //	}
 func (bc *BifrostContext) Root() *BifrostContext {
-	// Unwrap the full delegation chain. A scoped context can in principle be
-	// derived from another scoped context (e.g. nested plugin scopes), and
-	// stopping at the first valueDelegate would return an intermediate pooled
-	// scope — which loses the async-safety guarantee as soon as that
-	// intermediate scope is released.
+	// Unwrap the full delegation chain, including nested plugin scopes. Do not
+	// follow parent: ordinary derived contexts own their cancellation boundary.
 	for bc != nil && bc.valueDelegate != nil {
 		bc = bc.valueDelegate
 	}
@@ -322,58 +323,13 @@ func (bc *BifrostContext) UnblockRestrictedWrites() {
 
 // Cancel cancels the context, closing the Done channel and setting the error to context.Canceled.
 func (bc *BifrostContext) Cancel() {
-	bc.cancel(context.Canceled)
-}
-
-// watchCancellation monitors for deadline expiration and parent cancellation.
-func (bc *BifrostContext) watchCancellation() {
-	var timer <-chan time.Time
-
-	// Use effective deadline (considers both own and parent deadlines)
-	// This handles cases where parent has a deadline but doesn't properly
-	// cancel via Done() (e.g., fasthttp.RequestCtx)
-	if effectiveDeadline, hasDeadline := bc.Deadline(); hasDeadline {
-		duration := time.Until(effectiveDeadline)
-		if duration <= 0 {
-			// Deadline already passed
-			bc.cancel(context.DeadlineExceeded)
-			return
-		}
-		t := time.NewTimer(duration)
-		defer t.Stop()
-		timer = t.C
-	}
-
-	// Don't watch parent.Done() for contexts known to never close it
-	// (e.g., fasthttp.RequestCtx pools contexts and never cancels them)
-	if isNonCancellingContext(bc.parent) {
-		select {
-		case <-timer:
-			bc.cancel(context.DeadlineExceeded)
-		case <-bc.done:
-			// Already cancelled
-		}
+	if bc.valueDelegate != nil {
+		bc.valueDelegate.Cancel()
 		return
 	}
-
-	select {
-	case <-bc.parent.Done():
-		bc.cancel(bc.parent.Err())
-	case <-timer:
-		bc.cancel(context.DeadlineExceeded)
-	case <-bc.done:
-		// Already cancelled
+	if bc.cancelContext != nil {
+		bc.cancelContext()
 	}
-}
-
-// cancel closes the done channel and sets the error.
-func (bc *BifrostContext) cancel(err error) {
-	bc.doneOnce.Do(func() {
-		bc.errMu.Lock()
-		bc.err = err
-		bc.errMu.Unlock()
-		close(bc.done)
-	})
 }
 
 // Deadline returns the deadline for this context.
@@ -383,25 +339,10 @@ func (bc *BifrostContext) Deadline() (time.Time, bool) {
 	if bc.valueDelegate != nil {
 		return bc.valueDelegate.Deadline()
 	}
-	parentDeadline, parentHasDeadline := bc.parent.Deadline()
-
-	if !bc.hasDeadline && !parentHasDeadline {
+	if bc.cancellation == nil {
 		return time.Time{}, false
 	}
-
-	if !bc.hasDeadline {
-		return parentDeadline, true
-	}
-
-	if !parentHasDeadline {
-		return bc.deadline, true
-	}
-
-	// Both have deadlines, return the earlier one
-	if bc.deadline.Before(parentDeadline) {
-		return bc.deadline, true
-	}
-	return parentDeadline, true
+	return bc.cancellation.Deadline()
 }
 
 // Done returns a channel that is closed when the context is cancelled.
@@ -416,18 +357,10 @@ func (bc *BifrostContext) Err() error {
 	if bc.valueDelegate != nil {
 		return bc.valueDelegate.Err()
 	}
-	bc.errMu.RLock()
-	err := bc.err
-	bc.errMu.RUnlock()
-	// The watcher goroutine records a parent cancel asynchronously; read the parent
-	// directly so a cancel is visible on the next call, as with context.WithCancel.
-	if err == nil && bc.parent != nil && !isNonCancellingContext(bc.parent) {
-		if perr := bc.parent.Err(); perr != nil {
-			bc.cancel(perr)
-			return perr
-		}
+	if bc.cancellation == nil {
+		return nil
 	}
-	return err
+	return bc.cancellation.Err()
 }
 
 // Value returns the value associated with the key.
@@ -456,12 +389,14 @@ func (bc *BifrostContext) Value(key any) any {
 		return nil
 	}
 
-	// Never read through to a pooled *fasthttp.RequestCtx parent — it's recycled once the handler returns.
-	if isNonCancellingContext(bc.parent) {
+	// Resolve inherited values through our native cancellation context. It
+	// exposes this request's cancellation identity before inherited metadata,
+	// so Cause stays with the same first cancellation as Done and Err. A
+	// fasthttp-derived cancellation context is detached from the pooled parent.
+	if bc.cancellation == nil {
 		return nil
 	}
-
-	return bc.parent.Value(key)
+	return bc.cancellation.Value(key)
 }
 
 // AuthMode derives the per-user OAuth lookup mode from current context state.

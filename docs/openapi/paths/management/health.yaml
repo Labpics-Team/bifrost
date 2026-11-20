@@ -15,6 +15,8 @@ health:
       Returns the health status of the Bifrost server. Checks connectivity to config store,
       log store, and vector store if configured.
       Unauthenticated by design - `/health` is in the auth middleware's system whitelist.
+      Use `/readyz` for readiness when an optional vector-store outage should not
+      remove the gateway from service.
     tags:
       - Health
     # Public: system-whitelisted in AuthMiddleware.APIMiddleware().
@@ -28,6 +30,40 @@ health:
               $ref: '../../schemas/management/health.yaml#/HealthResponse'
       '503':
         description: Service unavailable
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/inference/common.yaml#/BifrostError'
+
+readiness:
+  get:
+    operationId: getReadiness
+    summary: Readiness check
+    description: |
+      Checks the configured config store and log store required to accept requests.
+      Returns 503 when either check fails. The optional vector store and response
+      cache do not affect readiness; `/health` remains the diagnostic check that
+      includes vector-store connectivity.
+
+      Required store checks still run when `disable_db_pings_in_health` is enabled.
+      Only the exact `/readyz` path is publicly accessible through the auth
+      middleware; this does not grant access to management APIs.
+    tags:
+    - Health
+    security: []
+    responses:
+      '200':
+        description: Required stores are available
+        content:
+          application/json:
+            schema:
+              $ref: '../../schemas/management/health.yaml#/HealthResponse'
+            example:
+              status: ok
+              components:
+                db_pings: ok
+      '503':
+        description: A required store is unavailable
         content:
           application/json:
             schema:

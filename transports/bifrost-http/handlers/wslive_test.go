@@ -533,8 +533,18 @@ func TestLiveSidebandRelayReportsHowItEnded(t *testing.T) {
 		upstream, openai := dialLiveTestUpstream(t)
 		relay := &liveSidebandRelay{liveUpdatePolicy: testLiveUpdatePolicy(fakeLiveModels{allowed: true}), clientConn: newRealtimeClientConn(bifrostSide), upstream: upstream}
 		ended := make(chan *schemas.BifrostError, 1)
-		go func() { ended <- relay.run() }()
-		t.Cleanup(func() { _ = openai.UnderlyingConn().Close() })
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ended <- relay.run()
+		}()
+		// Join the relay before the upgrade callbacks return their connections
+		// to fasthttp, including when an assertion ends the test early.
+		t.Cleanup(func() {
+			_ = openai.UnderlyingConn().Close()
+			_ = app.Close()
+			<-done
+		})
 		return app, openai, ended
 	}
 	wait := func(t *testing.T, ended chan *schemas.BifrostError) *schemas.BifrostError {
@@ -562,8 +572,13 @@ func TestLiveSidebandRelayReportsHowItEnded(t *testing.T) {
 		assert.Nil(t, wait(t, ended))
 	})
 	t.Run("upstream closes normally", func(t *testing.T) {
-		_, openai, ended := start(t)
+		app, openai, ended := start(t)
 		require.NoError(t, openai.WriteControl(ws.CloseMessage, ws.FormatCloseMessage(ws.CloseNormalClosure, "session over"), time.Now().Add(time.Second)))
+		require.NoError(t, app.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, _, err := app.ReadMessage()
+		var closeErr *ws.CloseError
+		require.ErrorAs(t, err, &closeErr)
+		assert.Equal(t, ws.CloseNormalClosure, closeErr.Code)
 		assert.Nil(t, wait(t, ended))
 	})
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,17 +15,24 @@ import (
 // openAIStyleModelsHandler serves a minimal OpenAI-format GET /v1/models
 // response listing the given model IDs.
 func openAIStyleModelsHandler(ids ...string) http.HandlerFunc {
+	// Build the immutable fixture before a request's deadline starts. Repeated
+	// string concatenation inside the handler made large catalogs spend their
+	// page budget on fixture allocation, in addition to the simulated delay.
+	var body strings.Builder
+	body.WriteString(`{"object":"list","data":[`)
+	for i, id := range ids {
+		if i > 0 {
+			body.WriteByte(',')
+		}
+		body.WriteString(`{"id":"`)
+		body.WriteString(id)
+		body.WriteString(`","object":"model","created":1700000000,"owned_by":"test"}`)
+	}
+	body.WriteString(`]}`)
+	payload := []byte(body.String())
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		body := `{"object":"list","data":[`
-		for i, id := range ids {
-			if i > 0 {
-				body += ","
-			}
-			body += `{"id":"` + id + `","object":"model","created":1700000000,"owned_by":"test"}`
-		}
-		body += `]}`
-		_, _ = w.Write([]byte(body))
+		_, _ = w.Write(payload)
 	}
 }
 

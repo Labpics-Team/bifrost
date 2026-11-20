@@ -1,9 +1,12 @@
 package governance
 
 import (
+	"context"
+	"fmt"
 	"testing"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/grant"
 )
 
 // Every Decision that refuses a request. Hand-kept: Go cannot enumerate constants.
@@ -86,5 +89,63 @@ func TestRefusalStillCarriesRawDecisionInType(t *testing.T) {
 		if *bifrostErr.Type != string(decision) {
 			t.Errorf("decision %q surfaced as Type %q", decision, *bifrostErr.Type)
 		}
+	}
+}
+
+type rateLimitFeedbackStore struct {
+	GovernanceStore
+	decision Decision
+	err      error
+}
+
+func (s rateLimitFeedbackStore) CheckRateLimits(context.Context, []schemas.Limit, map[string]int64, map[string]int64) (Decision, error) {
+	return s.decision, s.err
+}
+
+func TestRateLimitFeedbackResolver(t *testing.T) {
+	resolver := &BudgetResolver{store: rateLimitFeedbackStore{
+		decision: DecisionRequestLimited,
+		err: fmt.Errorf("wrapped: %w", &rateLimitRefusal{
+			reason: "counter full", retryAfter: 8000,
+		}),
+	}}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	result := resolver.evaluateLimits(ctx, &EvaluationRequest{}, grant.NewLimits(nil, []schemas.Limit{{ID: "counter"}}))
+	if result.Decision != DecisionRequestLimited || result.RetryAfter != 8000 {
+		t.Fatalf("store feedback must reach the refusal unchanged: %#v", result)
+	}
+	_, refusal := (&GovernancePlugin{}).decide(nil, result)
+	if refusal == nil || refusal.StatusCode == nil || *refusal.StatusCode != 429 ||
+		refusal.ExtraFields.RetryAfter != 8000 {
+		t.Fatalf("resolver feedback must reach the wire fields: %#v", refusal)
+	}
+}
+
+func TestRateLimitFeedbackRefusal(t *testing.T) {
+	for _, decision := range allRefusalDecisions {
+		t.Run(string(decision), func(t *testing.T) {
+			_, refusal := (&GovernancePlugin{}).decide(nil, &EvaluationResult{
+				Decision: decision, RetryAfter: 8000,
+			})
+			if refusal == nil {
+				t.Fatal("expected a refusal")
+			}
+			if isRateLimitViolation(decision) {
+				if refusal.ExtraFields.RetryAfter != 8000 {
+					t.Fatalf("rate-limit feedback was dropped: %#v", refusal.ExtraFields)
+				}
+				if refusal.Type == nil || *refusal.Type != string(decision) || refusal.StatusCode == nil || *refusal.StatusCode != 429 {
+					t.Fatal("existing machine decision and HTTP status must stay intact")
+				}
+			} else if refusal.ExtraFields.RetryAfter != 0 {
+				t.Fatal("access, budget, and internal failures must not inherit rate-limit feedback")
+			}
+		})
+	}
+	_, allowed := (&GovernancePlugin{}).decide(nil, &EvaluationResult{
+		Decision: DecisionAllow, RetryAfter: 8000,
+	})
+	if allowed != nil {
+		t.Fatal("an allowed request must not acquire an error")
 	}
 }

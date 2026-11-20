@@ -1,5 +1,10 @@
 # Bifrost AI Gateway
 
+> **Labpics fork:** the maintained branch is `labpics`. The existing Labpics fixes
+> are integrated into the source tree. Production still uses Infra's upstream
+> and patch build. See [fork contracts, development and delivery](FORK.md).
+> The upstream project and its Apache 2.0 license are preserved below.
+
 <a href="https://trendshift.io/repositories/14529?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-14529" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/14529" alt="maximhq%2Fbifrost | Trendshift" width="250" height="55"/></a>
 
 [![Discord badge](https://img.shields.io/badge/Discord-Join%20Community-5865F2?logo=discord&logoColor=white)](https://discord.gg/exN5KAydbU)
@@ -23,11 +28,9 @@ Bifrost is a high-performance AI gateway that unifies access to 23+ providers (O
 **Step 1:** Start Bifrost Gateway
 
 ```bash
-# Install and run locally
-npx -y @maximhq/bifrost
-
-# Or use Docker
-docker run -p 8080:8080 maximhq/bifrost
+# Build and run the Labpics fork from this checkout
+python3 ci/verify.py workspace
+make run LOCAL=1
 ```
 
 **Step 2:** Configure via Web UI

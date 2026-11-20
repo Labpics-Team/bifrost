@@ -307,6 +307,98 @@
         ]
       }
     },
+    "/v1/routing/models": {
+      "get": {
+        "operationId": "listRoutingModels",
+        "summary": "List public routing model names",
+        "description": "Lists public model names declared by enabled, global, terminal routing rules\nwhose condition is an equality between `model` and a string literal.\nConditional, chained and scoped rules are not advertised. Names are sorted\nand deduplicated using the first declaration with a selectable target in\nrouting priority order. A denied first selectable declaration does not\nexpose a later declaration of the same name.\n\nGovernance validates the caller's identity and required headers, and filters out names whose\nselectable targets are not all allowed by the caller's provider, model and\nkey restrictions. This metadata read does not consume inference quota and\nremains available when an otherwise valid caller exhausts a budget or rate\nlimit. It does not call providers or guarantee that inference will succeed.\n",
+        "tags": [
+          "Models"
+        ],
+        "parameters": [
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "Maximum number of names to return; zero or omitted returns all names",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "page_token",
+            "in": "query",
+            "description": "Continuation token returned by the previous page",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Public routing names visible to the caller",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListModelsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated, but not permitted to perform this action",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Routing model catalog unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "VirtualKeyAuth": []
+          },
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
     "/v1/chat/completions": {
       "post": {
         "operationId": "createChatCompletion",
@@ -39569,7 +39661,7 @@
           "content": "**Required Permissions**\n\n| Permission | Granted via |\n| --- | --- |\n| None | Public endpoint - no authentication required |\n\n[How permissions work](/api/procuring-api-keys#required-permissions)\n"
         },
         "summary": "Health check",
-        "description": "Returns the health status of the Bifrost server. Checks connectivity to config store,\nlog store, and vector store if configured.\nUnauthenticated by design - `/health` is in the auth middleware's system whitelist.\n",
+        "description": "Returns the health status of the Bifrost server. Checks connectivity to config store,\nlog store, and vector store if configured.\nUnauthenticated by design - `/health` is in the auth middleware's system whitelist.\nUse `/readyz` for readiness when an optional vector-store outage should not\nremove the gateway from service.\n",
         "tags": [
           "Health"
         ],
@@ -39587,6 +39679,45 @@
           },
           "503": {
             "description": "Service unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BifrostError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "getReadiness",
+        "summary": "Readiness check",
+        "description": "Checks the configured config store and log store required to accept requests.\nReturns 503 when either check fails. The optional vector store and response\ncache do not affect readiness; `/health` remains the diagnostic check that\nincludes vector-store connectivity.\n\nRequired store checks still run when `disable_db_pings_in_health` is enabled.\nOnly the exact `/readyz` path is publicly accessible through the auth\nmiddleware; this does not grant access to management APIs.\n",
+        "tags": [
+          "Health"
+        ],
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Required stores are available",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                },
+                "example": {
+                  "status": "ok",
+                  "components": {
+                    "db_pings": "ok"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "A required store is unavailable",
             "content": {
               "application/json": {
                 "schema": {
@@ -117652,7 +117783,7 @@
         "properties": {
           "id": {
             "type": "string",
-            "description": "Model ID in provider/model format"
+            "description": "Model ID in provider/model format for provider listings, or a public name from the routing catalog"
           },
           "canonical_slug": {
             "type": "string"

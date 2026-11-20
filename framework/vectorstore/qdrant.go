@@ -3,6 +3,7 @@ package vectorstore
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -10,6 +11,8 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/qdrant/go-client/qdrant"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // qdrantMaxRecvMsgSize is the gRPC max receive message size for Qdrant.
@@ -40,25 +43,84 @@ func (s *QdrantStore) Ping(ctx context.Context) error {
 
 // CreateNamespace creates a new collection in the Qdrant vector store.
 func (s *QdrantStore) CreateNamespace(ctx context.Context, namespace string, dimension int, properties map[string]VectorStoreProperties) error {
-	exists, err := s.client.CollectionExists(ctx, namespace)
-	if err != nil {
-		return fmt.Errorf("failed to check collection existence: %w", err)
+	if dimension <= 0 {
+		return fmt.Errorf("collection %q dimension must be positive", namespace)
 	}
+	existence, err := s.client.GetCollectionsClient().CollectionExists(ctx, &qdrant.CollectionExistsRequest{CollectionName: namespace})
+	if err != nil {
+		return fmt.Errorf("failed to check collection existence: %w", qdrantNamespaceError(namespace, err))
+	}
+	if existence.GetResult() == nil {
+		return fmt.Errorf("failed to check collection %q existence: missing result", namespace)
+	}
+	exists := existence.GetResult().GetExists()
 
+	var payloadSchema map[string]*qdrant.PayloadSchemaInfo
 	if exists {
 		info, infoErr := s.client.GetCollectionInfo(ctx, namespace)
 		if infoErr != nil {
-			s.logger.Warn(fmt.Sprintf("could not inspect existing collection %q for dimension validation (check skipped): %v", namespace, infoErr))
-		} else if params := info.GetConfig().GetParams().GetVectorsConfig().GetParams(); params == nil {
-			// Named-vector collections use GetParamsMap(); Bifrost only creates unnamed vectors so
-			// this collection was not created by Bifrost. Dimension validation is skipped.
-			s.logger.Debug(fmt.Sprintf("collection %q uses named vectors — dimension check skipped (Bifrost always creates unnamed vectors)", namespace))
-		} else {
-			existingDim := int(params.GetSize())
-			if existingDim != dimension {
-				return dimensionMismatchError(namespace, existingDim, dimension, "collection")
-			}
+			return fmt.Errorf("failed to inspect existing collection %q before reconciling indexes: %w", namespace, qdrantNamespaceError(namespace, infoErr))
 		}
+		payloadSchema = info.GetPayloadSchema()
+		vectors := info.GetConfig().GetParams().GetVectorsConfig()
+		if vectors.GetParamsMap() != nil {
+			return fmt.Errorf("collection %q uses named vectors, which Bifrost does not support", namespace)
+		}
+		params := vectors.GetParams()
+		if params == nil {
+			return fmt.Errorf("collection %q has no unnamed vector configuration; cannot verify dimension", namespace)
+		}
+		if params.GetSize() != uint64(dimension) {
+			return dimensionMismatchError(namespace, int(params.GetSize()), dimension, "collection")
+		}
+		if params.GetDistance() != qdrant.Distance_Cosine {
+			return fmt.Errorf("collection %q has distance %s, expected Cosine", namespace, params.GetDistance())
+		}
+	}
+
+	// Validate every existing index before creating missing ones. A schema
+	// mismatch must leave the collection and its operator-selected indexes intact.
+	var missingIndexes []*qdrant.CreateFieldIndexCollection
+	for fieldName, prop := range properties {
+		if !prop.Filterable {
+			continue
+		}
+		var fieldType qdrant.FieldType
+		var schemaType qdrant.PayloadSchemaType
+		switch prop.DataType {
+		case VectorStorePropertyTypeInteger:
+			fieldType, schemaType = qdrant.FieldType_FieldTypeInteger, qdrant.PayloadSchemaType_Integer
+		case VectorStorePropertyTypeBoolean:
+			fieldType, schemaType = qdrant.FieldType_FieldTypeBool, qdrant.PayloadSchemaType_Bool
+		default:
+			fieldType, schemaType = qdrant.FieldType_FieldTypeKeyword, qdrant.PayloadSchemaType_Keyword
+		}
+		if existing, ok := payloadSchema[fieldName]; ok {
+			if existing.GetDataType() != schemaType {
+				return fmt.Errorf("collection %q index %q has type %s, expected %s", namespace, fieldName, existing.GetDataType(), schemaType)
+			}
+			if schemaType == qdrant.PayloadSchemaType_Integer {
+				// Filterable integers support both equality and range Query operators.
+				// Omitted flags default to true; preserve every other index setting.
+				if params := existing.GetParams().GetIntegerIndexParams(); params != nil {
+					if params.Range != nil && !*params.Range {
+						return fmt.Errorf("collection %q integer index %q disables range filtering", namespace, fieldName)
+					}
+					if params.Lookup != nil && !*params.Lookup {
+						return fmt.Errorf("collection %q integer index %q disables lookup filtering", namespace, fieldName)
+					}
+				}
+			}
+			// Keep operator-selected memory placement and other index parameters.
+			continue
+		}
+
+		missingIndexes = append(missingIndexes, &qdrant.CreateFieldIndexCollection{
+			CollectionName: namespace,
+			FieldName:      fieldName,
+			FieldType:      &fieldType,
+			Wait:           qdrant.PtrOf(true),
+		})
 	}
 
 	if !exists {
@@ -70,28 +132,14 @@ func (s *QdrantStore) CreateNamespace(ctx context.Context, namespace string, dim
 			}),
 		})
 		if err != nil {
-			return fmt.Errorf("failed to create collection: %w", err)
+			return fmt.Errorf("failed to create collection: %w", qdrantNamespaceError(namespace, err))
 		}
 	}
 
-	for fieldName, prop := range properties {
-		var fieldType qdrant.FieldType
-		switch prop.DataType {
-		case VectorStorePropertyTypeInteger:
-			fieldType = qdrant.FieldType_FieldTypeInteger
-		case VectorStorePropertyTypeBoolean:
-			fieldType = qdrant.FieldType_FieldTypeBool
-		default:
-			fieldType = qdrant.FieldType_FieldTypeKeyword
-		}
-
-		_, err = s.client.CreateFieldIndex(ctx, &qdrant.CreateFieldIndexCollection{
-			CollectionName: namespace,
-			FieldName:      fieldName,
-			FieldType:      &fieldType,
-		})
+	for _, index := range missingIndexes {
+		_, err = s.client.CreateFieldIndex(ctx, index)
 		if err != nil {
-			s.logger.Debug(fmt.Sprintf("failed to create index for field %s: %v", fieldName, err))
+			return fmt.Errorf("failed to create index %q in collection %q: %w", index.FieldName, namespace, qdrantNamespaceError(namespace, err))
 		}
 	}
 
@@ -144,11 +192,11 @@ func (s *QdrantStore) GetChunk(ctx context.Context, namespace string, id string)
 		WithPayload:    qdrant.NewWithPayload(true),
 	})
 	if err != nil {
-		return SearchResult{}, fmt.Errorf("failed to get point: %w", err)
+		return SearchResult{}, fmt.Errorf("failed to get point: %w", qdrantNamespaceError(namespace, err))
 	}
 
 	if len(points) == 0 {
-		return SearchResult{}, fmt.Errorf("not found: %s", id)
+		return SearchResult{}, fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
 
 	return SearchResult{
@@ -299,7 +347,7 @@ func (s *QdrantStore) GetNearest(ctx context.Context, namespace string, vector [
 		ScoreThreshold: qdrant.PtrOf(float32(threshold)),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to search points: %w", err)
+		return nil, fmt.Errorf("failed to search points: %w", qdrantNamespaceError(namespace, err))
 	}
 
 	results := make([]SearchResult, 0, len(searchResult))
@@ -340,9 +388,18 @@ func (s *QdrantStore) Add(ctx context.Context, namespace string, id string, embe
 		Wait:           qdrant.PtrOf(true),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to upsert point: %w", err)
+		return fmt.Errorf("failed to upsert point: %w", qdrantNamespaceError(namespace, err))
 	}
 	return nil
+}
+
+// Namespace-bound RPCs return NotFound when their collection is missing. A
+// missing point is an empty successful Get response, handled separately above.
+func qdrantNamespaceError(namespace string, err error) error {
+	if status.Code(err) == codes.NotFound {
+		return fmt.Errorf("%w: %q: %w", ErrNamespaceNotFound, namespace, err)
+	}
+	return err
 }
 
 // Delete removes a point from the Qdrant vector store.
@@ -415,6 +472,91 @@ func (s *QdrantStore) DeleteAll(ctx context.Context, namespace string, queries [
 	return results, nil
 }
 
+// DeleteByFilter implements FilteredDeleter without a client-side ID snapshot.
+// Equality accepts strings, booleans and signed integers; range comparisons
+// accept finite numbers within the signed 64-bit domain, without integer precision loss.
+// Other operators are rejected rather than silently weakening the filter.
+func (s *QdrantStore) DeleteByFilter(ctx context.Context, namespace string, queries []Query) error {
+	if strings.TrimSpace(namespace) == "" {
+		return fmt.Errorf("namespace is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	filter, err := buildQdrantDeleteFilter(queries)
+	if err != nil {
+		return err
+	}
+	result, err := s.client.Delete(ctx, &qdrant.DeletePoints{
+		CollectionName: namespace,
+		Points:         qdrant.NewPointsSelectorFilter(filter),
+		Wait:           qdrant.PtrOf(true),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to delete filtered points in collection %q: %w", namespace, err)
+	}
+	if result.GetStatus() != qdrant.UpdateStatus_Completed {
+		return fmt.Errorf("filtered deletion in collection %q was not confirmed complete: %s", namespace, result.GetStatus())
+	}
+	return nil
+}
+
+// buildQdrantDeleteFilter fails closed. The read-path filter builder tolerates
+// unsupported values by dropping conditions, which is unsafe for deletion.
+func buildQdrantDeleteFilter(queries []Query) (*qdrant.Filter, error) {
+	if len(queries) == 0 {
+		return nil, fmt.Errorf("conditional deletion requires a non-empty filter")
+	}
+	conditions := make([]*qdrant.Condition, 0, len(queries))
+	for i, query := range queries {
+		if strings.TrimSpace(query.Field) == "" {
+			return nil, fmt.Errorf("delete filter %d: field is required", i)
+		}
+		switch query.Operator {
+		case QueryOperatorEqual, QueryOperatorNotEqual:
+			switch query.Value.(type) {
+			case string, bool, int, int32, int64:
+			default:
+				return nil, fmt.Errorf("delete filter %d: unsupported equality value %T", i, query.Value)
+			}
+		case QueryOperatorGreaterThan, QueryOperatorGreaterThanOrEqual, QueryOperatorLessThan, QueryOperatorLessThanOrEqual:
+			var number float64
+			var integer int64
+			switch value := query.Value.(type) {
+			case int:
+				integer, number = int64(value), float64(value)
+			case int32:
+				integer, number = int64(value), float64(value)
+			case int64:
+				integer, number = value, float64(value)
+			case float32:
+				number = float64(value)
+			case float64:
+				number = value
+			default:
+				return nil, fmt.Errorf("delete filter %d: unsupported range value %T", i, query.Value)
+			}
+			if integer > 1<<53 || integer < -(1<<53) || math.IsNaN(number) || math.IsInf(number, 0) {
+				return nil, fmt.Errorf("delete filter %d: range value is not a finite, precisely representable number", i)
+			}
+			// An integer index clamps out-of-domain floating bounds. Reject them
+			// before dispatch so that conversion cannot widen a destructive filter.
+			if number >= float64(1<<63) || number < -float64(1<<63) {
+				return nil, fmt.Errorf("delete filter %d: range value is outside the signed 64-bit integer domain", i)
+			}
+			query.Value = number
+		default:
+			return nil, fmt.Errorf("delete filter %d: unsupported operator %q", i, query.Operator)
+		}
+		condition := buildQdrantCondition(query)
+		if condition == nil {
+			return nil, fmt.Errorf("delete filter %d: could not build condition", i)
+		}
+		conditions = append(conditions, condition)
+	}
+	return &qdrant.Filter{Must: conditions}, nil
+}
+
 // Close closes the Qdrant client connection.
 func (s *QdrantStore) Close(ctx context.Context, namespace string) error {
 	return s.client.Close()
@@ -427,7 +569,10 @@ func (s *QdrantStore) RequiresVectors() bool {
 }
 
 // newQdrantStore creates a new Qdrant vector store.
-func newQdrantStore(ctx context.Context, config *QdrantConfig, logger schemas.Logger) (*QdrantStore, error) {
+func newQdrantStore(_ context.Context, config *QdrantConfig, logger schemas.Logger) (*QdrantStore, error) {
+	if config == nil {
+		return nil, fmt.Errorf("qdrant configuration is required")
+	}
 	if strings.TrimSpace(config.Host.GetValue()) == "" {
 		return nil, fmt.Errorf("qdrant host is required")
 	}
@@ -450,11 +595,8 @@ func newQdrantStore(ctx context.Context, config *QdrantConfig, logger schemas.Lo
 		return nil, fmt.Errorf("failed to create qdrant client: %w", err)
 	}
 
-	_, err = client.HealthCheck(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to qdrant: %w", err)
-	}
-
+	// Client setup is local. Optional cache reachability is checked explicitly
+	// through Ping or namespace operations, so an outage cannot block startup.
 	return &QdrantStore{
 		client: client,
 		logger: logger,

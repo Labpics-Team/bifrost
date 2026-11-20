@@ -117,10 +117,7 @@ func (response *BifrostListModelsResponse) ApplyPagination(pageSize int, pageTok
 		}
 	}
 
-	endIndex := offset + pageSize
-	if endIndex > totalItems {
-		endIndex = totalItems
-	}
+	endIndex := offset + min(pageSize, totalItems-offset)
 
 	paginatedData := response.Data[offset:endIndex]
 

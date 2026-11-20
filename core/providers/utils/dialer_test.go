@@ -263,7 +263,7 @@ func TestConfigureDialer_Idempotent(t *testing.T) {
 }
 
 // TestConfigureDialer_WithRetryOnStaleConnection is an integration test that
-// verifies ConfigureDialer enables successful POST retry after TTL mismatch.
+// verifies ConfigureDialer enables successful GET retry after TTL mismatch.
 // This combines both the retry and keepalive behaviors.
 func TestConfigureDialer_WithRetryOnStaleConnection(t *testing.T) {
 	if testing.Short() {
@@ -302,14 +302,14 @@ func TestConfigureDialer_WithRetryOnStaleConnection(t *testing.T) {
 	defer fasthttp.ReleaseResponse(resp)
 
 	req.SetRequestURI(server.URL)
-	req.Header.SetMethod(http.MethodPost)
+	req.Header.SetMethod(http.MethodGet)
 	req.SetBodyString(`{"prompt": "hello"}`)
 
 	if err := client.Do(req, resp); err != nil {
-		t.Fatalf("First POST failed: %v", err)
+		t.Fatalf("First GET failed: %v", err)
 	}
 	if resp.StatusCode() != 200 {
-		t.Fatalf("First POST: expected 200, got %d", resp.StatusCode())
+		t.Fatalf("First GET: expected 200, got %d", resp.StatusCode())
 	}
 	_ = resp.Body()
 
@@ -324,16 +324,16 @@ func TestConfigureDialer_WithRetryOnStaleConnection(t *testing.T) {
 	defer fasthttp.ReleaseResponse(resp2)
 
 	req2.SetRequestURI(server.URL)
-	req2.Header.SetMethod(http.MethodPost)
+	req2.Header.SetMethod(http.MethodGet)
 	req2.SetBodyString(`{"prompt": "world"}`)
 
 	if err := client.Do(req2, resp2); err != nil {
-		t.Fatalf("Second POST failed (ConfigureDialer retry should have saved it): %v", err)
+		t.Fatalf("Second GET failed (ConfigureDialer retry should have saved it): %v", err)
 	}
 	if resp2.StatusCode() != 200 {
-		t.Fatalf("Second POST: expected 200, got %d", resp2.StatusCode())
+		t.Fatalf("Second GET: expected 200, got %d", resp2.StatusCode())
 	}
-	t.Logf("Second POST succeeded after TTL mismatch via ConfigureDialer")
+	t.Logf("Second GET succeeded after TTL mismatch via ConfigureDialer")
 }
 
 // TestConfigureRetry_Deprecated verifies the deprecated ConfigureRetry still works.

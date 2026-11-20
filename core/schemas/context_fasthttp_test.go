@@ -3,11 +3,63 @@
 package schemas
 
 import (
+	"context"
 	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/valyala/fasthttp"
 )
+
+func TestFasthttpContextCancellationReachesChildrenSynchronously(t *testing.T) {
+	var request fasthttp.RequestCtx
+	request.Init(&fasthttp.Request{}, nil, nil)
+	for i := range 100 {
+		root := NewBifrostContext(&request, NoDeadline)
+		standard, cancel := context.WithCancel(root)
+		child := NewBifrostContext(root, NoDeadline)
+		root.Cancel()
+		standardErr, childErr := standard.Err(), child.Err()
+		cancel()
+		child.Cancel()
+		if standardErr != context.Canceled || childErr != context.Canceled {
+			t.Fatalf("iteration %d: Cancel returned before child cancellation: standard=%v bifrost=%v", i, standardErr, childErr)
+		}
+	}
+}
+
+func TestFasthttpContextChildDeadlineStaysIndependent(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var request fasthttp.RequestCtx
+		request.Init(&fasthttp.Request{}, nil, nil)
+		root := NewBifrostContext(&request, time.Now().Add(time.Minute))
+		defer root.Cancel()
+		child, cancel := context.WithTimeout(root, time.Second)
+		defer cancel()
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if child.Err() != context.DeadlineExceeded || root.Err() != nil {
+			t.Fatalf("child deadline changed the request: child=%v root=%v", child.Err(), root.Err())
+		}
+		root.Cancel()
+		if child.Err() != context.DeadlineExceeded || context.Cause(root) != context.Canceled {
+			t.Fatal("request cancellation changed the child's first error or lost its own cause")
+		}
+	})
+}
+
+func BenchmarkFasthttpContextChildCancellation(b *testing.B) {
+	var request fasthttp.RequestCtx
+	request.Init(&fasthttp.Request{}, nil, nil)
+	b.ReportAllocs()
+	for b.Loop() {
+		root := NewBifrostContext(&request, NoDeadline)
+		_, cancel := context.WithCancel(root)
+		root.Cancel()
+		cancel()
+	}
+}
 
 // TestBifrostContext_Value_DoesNotConsultPooledRequestCtx is the deterministic
 // half of the streaming use-after-release crash (the chronic nil-pointer panic
@@ -32,7 +84,9 @@ import (
 // through to a *fasthttp.RequestCtx parent.
 //
 // Pre-fix:  bc.Value(key) returns the RequestCtx-only value (proves the unsafe
-//           fall-through link exists) → test FAILS.
+//
+//	fall-through link exists) → test FAILS.
+//
 // Post-fix: bc.Value(key) returns nil without touching the pooled ctx → PASSES.
 func TestBifrostContext_Value_DoesNotConsultPooledRequestCtx(t *testing.T) {
 	var rctx fasthttp.RequestCtx

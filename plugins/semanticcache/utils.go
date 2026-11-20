@@ -1,11 +1,13 @@
 package semanticcache
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"math"
 	"sort"
@@ -17,6 +19,8 @@ import (
 	"github.com/google/uuid"
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/vectorstore"
+	"github.com/tidwall/gjson"
 )
 
 // Cache the same completion usage fields sent to clients, so explicit zeros
@@ -43,8 +47,29 @@ func marshalCachedResponse(res *schemas.BifrostResponse) ([]byte, error) {
 }
 
 func unmarshalCachedResponse(data []byte, res *schemas.BifrostResponse) error {
-	if err := json.Unmarshal(data, res); err != nil {
+	// Native raw JSON is held in interface{} fields. Keep its exact numbers;
+	// converting through float64 would corrupt integers beyond 2^53 on replay.
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(res); err != nil {
 		return err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return fmt.Errorf("cached response contains trailing data")
+	}
+	// Some response variants have custom JSON decoders, which do not inherit
+	// UseNumber. Restore opaque native JSON from the validated cache envelope,
+	// without interpreting it through those typed decoders. SSE strings keep
+	// their string type. The union's active variant is the only non-null payload.
+	if extra := res.GetExtraFields(); extra != nil && extra.RawResponse != nil {
+		gjson.ParseBytes(data).ForEach(func(_, response gjson.Result) bool {
+			raw := response.Get("extra_fields.raw_response")
+			if raw.IsObject() || raw.IsArray() {
+				extra.RawResponse = json.RawMessage(raw.Raw)
+				return false
+			}
+			return true
+		})
 	}
 	if res.ChatResponse != nil {
 		res.ChatResponse.Usage.PreserveTokenCountZeros(data, "ChatResponse.usage.prompt_tokens", "ChatResponse.usage.completion_tokens")
@@ -618,6 +643,9 @@ func (plugin *Plugin) addNonStreamingResponse(ctx context.Context, responseID st
 	metadata["stream_chunks"] = []string{}
 
 	if err := plugin.store.Add(ctx, plugin.config.VectorStoreNamespace, responseID, embedding, metadata); err != nil {
+		if vectorstore.IsUnavailable(err) {
+			plugin.requestNamespaceRecovery()
+		}
 		return fmt.Errorf("failed to store unified cache entry: %w", err)
 	}
 

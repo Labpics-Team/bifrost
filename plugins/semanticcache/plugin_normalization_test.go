@@ -1,10 +1,103 @@
 package semanticcache
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 
+	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
 )
+
+// Exercise native matching through the client and provider boundary without an
+// external vector store: normalized FAQ text and reordered tool sets replay the
+// first answer instead of making another provider request.
+func TestDirectCacheKeepsNativeMatching(t *testing.T) {
+	const question = "How Do I Reset My Password?"
+	const answer = "Use the password reset link on the sign-in page."
+	tools := []schemas.ChatTool{
+		{Type: schemas.ChatToolTypeFunction, Function: &schemas.ChatToolFunction{Name: "lookup_faq"}},
+		{Type: schemas.ChatToolTypeFunction, Function: &schemas.ChatToolFunction{Name: "contact_support"}},
+	}
+	for _, tc := range []struct {
+		name       string
+		prompts    []string
+		toolOrders [][]schemas.ChatTool
+	}{
+		{
+			name: "TextNormalization",
+			prompts: []string{
+				question,
+				strings.ToLower(question),
+				" \t" + question + "\n ",
+				" \t" + strings.ToLower(question) + "\n ",
+			},
+		},
+		{
+			name:       "ToolSetOrder",
+			prompts:    []string{question, question},
+			toolOrders: [][]schemas.ChatTool{tools, {tools[1], tools[0]}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sends atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sends.Add(1)
+				response := identityTestChatResponse(answer).ChatResponse
+				response.Model = "gpt-4o-mini"
+				response.Choices[0].FinishReason = schemas.Ptr("stop")
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(response)
+			}))
+			defer upstream.Close()
+			plugin := identityScopeTestPlugin(t, newObservableStore(), "")
+			client, err := bifrost.Init(context.Background(), schemas.BifrostConfig{
+				Account: nativeReplayAccount{upstream.URL}, Logger: bifrost.NewDefaultLogger(schemas.LogLevelError),
+				LLMPlugins: []schemas.LLMPlugin{plugin},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Shutdown()
+			var cacheID string
+			for i, prompt := range tc.prompts {
+				request := identityTestChatRequest(prompt, nil).ChatRequest
+				if tc.toolOrders != nil {
+					request.Params = &schemas.ChatParameters{
+						Tools:      tc.toolOrders[i],
+						ToolChoice: &schemas.ChatToolChoice{ChatToolChoiceStr: schemas.Ptr("none")},
+					}
+				}
+				ctx := CreateContextWithCacheKeyAndType(t, "faq", CacheTypeDirect)
+				response, err := client.ChatCompletionRequest(ctx, request)
+				plugin.WaitForPendingOperations()
+				ctx.Cancel()
+				if err != nil || response == nil || len(response.Choices) != 1 || response.Choices[0].Message == nil || response.Choices[0].Message.Content == nil || response.Choices[0].Message.Content.ContentStr == nil {
+					t.Fatalf("request %d did not return an answer: response=%+v error=%v", i, response, err)
+				}
+				if got := *response.Choices[0].Message.Content.ContentStr; got != answer {
+					t.Fatalf("request %d changed the cached answer: %q", i, got)
+				}
+				debug := response.ExtraFields.CacheDebug
+				if debug == nil || debug.CacheHit != (i > 0) || sends.Load() != 1 {
+					t.Fatalf("request %d: want cached=%v with one provider send, got cache=%+v sends=%d", i, i > 0, debug, sends.Load())
+				}
+				if debug.CacheID == nil || *debug.CacheID == "" {
+					t.Fatalf("request %d has no cache ID", i)
+				}
+				if i == 0 {
+					cacheID = *debug.CacheID
+				} else if debug.HitType == nil || *debug.HitType != "direct" || *debug.CacheID != cacheID {
+					t.Fatalf("request %d did not directly replay cache ID %q: %+v", i, cacheID, debug)
+				}
+			}
+		})
+	}
+}
 
 // TestTextNormalizationDirectCache tests that text normalization works correctly
 // for direct cache (hash-based) matching across all input types
@@ -23,7 +116,8 @@ func TestTextNormalizationDirectCache(t *testing.T) {
 }
 
 func testChatCompletionNormalization(t *testing.T, setup *TestSetup) {
-	ctx := CreateContextWithCacheKey(t, "test-chat-normalization")
+	ctx := CreateContextWithCacheKeyAndType(t, "test-chat-normalization", CacheTypeDirect)
+	defer ctx.Cancel()
 
 	// Test cases with different case and whitespace variations
 	testCases := []struct {
@@ -128,7 +222,8 @@ func testChatCompletionNormalization(t *testing.T, setup *TestSetup) {
 }
 
 func testSpeechNormalization(t *testing.T, setup *TestSetup) {
-	ctx := CreateContextWithCacheKey(t, "test-speech-normalization")
+	ctx := CreateContextWithCacheKeyAndType(t, "test-speech-normalization", CacheTypeDirect)
+	defer ctx.Cancel()
 
 	// Test cases with different case and whitespace variations for speech input
 	testCases := []struct {
@@ -194,7 +289,8 @@ func TestChatCompletionContentBlocksNormalization(t *testing.T) {
 	setup := NewTestSetup(t)
 	defer setup.Cleanup()
 
-	ctx := CreateContextWithCacheKey(t, "test-content-blocks-normalization")
+	ctx := CreateContextWithCacheKeyAndType(t, "test-content-blocks-normalization", CacheTypeDirect)
+	defer ctx.Cancel()
 
 	// Test cases with content blocks having different text normalization
 	testCases := []struct {
@@ -293,6 +389,7 @@ func TestNormalizationWithSemanticCache(t *testing.T) {
 	defer setup.Cleanup()
 
 	ctx := CreateContextWithCacheKey(t, "test-normalization-semantic")
+	defer ctx.Cancel()
 
 	// Make first request with original text
 	originalRequest := CreateBasicChatRequest("What is Machine Learning?", 0.5, 50)

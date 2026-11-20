@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/iotest"
@@ -1158,5 +1159,70 @@ func TestSetExtraHeaders_ResolvesSecretVarValues(t *testing.T) {
 	}
 	if got := httpReq.Header.Get("Authorization"); got != "Bearer keep" {
 		t.Errorf("http Authorization overwritten: %q", got)
+	}
+}
+
+func TestContextTransportAcceptedPooledRequestIsNotRepeated(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	var accepted atomic.Int32
+	var connections atomic.Int32
+	var bodiesMu sync.Mutex
+	var bodyConnections []int32
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			connectionID := connections.Add(1)
+			go func() {
+				defer conn.Close()
+				reader := bufio.NewReader(conn)
+				for {
+					req, err := http.ReadRequest(reader)
+					if err != nil {
+						return
+					}
+					_, err = io.Copy(io.Discard, req.Body)
+					req.Body.Close()
+					if err != nil {
+						return
+					}
+					bodiesMu.Lock()
+					bodyConnections = append(bodyConnections, connectionID)
+					bodiesMu.Unlock()
+					if accepted.Add(1) != 1 {
+						return
+					}
+					io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+				}
+			}()
+		}
+	}()
+	client := ConfigureDialer(&fasthttp.Client{ReadTimeout: time.Second, WriteTimeout: time.Second}, true)
+	defer client.CloseIdleConnections()
+	for i := 0; i < 2; i++ {
+		req, resp := newSilentStreamingRequest("http://" + ln.Addr().String())
+		err := client.Do(req, resp)
+		fasthttp.ReleaseRequest(req)
+		fasthttp.ReleaseResponse(resp)
+		if i == 0 && err != nil {
+			t.Fatal(err)
+		}
+		if i == 1 && err == nil {
+			t.Fatal("accepted request without reply became success")
+		}
+	}
+	if got := accepted.Load(); got != 2 {
+		t.Fatalf("warm request + accepted inference produced %d bodies; want 2", got)
+	}
+	bodiesMu.Lock()
+	defer bodiesMu.Unlock()
+	if len(bodyConnections) != 2 || bodyConnections[0] != 1 || bodyConnections[1] != 1 {
+		t.Fatalf("both POST bodies must use the first pooled connection, got connection IDs %v", bodyConnections)
 	}
 }

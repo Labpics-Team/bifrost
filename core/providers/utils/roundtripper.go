@@ -105,13 +105,34 @@ var errTooManyInterimResponses = errors.New("too many 1xx interim responses")
 // watcher could close a socket that is about to be pooled.
 var testHookBeforeConnRelease func()
 
-// RoundTrip implements fasthttp.RoundTripper. The retry flag is true only for a
-// failure before the response headers were parsed on a connection reused from
-// the pool: the upstream may have closed it while idle, and RetryIfErr
-// (network.StaleConnectionRetryIfErr) walks past such sockets. The same failure
-// on a socket dialed for this request is the upstream failing, so it is
-// reported without a fasthttp-level retry and counts against Bifrost's own
-// max_retries (maximhq/bifrost#7035). ErrBodyTooLarge never retries.
+// requestMethodIsIdempotent follows RFC 9110 section 9.2.2. A caller-supplied
+// idempotency header alone does not establish an arbitrary provider's contract.
+func requestMethodIsIdempotent(method []byte) bool {
+	switch string(method) {
+	case "GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE":
+		return true
+	}
+	return false
+}
+
+type requestWriteConn struct {
+	net.Conn
+	written bool
+}
+
+func (c *requestWriteConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.written = true
+	}
+	return n, err
+}
+
+// RoundTrip implements fasthttp.RoundTripper. A reused connection may be retried
+// only for an idempotent method or a proven zero-byte write failure. A missing
+// reply after a non-idempotent write cannot prove the server did no work. Return
+// that error to Bifrost's configured retry loop instead of silently resending it.
+// Fresh-dial failures also use Bifrost's budget. ErrBodyTooLarge never retries.
 func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Request, resp *fasthttp.Response) (retry bool, err error) {
 	ctx := lookupRequestContext(req)
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -132,11 +153,13 @@ func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Requ
 	}
 	conn := cc.Conn()
 	resp.ParseNetConn(conn)
+	writeConn := &requestWriteConn{Conn: conn}
+	idempotent := requestMethodIsIdempotent(req.Header.Method())
 	// fasthttp stamps lastUseTime only when a connection is returned to the
 	// pool, so a zero value means this socket was dialed for this request.
 	reused := !cc.LastUseTime().IsZero()
 	retryOn := func(err error) bool {
-		return reused && !errors.Is(err, fasthttp.ErrBodyTooLarge)
+		return reused && (idempotent || !writeConn.written) && !errors.Is(err, fasthttp.ErrBodyTooLarge)
 	}
 
 	watcher := startCancelWatcher(ctx, abort, conn)
@@ -153,7 +176,7 @@ func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Requ
 		resetConnection = true
 	}
 
-	bw := hc.AcquireWriter(conn)
+	bw := hc.AcquireWriter(writeConn)
 	err = req.Write(bw)
 	if resetConnection {
 		req.Header.ResetConnectionClose()
@@ -187,10 +210,8 @@ func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Requ
 		// Buffered body: the read deadline covers the whole response, which is
 		// what a unary call wants. Headers and body are read as two steps so a
 		// failure can be told apart by whether the upstream ever answered: a
-		// failure before the status line is parsed is what the stale keep-alive
-		// walk (RetryIfErr) exists for, while a body cut short after it means the
-		// upstream has processed the request, so the POST surfaces as an error
-		// and is never replayed on a new socket.
+		// failure before the status line may still follow a dispatched request.
+		// Neither phase can silently replay a POST whose bytes were written.
 		resp.ResetBody()
 		if err = readResponseHeaders(resp, br); err != nil {
 			hc.ReleaseReader(br)

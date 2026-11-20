@@ -852,15 +852,16 @@ func TestDirect(t *testing.T) {
 		t.Parallel()
 		lc := newLogCtx("direct", "1.26_normalization_case")
 		key := "phase1-k26"
+		headers := cacheHeaders{Key: key, Type: "direct"}
 
 		reqA := simpleChat(cfg.OpenAIModel, "Hello, who wrote 1984?")
 		reqB := simpleChat(cfg.OpenAIModel, "hello, who wrote 1984? ")
 
-		respA := postChat(t, lc, 1, reqA, cacheHeaders{Key: key})
+		respA := postChat(t, lc, 1, reqA, headers)
 		idA := assertMiss(t, lc, 2, respA)
 		waitForCacheWrite(t, lc, 3)
 
-		respB := postChat(t, lc, 4, reqB, cacheHeaders{Key: key})
+		respB := postChat(t, lc, 4, reqB, headers)
 		idB := assertHit(t, lc, 5, respB, "direct")
 		assertSameCacheID(t, lc, 6, idB, idA)
 	})
@@ -871,15 +872,16 @@ func TestDirect(t *testing.T) {
 		t.Parallel()
 		lc := newLogCtx("direct", "1.27_normalization_whitespace")
 		key := "phase1-k27"
+		headers := cacheHeaders{Key: key, Type: "direct"}
 
 		reqA := simpleChat(cfg.OpenAIModel, "  Name one type of pasta.  ")
 		reqB := simpleChat(cfg.OpenAIModel, "Name one type of pasta.")
 
-		respA := postChat(t, lc, 1, reqA, cacheHeaders{Key: key})
+		respA := postChat(t, lc, 1, reqA, headers)
 		idA := assertMiss(t, lc, 2, respA)
 		waitForCacheWrite(t, lc, 3)
 
-		respB := postChat(t, lc, 4, reqB, cacheHeaders{Key: key})
+		respB := postChat(t, lc, 4, reqB, headers)
 		idB := assertHit(t, lc, 5, respB, "direct")
 		assertSameCacheID(t, lc, 6, idB, idA)
 	})
@@ -1193,6 +1195,7 @@ func TestDirect(t *testing.T) {
 		t.Parallel()
 		lc := newLogCtx("direct", "1.48_tools_order_independent")
 		key := "phase1-k48"
+		headers := cacheHeaders{Key: key, Type: "direct"}
 		body := "Look up the current weather in Tokyo."
 
 		toolA := chatTool{Type: "function", Function: &toolFunction{
@@ -1206,14 +1209,17 @@ func TestDirect(t *testing.T) {
 
 		reqA := simpleChat(cfg.OpenAIModel, body)
 		reqA.Tools = []chatTool{toolA, toolB}
+		// Keep the response cacheable under the default tool-call response policy.
+		reqA.ToolChoice = "none"
 		reqB := simpleChat(cfg.OpenAIModel, body)
 		reqB.Tools = []chatTool{toolB, toolA} // swapped order
+		reqB.ToolChoice = "none"
 
-		respA := postChat(t, lc, 1, reqA, cacheHeaders{Key: key})
+		respA := postChat(t, lc, 1, reqA, headers)
 		idA := assertMiss(t, lc, 2, respA)
 		waitForCacheWrite(t, lc, 3)
 
-		respB := postChat(t, lc, 4, reqB, cacheHeaders{Key: key})
+		respB := postChat(t, lc, 4, reqB, headers)
 		idB := assertHit(t, lc, 5, respB, "direct")
 		assertSameCacheID(t, lc, 6, idB, idA)
 	})

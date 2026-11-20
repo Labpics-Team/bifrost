@@ -6,9 +6,11 @@ package semanticcache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	bifrost "github.com/maximhq/bifrost/core"
@@ -170,9 +172,21 @@ type Plugin struct {
 	// writes spawned in PostLLMHook). WaitForPendingOperations blocks on this
 	// — tests use it to flush writes before asserting on the store.
 	writersWg sync.WaitGroup
-	// cleanupWg tracks the long-running background loops (stream + cacheState
-	// reapers). Only Cleanup blocks on this, after closing stopCh.
+	// writersMu serializes admission with namespace failure and Cleanup. Wait runs
+	// after admission is closed, so no new Add can race the final drain.
+	writersMu sync.Mutex
+	// cleanupWg tracks the stream, cacheState and persistent retention loops.
+	// Cleanup cancels them before waiting for completion.
 	cleanupWg sync.WaitGroup
+	// retentionCancel interrupts the current store operation during Cleanup.
+	retentionCancel context.CancelFunc
+	// One maintenance worker owns namespace recovery and persistent expiration.
+	maintenanceCancel    context.CancelFunc
+	namespaceUnavailable atomic.Bool
+	maintenanceWake      chan struct{}
+	// writersMu protects pending recovery work. Each attempt consumes it before
+	// its RPC, so a later failure cannot be erased by that RPC's success.
+	namespaceRecoveryPending bool
 	// stopCh is closed by Cleanup to signal the background reaper loops to exit.
 	stopCh chan struct{}
 	// cleanupOnce guards Cleanup so close(stopCh) doesn't panic if the harness
@@ -212,6 +226,7 @@ var VectorStoreProperties = map[string]vectorstore.VectorStoreProperties{
 	"expires_at": {
 		DataType:    vectorstore.VectorStorePropertyTypeInteger,
 		Description: "The expiration time of the cache entry",
+		Filterable:  true,
 	},
 	"cache_key": {
 		DataType:    vectorstore.VectorStorePropertyTypeString,
@@ -306,10 +321,11 @@ func Init(ctx context.Context, config *Config, logger schemas.Logger, store vect
 	}
 
 	plugin := &Plugin{
-		store:  store,
-		config: config,
-		logger: logger,
-		stopCh: make(chan struct{}),
+		store:           store,
+		config:          config,
+		logger:          logger,
+		stopCh:          make(chan struct{}),
+		maintenanceWake: make(chan struct{}, 1),
 	}
 
 	if config.Provider == "" && config.Dimension == 1 {
@@ -318,10 +334,17 @@ func Init(ctx context.Context, config *Config, logger schemas.Logger, store vect
 		logger.Warn("Incomplete semantic mode config: missing provider, falling back to direct search only")
 	}
 
+	// Validate schemas with the native namespace deadline. Unavailable stores
+	// recover in the background; schema and access errors still reject the config.
 	createCtx, cancel := context.WithTimeout(ctx, CreateNamespaceTimeout)
-	defer cancel()
-	if err := store.CreateNamespace(createCtx, config.VectorStoreNamespace, config.Dimension, VectorStoreProperties); err != nil {
-		return nil, fmt.Errorf("failed to create namespace for semantic cache: %w", err)
+	err := store.CreateNamespace(createCtx, config.VectorStoreNamespace, config.Dimension, VectorStoreProperties)
+	cancel()
+	if err != nil {
+		if ctx.Err() != nil || !vectorstore.IsUnavailable(err) {
+			return nil, fmt.Errorf("failed to create namespace for semantic cache: %w", err)
+		}
+		plugin.namespaceUnavailable.Store(true)
+		logger.Warn("Semantic cache unavailable; serving provider requests until namespace recovery: %v", err)
 	}
 
 	plugin.cleanupWg.Add(1)
@@ -330,7 +353,150 @@ func Init(ctx context.Context, config *Config, logger schemas.Logger, store vect
 	plugin.cleanupWg.Add(1)
 	go plugin.runCacheStateCleanupLoop()
 
+	plugin.startRetentionCleanup()
+
 	return plugin, nil
+}
+
+const (
+	retentionCleanupInterval = time.Minute
+	retentionCleanupTimeout  = 30 * time.Second
+)
+
+// startRetentionCleanup owns one serial maintenance worker. Namespace recovery
+// shares it with retention; unavailable cache never starts concurrent repair loops.
+func (plugin *Plugin) startRetentionCleanup() {
+	deleter, hasRetention := plugin.store.(vectorstore.FilteredDeleter)
+	if !hasRetention {
+		plugin.logger.Warn("Persistent cache expiration cleanup is unavailable: vector store does not support conditional deletion")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	plugin.maintenanceCancel = cancel
+	if hasRetention {
+		plugin.retentionCancel = cancel
+	}
+	plugin.cleanupWg.Add(1)
+	go func() {
+		defer plugin.cleanupWg.Done()
+		var retention <-chan time.Time
+		if hasRetention {
+			ticker := time.NewTicker(retentionCleanupInterval)
+			defer ticker.Stop()
+			retention = ticker.C
+			if !plugin.namespaceUnavailable.Load() {
+				plugin.deleteExpiredEntries(ctx, deleter)
+			}
+		}
+		retryTimer := time.NewTimer(time.Second)
+		defer retryTimer.Stop()
+		var retry <-chan time.Time
+		if plugin.namespaceUnavailable.Load() {
+			retry = retryTimer.C
+		} else {
+			retryTimer.Stop()
+		}
+		lastError := ""
+		// One accelerated pass per interval bounds work even when deletion fails
+		// quickly or a legacy expired payload is outside the retention filter.
+		earlyRetentionAllowed := true
+		recoverNamespace := func() {
+			if !plugin.namespaceUnavailable.Load() || ctx.Err() != nil {
+				return
+			}
+			plugin.writersMu.Lock()
+			plugin.namespaceRecoveryPending = false
+			plugin.writersMu.Unlock()
+			createCtx, stop := context.WithTimeout(ctx, CreateNamespaceTimeout)
+			err := plugin.store.CreateNamespace(createCtx, plugin.config.VectorStoreNamespace,
+				plugin.config.Dimension, VectorStoreProperties)
+			stop()
+			if ctx.Err() != nil {
+				return
+			}
+			if err != nil {
+				if err.Error() != lastError {
+					plugin.logger.Warn("Semantic cache remains unavailable: %v", err)
+					lastError = err.Error()
+				}
+				retryTimer.Reset(time.Second)
+				retry = retryTimer.C
+				return
+			}
+			plugin.writersMu.Lock()
+			if plugin.namespaceRecoveryPending {
+				plugin.writersMu.Unlock()
+				retryTimer.Reset(time.Second)
+				retry = retryTimer.C
+				return
+			}
+			plugin.namespaceUnavailable.Store(false)
+			plugin.writersMu.Unlock()
+			lastError = ""
+			earlyRetentionAllowed = true
+			retryTimer.Stop()
+			retry = nil
+			plugin.logger.Info("Semantic cache namespace recovered")
+			if hasRetention {
+				plugin.deleteExpiredEntries(ctx, deleter)
+			}
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-plugin.maintenanceWake:
+				if plugin.namespaceUnavailable.Load() {
+					recoverNamespace()
+				} else if hasRetention && earlyRetentionAllowed {
+					earlyRetentionAllowed = false
+					plugin.deleteExpiredEntries(ctx, deleter)
+				}
+			case <-retry:
+				recoverNamespace()
+			case <-retention:
+				earlyRetentionAllowed = true
+				if !plugin.namespaceUnavailable.Load() {
+					plugin.deleteExpiredEntries(ctx, deleter)
+				}
+			}
+		}
+	}()
+}
+
+func (plugin *Plugin) requestNamespaceRecovery() {
+	plugin.writersMu.Lock()
+	plugin.namespaceRecoveryPending = true
+	changed := plugin.namespaceUnavailable.CompareAndSwap(false, true)
+	plugin.writersMu.Unlock()
+	if changed {
+		plugin.wakeMaintenance()
+	}
+}
+
+func (plugin *Plugin) wakeMaintenance() {
+	select {
+	case plugin.maintenanceWake <- struct{}{}:
+	default:
+	}
+}
+
+func (plugin *Plugin) deleteExpiredEntries(ctx context.Context, deleter vectorstore.FilteredDeleter) {
+	if ctx.Err() != nil {
+		return
+	}
+	// Capture one cutoff per operation. The server evaluates all predicates
+	// against its current state; there is no client-side snapshot of expired IDs.
+	cutoff := time.Now().Unix()
+	queries := []vectorstore.Query{
+		{Field: "from_bifrost_semantic_cache_plugin", Operator: vectorstore.QueryOperatorEqual, Value: true},
+		{Field: "expires_at", Operator: vectorstore.QueryOperatorGreaterThan, Value: int64(0)},
+		{Field: "expires_at", Operator: vectorstore.QueryOperatorLessThan, Value: cutoff},
+	}
+	deleteCtx, cancel := context.WithTimeout(ctx, retentionCleanupTimeout)
+	defer cancel()
+	if err := deleter.DeleteByFilter(deleteCtx, plugin.config.VectorStoreNamespace, queries); err != nil && ctx.Err() == nil {
+		plugin.logger.Warn("Failed to delete expired cache entries in namespace %q: %v", plugin.config.VectorStoreNamespace, err)
+	}
 }
 
 // GetName returns the canonical name used for plugin identification and logging.
@@ -390,6 +556,13 @@ func (plugin *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.Bifro
 	}
 
 	if !isSemanticCacheSupportedRequestType(req.RequestType) {
+		return req, nil, nil
+	}
+
+	if plugin.namespaceUnavailable.Load() {
+		plugin.clearCacheState(requestID)
+		ctx.ClearValue(schemas.BifrostContextKeyCacheLookup)
+		ctx.ClearValue(schemas.BifrostContextKeyCacheMetadata)
 		return req, nil, nil
 	}
 
@@ -454,6 +627,9 @@ func (plugin *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.Bifro
 			msg := fmt.Sprintf("direct search failed (vector store unreachable?): %v", err)
 			plugin.logger.Warn(msg)
 			ctx.Log(schemas.LogLevelWarn, msg)
+			if plugin.disableUnavailableCache(ctx, requestID, err) {
+				return req, nil, nil
+			}
 		} else if shortCircuit != nil {
 			return req, shortCircuit, nil
 		}
@@ -474,6 +650,16 @@ func (plugin *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.Bifro
 				msg := fmt.Sprintf("semantic search skipped: %v", err)
 				plugin.logger.Warn(msg)
 				ctx.Log(schemas.LogLevelWarn, msg)
+				if plugin.disableUnavailableCache(ctx, requestID, err) {
+					return req, nil, nil
+				}
+				// An unsupported lookup or corrupt result does not invalidate a
+				// direct ID or an embedding already obtained for a later write.
+				if state.DirectCacheID == "" && (state.PlaceholderEmbeddings || len(state.Embeddings) == 0) {
+					plugin.clearCacheState(requestID)
+					ctx.ClearValue(schemas.BifrostContextKeyCacheLookup)
+					return req, nil, nil
+				}
 			} else if shortCircuit != nil {
 				return req, shortCircuit, nil
 			}
@@ -489,6 +675,21 @@ func (plugin *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.Bifro
 
 	plugin.recordCacheLookupMiss(ctx, state, requestID)
 	return req, nil, nil
+}
+
+// disableUnavailableCache drops this request's cache work only when the store
+// itself is unavailable. An individual lookup can fail while Add still works.
+func (plugin *Plugin) disableUnavailableCache(ctx *schemas.BifrostContext, requestID string, err error) bool {
+	var storeErr *cacheStoreError
+	if !errors.As(err, &storeErr) || !vectorstore.IsUnavailable(err) {
+		return false
+	}
+	if ctx.Err() == nil {
+		plugin.requestNamespaceRecovery()
+	}
+	plugin.clearCacheState(requestID)
+	ctx.ClearValue(schemas.BifrostContextKeyCacheLookup)
+	return true
 }
 
 // recordCacheLookupMiss records a missed lookup on the request context for the
@@ -660,6 +861,14 @@ func (plugin *Plugin) placeholderVector() []float32 {
 // unmodified — caching never alters the request flow.
 func (plugin *Plugin) PostLLMHook(ctx *schemas.BifrostContext, res *schemas.BifrostResponse, bifrostErr *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError, error) {
 	if bifrostErr != nil {
+		select {
+		case <-plugin.stopCh:
+			if requestID, ok := ctx.Value(schemas.BifrostContextKeyRequestID).(string); ok {
+				plugin.clearCacheState(requestID)
+				plugin.streamAccumulators.Delete(requestID)
+			}
+		default:
+		}
 		// We rely on errors always arriving as the final chunk for streams, so
 		// we abort caching here without further bookkeeping. Any partial
 		// accumulator from a prior chunk gets reaped by the periodic cleanup.
@@ -693,6 +902,13 @@ func (plugin *Plugin) PostLLMHook(ctx *schemas.BifrostContext, res *schemas.Bifr
 	if cacheMetadata != nil && cacheMetadata.CacheHit {
 		plugin.clearCacheState(requestID)
 		return res, nil, nil
+	}
+	select {
+	case <-plugin.stopCh:
+		plugin.clearCacheState(requestID)
+		plugin.streamAccumulators.Delete(requestID)
+		return res, nil, nil
+	default:
 	}
 
 	cacheKey, ok := plugin.resolveCacheKey(ctx)
@@ -851,11 +1067,13 @@ func (plugin *Plugin) PostLLMHook(ctx *schemas.BifrostContext, res *schemas.Bifr
 		if !shouldFlush {
 			return res, nil, nil
 		}
-		plugin.cacheWriter(storageID, func(cacheCtx context.Context) {
+		if !plugin.cacheWriter(storageID, func(cacheCtx context.Context) {
 			if err := plugin.processAccumulatedStream(cacheCtx, requestID); err != nil {
 				plugin.logger.Warn("Failed to cache streaming response (namespace=%s, id=%s): %v. The cache_id stamped on the response will not resolve on subsequent lookups.", plugin.config.VectorStoreNamespace, storageID, err)
 			}
-		})
+		}) {
+			plugin.streamAccumulators.Delete(requestID)
+		}
 		return res, nil, nil
 	}
 
@@ -876,8 +1094,20 @@ func (plugin *Plugin) PostLLMHook(ctx *schemas.BifrostContext, res *schemas.Bifr
 // broken cache backend is that the cache_id stamped on it will not resolve
 // on subsequent lookups. A crashed process for a failed cache write is never
 // acceptable (issue #7450).
-func (plugin *Plugin) cacheWriter(storageID string, write func(ctx context.Context)) {
+func (plugin *Plugin) cacheWriter(storageID string, write func(ctx context.Context)) bool {
+	plugin.writersMu.Lock()
+	select {
+	case <-plugin.stopCh:
+		plugin.writersMu.Unlock()
+		return false
+	default:
+	}
+	if plugin.namespaceUnavailable.Load() {
+		plugin.writersMu.Unlock()
+		return false
+	}
 	plugin.writersWg.Add(1)
+	plugin.writersMu.Unlock()
 	go func() {
 		defer plugin.writersWg.Done()
 		defer func() {
@@ -889,6 +1119,7 @@ func (plugin *Plugin) cacheWriter(storageID string, write func(ctx context.Conte
 		defer cancel()
 		write(cacheCtx)
 	}()
+	return true
 }
 
 // shouldSkipCacheWrite returns true if the upstream response should NOT be
@@ -989,14 +1220,18 @@ func (plugin *Plugin) WaitForPendingOperations() {
 	plugin.writersWg.Wait()
 }
 
-// Cleanup signals the background loops to stop and waits for in-flight cache
-// writes to drain before returning. When CleanUpOnShutdown is true, it then
-// deletes every entry tagged from_bifrost_semantic_cache_plugin and drops
-// the namespace — useful for ephemeral test environments. The default is to
-// leave entries in place so they can serve subsequent process restarts.
+// Cleanup cancels background cleanup, drains in-flight cache writes and joins
+// the workers. Unexpired persistent entries remain available after restart.
 func (plugin *Plugin) Cleanup() error {
 	plugin.cleanupOnce.Do(func() {
+		plugin.writersMu.Lock()
 		close(plugin.stopCh)
+		plugin.writersMu.Unlock()
+		if plugin.maintenanceCancel != nil {
+			plugin.maintenanceCancel()
+		} else if plugin.retentionCancel != nil {
+			plugin.retentionCancel()
+		}
 		plugin.writersWg.Wait()
 		plugin.cleanupWg.Wait()
 

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/maximhq/bifrost/core/schemas"
 	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
 )
 
@@ -877,4 +878,218 @@ func markRequestRateLimitExpired(store *LocalGovernanceStore, rateLimitID string
 	clone.RequestCurrentUsage = 123
 	clone.RequestLastReset = time.Now().Add(-2 * time.Minute)
 	store.rateLimits.Store(rateLimitID, &clone)
+}
+
+func TestRateLimitFeedbackWindows(t *testing.T) {
+	anchor := time.Date(2026, time.November, 7, 10, 19, 15, 0, time.UTC)
+	for _, tc := range []struct {
+		name      string
+		duration  *string
+		calendar  bool
+		anchor    time.Time
+		lastReset time.Time
+		now       time.Time
+		wantDelay int64
+		wantAllow bool
+	}{
+		{"rolling minute", new("1m"), false, anchor, anchor, anchor.Add(52 * time.Second), 8000, false},
+		{"calendar subday is rolling", new("1m"), true, anchor, anchor, anchor.Add(52 * time.Second), 8000, false},
+		{"legacy reset stamp keeps lattice", new("1m"), false, anchor, anchor.Add(2 * time.Second), anchor.Add(52 * time.Second), 8000, false},
+		{"just before boundary rounds up", new("1m"), false, anchor, anchor, anchor.Add(time.Minute - time.Nanosecond), 1, false},
+		{"exact boundary admits unswept counter", new("1m"), false, anchor, anchor, anchor.Add(time.Minute), 0, true},
+		{"future reset is not prematurely expired", new("1m"), false, anchor, anchor.Add(62 * time.Second), anchor.Add(52 * time.Second), 68000, false},
+		{"missing anchor uses last reset", new("1m"), false, time.Time{}, anchor, anchor.Add(52 * time.Second), 8000, false},
+		{"calendar midnight", new("1d"), true, anchor, time.Date(2026, 11, 7, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 7, 23, 59, 52, 0, time.UTC), 8000, false},
+		{"calendar future reset", new("1d"), true, anchor, time.Date(2026, 11, 8, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 7, 23, 59, 52, 0, time.UTC), 86408000, false},
+		{"calendar Monday", new("1w"), true, anchor, time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 8, 23, 59, 52, 0, time.UTC), 8000, false},
+		{"calendar month", new("1M"), true, anchor, time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 11, 30, 23, 59, 52, 0, time.UTC), 8000, false},
+		{"calendar quarter", new("1Q"), true, anchor, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 12, 31, 23, 59, 52, 0, time.UTC), 8000, false},
+		{"calendar year", new("1Y"), true, anchor, time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 12, 31, 23, 59, 52, 0, time.UTC), 8000, false},
+		{"missing duration has no invented deadline", nil, false, anchor, anchor, anchor.Add(52 * time.Second), 0, false},
+		{"invalid calendar suffix stays enforced", new("invalid"), true, anchor, anchor, anchor.Add(52 * time.Second), 0, false},
+		{"zero calendar duration stays enforced", new("0d"), true, anchor, anchor, anchor.Add(52 * time.Second), 0, false},
+		{"negative calendar duration stays enforced", new("-1d"), true, anchor, anchor, anchor.Add(52 * time.Second), 0, false},
+		{"invalid duration stays enforced", new("invalid"), false, anchor, anchor, anchor.Add(52 * time.Second), 0, false},
+		{"zero duration stays enforced", new("0s"), false, anchor, anchor, anchor.Add(52 * time.Second), 0, false},
+		{"negative duration stays enforced", new("-1s"), false, anchor, anchor, anchor.Add(52 * time.Second), 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newStandaloneStoreForResetBenchmark()
+			row := &configstoreTables.TableRateLimit{
+				ID: "counter", CreatedAt: tc.anchor, IsCalendarAligned: tc.calendar,
+				RequestMaxLimit: new(int64(30)), RequestCurrentUsage: 30,
+				RequestResetDuration: tc.duration, RequestLastReset: tc.lastReset,
+			}
+			rows := EntityWiseRateLimits{"key": {row}}
+			decision, err := store.checkRateLimit(context.Background(), rows, nil, nil, tc.now)
+			if tc.wantAllow {
+				if decision != DecisionAllow || err != nil {
+					t.Fatalf("closed window must admit the unswept counter: %s, %v", decision, err)
+				}
+			} else {
+				refusal, ok := err.(*rateLimitRefusal)
+				if !ok || decision != DecisionRequestLimited {
+					t.Fatalf("want request refusal, got %s, %v", decision, err)
+				}
+				if refusal.retryAfter != tc.wantDelay {
+					t.Fatalf("feedback = %d, want %d", refusal.retryAfter, tc.wantDelay)
+				}
+				if tc.wantDelay == 0 {
+					decision, err := store.checkRateLimit(context.Background(), rows, nil, nil, tc.now.AddDate(1, 0, 0))
+					if decision != DecisionRequestLimited || err == nil {
+						t.Fatal("an invalid or missing reset must not expire at a calendar boundary")
+					}
+				}
+				if tc.wantDelay > 0 {
+					next := store.rateLimitNextReset(tc.duration, tc.calendar, tc.anchor, tc.lastReset, tc.now)
+					if store.rateLimitResetTarget(tc.duration, tc.calendar, tc.anchor, tc.lastReset, next.Add(-time.Nanosecond)) != nil {
+						t.Fatal("the reset owner must not expire the counter before the reported boundary")
+					}
+					if store.rateLimitResetTarget(tc.duration, tc.calendar, tc.anchor, tc.lastReset, next) == nil {
+						t.Fatal("the reported boundary must be a real reset boundary")
+					}
+					if decision, err := store.checkRateLimit(context.Background(), rows, nil, nil, next); decision != DecisionAllow || err != nil {
+						t.Fatalf("reported reset must permit another attempt: %s, %v", decision, err)
+					}
+				}
+			}
+			if *row.RequestMaxLimit != 30 || row.RequestCurrentUsage != 30 || !row.RequestLastReset.Equal(tc.lastReset) {
+				t.Fatal("feedback must not change policy, charge a request, or reset usage")
+			}
+		})
+	}
+}
+
+func TestRateLimitFeedbackFutureAnchor(t *testing.T) {
+	now := time.Now()
+	store := newStandaloneStoreForResetBenchmark()
+	row := &configstoreTables.TableRateLimit{
+		ID: "future-anchor", CreatedAt: now.Add(time.Hour),
+		TokenMaxLimit: new(int64(1)), TokenCurrentUsage: 1,
+		RequestMaxLimit: new(int64(1)), RequestCurrentUsage: 1,
+		TokenResetDuration: new("1m"), RequestResetDuration: new("1m"),
+		TokenLastReset: now.Add(-time.Minute), RequestLastReset: now.Add(-time.Minute),
+	}
+	ctx := context.Background()
+	decision, err := store.checkRateLimit(ctx, EntityWiseRateLimits{"key": {row}}, nil, nil, now)
+	if decision != DecisionRateLimited || err == nil {
+		t.Fatalf("future reset cannot admit an exhausted counter: %s, %v", decision, err)
+	}
+	if next := store.rateLimitNextReset(row.RequestResetDuration, false, row.CreatedAt, row.RequestLastReset, now); !next.Equal(row.CreatedAt) {
+		t.Fatalf("first due reset = %v, want anchor %v", next, row.CreatedAt)
+	}
+	store.rateLimits.Store(row.ID, row)
+	if err := store.BumpRateLimitUsage(ctx, row.ID, 1, true, true); err != nil {
+		t.Fatal(err)
+	}
+	got := store.LoadRateLimit(ctx, row.ID)
+	if got.TokenCurrentUsage != 2 || got.RequestCurrentUsage != 2 || !got.TokenLastReset.Equal(row.TokenLastReset) || !got.RequestLastReset.Equal(row.RequestLastReset) {
+		t.Fatalf("usage bump prematurely reset a future window: %+v", got)
+	}
+	if decision, err := store.checkRateLimit(ctx, EntityWiseRateLimits{"key": {row}}, nil, nil, row.CreatedAt); decision != DecisionAllow || err != nil {
+		t.Fatalf("due anchor must admit the unswept counter: %s, %v", decision, err)
+	}
+}
+
+func BenchmarkRateLimitResetTarget(b *testing.B) {
+	store := newStandaloneStoreForResetBenchmark()
+	now := time.Date(2026, time.November, 20, 0, 0, 0, 0, time.UTC)
+	anchor := now.Add(-time.Hour)
+	lastReset := now.Add(-30 * time.Second)
+	duration := "1m"
+	b.ReportAllocs()
+	for b.Loop() {
+		if store.rateLimitResetTarget(&duration, false, anchor, lastReset, now) == nil {
+			b.Fatal("due reset was lost")
+		}
+	}
+}
+
+func TestRateLimitFeedbackOverlappingWindows(t *testing.T) {
+	now := time.Date(2026, time.November, 7, 10, 20, 7, 0, time.UTC)
+	requestLimit := func(id, duration string, elapsed time.Duration) *configstoreTables.TableRateLimit {
+		reset := now.Add(-elapsed)
+		return &configstoreTables.TableRateLimit{
+			ID: id, CreatedAt: reset, RequestLastReset: reset,
+			RequestMaxLimit: new(int64(30)), RequestCurrentUsage: 36, RequestResetDuration: new(duration),
+		}
+	}
+	short := requestLimit("short", "1m", 52*time.Second)
+	long := requestLimit("long", "5m", 0)
+	token := &configstoreTables.TableRateLimit{
+		ID: "token", CreatedAt: now, TokenLastReset: now,
+		TokenMaxLimit: new(int64(100)), TokenCurrentUsage: 100, TokenResetDuration: new("12s"),
+	}
+	unknown := requestLimit("unknown", "invalid", 0)
+	available := *long
+	available.RequestCurrentUsage = 0
+	for _, tc := range []struct {
+		name      string
+		rows      EntityWiseRateLimits
+		now       time.Time
+		wantDelay int64
+	}{
+		{"all request windows must reset", EntityWiseRateLimits{"short": {short}, "long": {long}}, now, 300000},
+		{"token and request windows must reset", EntityWiseRateLimits{"short": {short}, "token": {token}}, now, 12000},
+		{"expired window no longer blocks", EntityWiseRateLimits{"short": {short}, "long": {long}}, now.Add(8 * time.Second), 292000},
+		{"unknown reset cannot promise a finite deadline", EntityWiseRateLimits{"short": {short}, "unknown": {unknown}}, now, 0},
+		{"unexhausted window does not delay retry", EntityWiseRateLimits{"short": {short}, "available": {&available}}, now, 8000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newStandaloneStoreForResetBenchmark()
+			_, err := store.checkRateLimit(context.Background(), tc.rows, nil, nil, tc.now)
+			refusal, ok := err.(*rateLimitRefusal)
+			if !ok || refusal.retryAfter != tc.wantDelay {
+				t.Fatalf("feedback = %#v, want %d", err, tc.wantDelay)
+			}
+		})
+	}
+	t.Run("remote baseline participates without changing the quota", func(t *testing.T) {
+		available := *short
+		available.RequestCurrentUsage = 25
+		store := newStandaloneStoreForResetBenchmark()
+		decision, err := store.checkRateLimit(context.Background(), EntityWiseRateLimits{"short": {&available}}, nil, map[string]int64{short.ID: 5}, now)
+		refusal, ok := err.(*rateLimitRefusal)
+		if !ok || decision != DecisionRequestLimited || refusal.retryAfter != 8000 {
+			t.Fatalf("local plus baseline must enforce the same 30-request window: %s, %#v", decision, err)
+		}
+	})
+}
+
+func TestRateLimitFeedbackAdmission(t *testing.T) {
+	for _, duration := range []string{"1h", "invalid"} {
+		for _, blocked := range []bool{false, true} {
+			name := "allowed"
+			want := DecisionAllow
+			if blocked {
+				name = "refused"
+				want = DecisionRequestLimited
+			}
+			t.Run(duration+"/"+name, func(t *testing.T) {
+				store := newStandaloneStoreForResetBenchmark()
+				now := time.Now()
+				limits := make([]schemas.Limit, 4)
+				for i := range limits {
+					id := fmt.Sprintf("counter-%d", i)
+					row := &configstoreTables.TableRateLimit{
+						ID: id, CreatedAt: now, RequestLastReset: now,
+						RequestMaxLimit: new(int64(30)), RequestResetDuration: new(duration),
+					}
+					if blocked {
+						row.RequestCurrentUsage = 30
+					}
+					store.rateLimits.Store(id, row)
+					limits[i] = schemas.Limit{ID: id, HolderKind: "vk"}
+				}
+				decision, err := store.CheckRateLimits(context.Background(), limits, nil, nil)
+				if decision != want || blocked != (err != nil) {
+					t.Fatalf("unexpected decision: %s, %v", decision, err)
+				}
+				logged := len(store.logger.(*MockLogger).errors) > 0
+				if logged != (blocked && duration == "invalid") {
+					t.Fatalf("reset parsing must run only for exhausted counters: logged=%v", logged)
+				}
+			})
+		}
+	}
 }

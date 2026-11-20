@@ -806,17 +806,21 @@ func TestSemantic(t *testing.T) {
 		t.Parallel()
 		lc := newLogCtx("semantic", "2.34_tools_order_independent_semantic")
 		key := "phase2-k34"
+		headers := cacheHeaders{Key: key, Type: "semantic"}
 		toolA := chatTool{Type: "function", Function: &toolFunction{Name: "get_weather", Parameters: map[string]any{"type": "object", "properties": map[string]any{"city": map[string]any{"type": "string"}}}}}
 		toolB := chatTool{Type: "function", Function: &toolFunction{Name: "search_web", Parameters: map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}}}}
 
 		reqA := simpleChat(cfg.OpenAIModel, "What is the capital city of France in modern times?")
 		reqA.Tools = []chatTool{toolA, toolB}
+		// Tool execution is irrelevant here; keep both provider responses cacheable.
+		reqA.ToolChoice = "none"
 		reqB := simpleChat(cfg.OpenAIModel, "Tell me the capital city of France in modern times.")
 		reqB.Tools = []chatTool{toolB, toolA}
+		reqB.ToolChoice = "none"
 
-		_ = assertMiss(t, lc, 2, postChat(t, lc, 1, reqA, cacheHeaders{Key: key}))
+		_ = assertMiss(t, lc, 2, postChat(t, lc, 1, reqA, headers))
 		waitForCacheWrite(t, lc, 3)
-		_ = assertHit(t, lc, 5, postChat(t, lc, 4, reqB, cacheHeaders{Key: key}), "semantic")
+		_ = assertHit(t, lc, 5, postChat(t, lc, 4, reqB, headers), "semantic")
 	})
 
 	// 2.35 tools_function_name_change_semantic — different tool names → miss.

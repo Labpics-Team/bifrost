@@ -225,6 +225,7 @@ type ServerCallbacks interface {
 	ResolveAccess(ctx *schemas.BifrostContext) (schemas.Access, error)
 	// The models listing narrows its provider fan-out to what the request may reach.
 	NarrowListModelsProviders(bifrostCtx *schemas.BifrostContext)
+	ListRoutingModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError)
 }
 
 // GovernanceRouteOverridesProvider lets downstream editions replace selected OSS governance route families.

@@ -19,6 +19,9 @@ import (
 )
 
 func TestAnthropic(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires live Anthropic API access")
+	}
 	t.Parallel()
 	if strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")) == "" {
 		t.Skip("Skipping Anthropic tests because ANTHROPIC_API_KEY is not set")

@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
@@ -9433,5 +9434,273 @@ func TestVideo_ListResumesFromNativeCursor(t *testing.T) {
 	decoded, decodeErr := schemas.DecodeSerialCursor(*resp.After)
 	if decodeErr != nil || decoded.KeyIndex != 2 {
 		t.Fatalf("cursor = %+v (%v), want the third key", decoded, decodeErr)
+	}
+}
+
+func writeChatCompletionTestResponse(w http.ResponseWriter, stream bool) {
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"id\":\"done\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"useful\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+		return
+	}
+	fmt.Fprint(w, "{\"id\":\"done\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"useful\"},\"finish_reason\":\"stop\"}]}")
+}
+
+// A lost response may follow an accepted request. Retrying it is a configured
+// application decision; the transport must not add attempts outside that budget.
+func TestProviderRetryBudgetAfterLostResponse(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		for _, maxRetries := range []int{0, 1} {
+			t.Run(fmt.Sprintf("stream=%v/max_retries=%d", streaming, maxRetries), func(t *testing.T) {
+				var sends atomic.Int32
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					if err != nil || r.Method != http.MethodPost || len(body) == 0 {
+						t.Errorf("expected a complete POST body: method=%s length=%d error=%v", r.Method, len(body), err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					if sends.Add(1) == 1 {
+						conn, _, err := w.(http.Hijacker).Hijack()
+						if err != nil {
+							t.Error(err)
+							return
+						}
+						conn.Close()
+						return
+					}
+					writeChatCompletionTestResponse(w, streaming)
+				}))
+				defer upstream.Close()
+				account := NewMockAccount()
+				account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, upstream.URL)
+				account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = maxRetries
+				account.configs[schemas.OpenAI].NetworkConfig.RetryBackoffInitial = time.Millisecond
+				account.configs[schemas.OpenAI].NetworkConfig.RetryBackoffMax = time.Millisecond
+				account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{{ID: "fixture", Value: *schemas.NewSecretVar("fixture"), Models: schemas.WhiteList{"*"}, Weight: 100}})
+				client := newStreamTestClient(t, account)
+				ctx := ttftContext(0)
+				defer ctx.Cancel()
+				var requestErr *schemas.BifrostError
+				var content string
+				if streaming {
+					var stream chan *schemas.BifrostStreamChunk
+					stream, requestErr = client.ChatCompletionStreamRequest(ctx, ttftChatRequest())
+					if stream != nil {
+						var streamErrors []string
+						content, streamErrors = drainChatStream(stream)
+						if len(streamErrors) != 0 {
+							t.Fatalf("stream errors: %v", streamErrors)
+						}
+					}
+				} else {
+					var response *schemas.BifrostChatResponse
+					response, requestErr = client.ChatCompletionRequest(ctx, ttftChatRequest())
+					if response != nil && len(response.Choices) != 0 && response.Choices[0].Message.Content != nil && response.Choices[0].Message.Content.ContentStr != nil {
+						content = *response.Choices[0].Message.Content.ContentStr
+					}
+				}
+				if got := sends.Load(); got != int32(maxRetries+1) {
+					t.Fatalf("accepted POSTs=%d, want %d for max_retries=%d", got, maxRetries+1, maxRetries)
+				}
+				if maxRetries == 0 {
+					if requestErr == nil || content != "" {
+						t.Fatalf("lost response with no retries: content=%q error=%v", content, requestErr)
+					}
+				} else if requestErr != nil || content != "useful" {
+					t.Fatalf("configured retry: content=%q error=%v", content, requestErr)
+				}
+			})
+		}
+	}
+}
+
+type requestContextTestKey struct{}
+
+type requestContextRecorder struct {
+	fakeRoutingPlugin
+	contexts chan *schemas.BifrostContext
+	barrier  <-chan struct{}
+}
+
+func (p *requestContextRecorder) PreRequestHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) error {
+	_, model, _ := req.GetRequestFields()
+	ctx.SetValue(requestContextTestKey{}, model)
+	p.contexts <- ctx
+	if p.barrier != nil {
+		<-p.barrier
+	}
+	return nil
+}
+
+func TestNilContextFiniteStreamCompletesBeforeRead(t *testing.T) {
+	upstream := httptest.NewServer(sseHandler(
+		`{"id":"done","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}`,
+		`{"id":"done","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+	))
+	defer upstream.Close()
+	account := NewMockAccount()
+	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, upstream.URL)
+	account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = 0
+	account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{{ID: "fixture", Value: *schemas.NewSecretVar("fixture"), Models: schemas.WhiteList{"*"}, Weight: 100}})
+	recorder := &requestContextRecorder{fakeRoutingPlugin: fakeRoutingPlugin{name: "request-context"}, contexts: make(chan *schemas.BifrostContext, 1)}
+	client := newStreamTestClient(t, account, recorder)
+	stream, err := client.ChatCompletionStreamRequest(nil, ttftChatRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := <-recorder.contexts
+	if ctx == client.ctx {
+		t.Fatal("request reused the client context")
+	}
+	// A finite response that fits the provider buffer can finish without a reader.
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("completed stream retained its request context until a consumer read")
+	}
+	content, errors := drainChatStream(stream)
+	if content != "hello" || len(errors) != 0 {
+		t.Fatalf("completed response changed: content=%q errors=%v", content, errors)
+	}
+	if client.ctx.Err() != nil {
+		t.Fatal("request completion cancelled the client")
+	}
+}
+
+func TestOwnedStreamCancellationIsNotCleanEOF(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		bufferedFinal bool
+		closedSource  bool
+	}{
+		{name: "buffered_final=false"},
+		{name: "buffered_final=true", bufferedFinal: true, closedSource: true},
+		{name: "closed_source", closedSource: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for i := range 32 {
+				ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+				source := make(chan *schemas.BifrostStreamChunk, 1)
+				terminal := &schemas.BifrostStreamChunk{BifrostChatResponse: &schemas.BifrostChatResponse{
+					Choices: []schemas.BifrostResponseChoice{{FinishReason: schemas.Ptr("stop")}},
+				}}
+				if tc.bufferedFinal {
+					source <- terminal
+				}
+				if tc.closedSource {
+					close(source)
+				}
+				ctx.Cancel()
+				output := finishOwnedRequestStream(ctx, source)
+				observedTerminal := false
+				for chunk := range output {
+					if chunk == terminal {
+						observedTerminal = true
+					}
+					if chunk.BifrostError != nil && chunk.BifrostError.Error != nil && chunk.BifrostError.Error.Type != nil && *chunk.BifrostError.Error.Type == schemas.RequestCancelled {
+						observedTerminal = true
+					}
+				}
+				if !observedTerminal {
+					t.Fatalf("iteration %d: cancellation ended the stream without its final chunk or a cancellation error", i)
+				}
+			}
+		})
+	}
+}
+
+func TestOwnedStreamCancellationDoesNotWaitForReader(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		defer ctx.Cancel()
+		source := make(chan *schemas.BifrostStreamChunk, 1)
+		_ = finishOwnedRequestStream(ctx, source)
+		source <- &schemas.BifrostStreamChunk{}
+		synctest.Wait()
+		source <- &schemas.BifrostStreamChunk{}
+		synctest.Wait()
+		ctx.Cancel()
+		// The bubble must exit even though its returned stream is never read.
+		synctest.Wait()
+	})
+}
+
+func BenchmarkOwnedRequestStream(b *testing.B) {
+	chunk := &schemas.BifrostStreamChunk{}
+	b.ReportAllocs()
+	for b.Loop() {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		source := make(chan *schemas.BifrostStreamChunk, 1)
+		source <- chunk
+		close(source)
+		for range finishOwnedRequestStream(ctx, source) {
+		}
+	}
+}
+
+func TestConcurrentNilContextRequestsHaveIsolatedState(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		writeChatCompletionTestResponse(w, false)
+	}))
+	defer upstream.Close()
+	account := NewMockAccount()
+	account.AddProviderWithBaseURL(schemas.OpenAI, 2, 4, upstream.URL)
+	account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = 0
+	account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{{ID: "fixture", Value: *schemas.NewSecretVar("fixture"), Models: schemas.WhiteList{"*"}, Weight: 100}})
+	barrier := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(barrier) }) }
+	defer release()
+	recorder := &requestContextRecorder{fakeRoutingPlugin: fakeRoutingPlugin{name: "request-context"}, contexts: make(chan *schemas.BifrostContext, 2), barrier: barrier}
+	client := newStreamTestClient(t, account, recorder)
+	client.ctx.SetValue(requestContextTestKey{}, "client")
+	done := make(chan *schemas.BifrostError, 2)
+	for _, model := range []string{"request-a", "request-b"} {
+		go func() {
+			request := ttftChatRequest()
+			request.Model = model
+			_, err := client.ChatCompletionRequest(nil, request)
+			done <- err
+		}()
+	}
+	var contexts []*schemas.BifrostContext
+	for range 2 {
+		select {
+		case ctx := <-recorder.contexts:
+			contexts = append(contexts, ctx)
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent requests did not reach the hook")
+		}
+	}
+	if contexts[0] == contexts[1] || contexts[0] == client.ctx || contexts[1] == client.ctx {
+		t.Error("nil-context requests shared mutable context")
+	}
+	models := map[any]bool{}
+	for _, ctx := range contexts {
+		models[ctx.Value(requestContextTestKey{})] = true
+	}
+	if !models["request-a"] || !models["request-b"] || client.ctx.Value(requestContextTestKey{}) != "client" {
+		t.Error("request-local state leaked between concurrent requests or into the client")
+	}
+	release()
+	for range 2 {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("request failed: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent requests did not complete")
+		}
+	}
+	for _, ctx := range contexts {
+		if ctx.Err() != context.Canceled {
+			t.Error("completed request retained its owned context")
+		}
+	}
+	if client.ctx.Err() != nil {
+		t.Error("request completion cancelled the client")
 	}
 }

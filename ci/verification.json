@@ -1,0 +1,162 @@
+{
+  "upstream": {
+    "repository": "https://github.com/maximhq/bifrost.git",
+    "commit": "7cb75fb2f8276ca48d0792c857fecb67b8879e2f",
+    "version": "2.5.1"
+  },
+  "required_tests": {
+    "github.com/maximhq/bifrost/core/providers/openai": [
+      "TestToOpenAIResponsesRequest_PreservesNamedOutputWithoutCallID",
+      "TestToOpenAIResponsesRequest_NamedOutputCallIDVariants",
+      "TestToOpenAIResponsesRequest_StripsGeminiResidueFromResponsesInput",
+      "TestCustomOpenAIProviderRerankUsesGenericEndpoint",
+      "TestCustomOpenAIRerankPreservesUpstreamDocument",
+      "TestCustomOpenAIRerankHonorsAllowedRequests"
+    ],
+    "github.com/maximhq/bifrost/framework/vectorstore": [
+      "TestCacheRetentionQdrantRejectsUnsafeFilters",
+      "TestCacheRetentionQdrantDeletesExpiredOwnedPoints",
+      "TestCacheRetentionQdrantPreservesIndexSchema",
+      "TestCacheAvailabilityQdrantConstructorDoesNotRequireReachableServer",
+      "TestCacheAvailabilityQdrantConstructorValidatesConfig",
+      "TestCacheAvailabilityQdrantNamespaceRejectsUnavailableLookup",
+      "TestCacheAvailabilityQdrantNamespaceRejectsNonPositiveDimension",
+      "TestCacheAvailabilityQdrantNamespaceRejectsIncompatibleVectors",
+      "TestCacheAvailabilityQdrantNamespaceRejectsIncompatibleIndexesWithoutMutation",
+      "TestCacheAvailabilityQdrantNamespaceRejectsNonCosineDistance",
+      "TestCacheAvailabilityQdrantNamespacePreservesCompatibleCollectionAndData",
+      "TestCacheAvailabilityQdrantNamespaceCreatesOnlyMissingIndexes",
+      "TestCacheAvailabilityQdrantNamespaceRejectsUnavailableIndexCreation",
+      "TestCacheAvailabilityQdrantNamespaceRecoversAfterCollectionDisappearsDuringRPC",
+      "TestCacheAvailabilityQdrantNamespaceRPCPreservesSchemaAndAccessErrors",
+      "TestCacheAvailabilityQdrantLostCollectionAllowsRecoveryAndPointMissDoesNot",
+      "TestCacheAvailabilityQdrantPointOperationsPreserveSchemaAndAccessErrors",
+      "TestCacheAvailabilityIsUnavailable",
+      "TestCacheRetentionQdrantRequiresIntegerFilters",
+      "TestCacheRetentionQdrantUsesSingleFilteredDeleteRPC"
+    ],
+    "github.com/maximhq/bifrost/plugins/semanticcache": [
+      "TestDirectCacheKeepsNativeMatching",
+      "TestCacheReplayPreservesRawResponsePrecision",
+      "TestCacheReplayPreservesResponsesRawResponsePrecision",
+      "TestCacheRetentionStartupAndPeriodicSweep",
+      "TestCacheRetentionDeadlineAndShutdown",
+      "TestCacheRetentionNoOverlap",
+      "TestCacheRetentionWriterShutdown",
+      "TestCacheRetentionLateDelete",
+      "TestCacheRetentionLatePostHook",
+      "TestCacheRetentionLegacyStore",
+      "TestCacheRetentionLookupDoesNotDeleteRefreshedID",
+      "TestCacheReplayPreservesNativeContent",
+      "TestCacheAvailabilityEmbeddingKeepsCallerDeadline",
+      "TestCacheAvailabilityStoreReadDeadlines",
+      "TestCacheAvailabilityCallerCancellationPreservesNamespace",
+      "TestCacheAvailabilityHangingStartupAndCleanup",
+      "TestCacheAvailabilityWriterAdmissionDuringRecovery",
+      "TestCacheAvailabilityRecoveryKeepsConcurrentNamespaceLoss",
+      "TestCacheRetentionExpiredHitWakesSerialWorker",
+      "TestCacheRetentionWakeBackoff"
+    ],
+    "github.com/maximhq/bifrost/transports/v2/bifrost-http/lib": [
+      "TestConvertToBifrostContextCancelsWhenClientDisconnects",
+      "TestConvertToBifrostContextCancelsSeededContextWhenClientDisconnects",
+      "TestStartSSEHeartbeatCallsOnDisconnectAfterClose",
+      "TestSSEStreamReaderSendDoneByteExact",
+      "TestRecoverStreamProducerCancelsAndDrains",
+      "TestRecoverStreamProducerReportsPanic"
+    ],
+    "github.com/maximhq/bifrost/transports/v2/bifrost-http/handlers": [
+      "TestNativeBetaHeaders",
+      "TestTracingMiddleware_StreamingRootSpanEndsAfterLLMSpan",
+      "TestTracingMiddleware_RootSpanCarriesStableHTTPSemconv",
+      "TestStreamingResponseSkipsDoneAfterErrorChunk",
+      "TestStreamingResponseSendsDoneOnCleanStream",
+      "TestStreamingResponsePluginChunkHookPanicIsRecovered",
+      "TestStreamingResponsePanicErrorFrameStripsExtraFieldsInHeadersMode",
+      "TestStreamingResponseTeardownPanicIsRecovered",
+      "TestCacheAvailabilityReadinessAndDiagnosticHealth",
+      "TestCacheAvailabilityReadinessKeepsAdminAuthentication",
+      "TestNativeBetaHeadersPreserveHookKey"
+    ],
+    "github.com/maximhq/bifrost/transports/v2/bifrost-http/integrations": [
+      "TestStreamErrorEventFramingPerRoute",
+      "Test_handleStreamingInterceptionErrorIsSanitized",
+      "TestRateLimitFeedbackHTTP",
+      "TestRateLimitFeedbackPreservesProviderHeader",
+      "TestRateLimitFeedbackCommonHeaderWriter",
+      "TestResponsesPassthroughHealthyStreamIsByteExact",
+      "TestResponsesFrameRelayFindsDelimiterSplitAcrossChunks",
+      "TestChatGPTPassthroughStreamEndsWithResponseFailedOnUpstreamError",
+      "Test_handleStreaming_ConverterPanicIsRecovered",
+      "Test_handleStreaming_TeardownPanicsAreRecovered",
+      "TestPassthroughStreamTeardownPanicIsRecovered"
+    ],
+    "github.com/maximhq/bifrost/core": [
+      "TestConcurrentNilContextRequestsHaveIsolatedState",
+      "TestNilContextFiniteStreamCompletesBeforeRead",
+      "TestProviderRetryBudgetAfterLostResponse",
+      "TestListAllModelsIncludesEveryPageOfASlowLargeProvider",
+      "TestFixedKeyRetriesTheSameKeyAfterATransientFailure",
+      "TestScenarioFailureClassLadder",
+      "TestStreamFallbackAfterSilentPrimaryHeaderTimeout",
+      "TestStreamRetryBudgetWhenUpstreamClosesBeforeHeaders",
+      "TestStreamTTFTCutsOffStartupOnlyPrimary",
+      "TestStreamTTFTCutsOffSilentPrimaryHeaderWait",
+      "TestStreamTTFTNeverCutsOffLastAttempt",
+      "TestStreamTTFTLeavesTimelyOrUnconfiguredPrimaryAlone",
+      "TestRetryBackoffStopsWhenRequestCancelled",
+      "TestRetryBackoffStopsWhenRequestDeadlineExpires",
+      "TestScenarioEveryKeyRefusedIsTriedOnce",
+      "TestOwnedStreamCancellationDoesNotWaitForReader",
+      "TestOwnedStreamCancellationIsNotCleanEOF"
+    ],
+    "github.com/maximhq/bifrost/core/providers/utils": [
+      "TestContextTransport_TruncatedContentLengthStreamReportsUnexpectedEOFAndDiscardsConn",
+      "TestContextTransportAcceptedPooledRequestIsNotRepeated",
+      "TestContextTransport_PooledStaleConnStillRetried",
+      "TestRetryAfterHint",
+      "TestHandleProviderAPIError_RetryAfter",
+      "TestApplyRetryAfter_KeepsParserHint",
+      "TestRetryAfterSerialization"
+    ],
+    "github.com/maximhq/bifrost/core/schemas": [
+      "TestScopedCancelPropagatesToStandardChild",
+      "TestScopedCancelWithActiveObserver",
+      "TestChildTimeoutPreservesRequest",
+      "TestCancellationKeepsFirstError",
+      "TestCancellationCausePreservesFirstCancellation",
+      "TestCancellationPreservesParentTimeoutCause",
+      "TestListModelsPaginationLargePage",
+      "TestFasthttpContextCancellationReachesChildrenSynchronously",
+      "TestFasthttpContextChildDeadlineStaysIndependent"
+    ],
+    "github.com/maximhq/bifrost/plugins/governance": [
+      "TestRateLimitFeedbackWindows",
+      "TestRateLimitFeedbackOverlappingWindows",
+      "TestRateLimitFeedbackResolver",
+      "TestRateLimitFeedbackRefusal",
+      "TestRateLimitFeedbackAdmission",
+      "TestRateLimitFeedbackFutureAnchor"
+    ],
+    "github.com/maximhq/bifrost/plugins/routing": [
+      "TestRoutingModelsLiveDeclaration",
+      "TestRoutingModelsDeclarationAndTargetPermissions",
+      "TestRoutingModelsFirstDeclarationAndSortedNames",
+      "TestRoutingModelsFollowsNativeProviderNamespace",
+      "TestRoutingModelsSkipsTargetlessFirstDeclaration"
+    ],
+    "github.com/maximhq/bifrost/plugins/routing/complexity": [
+      "TestSemanticClassifierDeclaresItsQueryFilterIndexes"
+    ],
+    "github.com/maximhq/bifrost/framework/warp": [
+      "TestWarpSearchDeclaresItsQueryFilterIndexes"
+    ],
+    "github.com/maximhq/bifrost/transports/v2/bifrost-http/server": [
+      "TestRoutingModelsHTTPAdmission"
+    ],
+    "github.com/maximhq/bifrost/core/providers/anthropic": [
+      "TestToAnthropicChatCompletionError",
+      "TestToAnthropicChatCompletionErrorNeverEmitsEmptyMessage"
+    ]
+  }
+}
