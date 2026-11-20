@@ -30,6 +30,8 @@ import (
 	"github.com/maximhq/bifrost/framework/encrypt"
 	"github.com/maximhq/bifrost/framework/temptoken"
 	"github.com/maximhq/bifrost/framework/tracing"
+	"github.com/maximhq/bifrost/framework/vectorstore"
+	"github.com/maximhq/bifrost/plugins/semanticcache"
 	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
 	"github.com/stretchr/testify/assert"
 	"github.com/valyala/fasthttp"
@@ -5788,6 +5790,120 @@ func TestCacheIdentityNativeBetaHeaders(t *testing.T) {
 			}
 			if got := string(ctx.Request.Header.Peek("X-App-Id")); got != "app" {
 				t.Fatal("ordinary header changed")
+			}
+		})
+	}
+}
+
+// Custom transport plugins run after built-ins by default and may rewrite
+// protocol options. Cache replay must use the request those hooks leave behind.
+func TestCacheIdentityUsesFinalHTTPProtocolOptions(t *testing.T) {
+	SetLogger(&mockLogger{})
+	for _, tc := range []struct {
+		name    string
+		rewrite func(*schemas.HTTPRequest, string)
+		final   func(*fasthttp.RequestCtx) string
+	}{
+		{
+			name:    "header",
+			rewrite: func(req *schemas.HTTPRequest, value string) { req.Headers["anthropic-beta"] = value },
+			final:   func(ctx *fasthttp.RequestCtx) string { return string(ctx.Request.Header.Peek("anthropic-beta")) },
+		},
+		{
+			name:    "query",
+			rewrite: func(req *schemas.HTTPRequest, value string) { req.Query["api-version"] = value },
+			final:   func(ctx *fasthttp.RequestCtx) string { return string(ctx.QueryArgs().Peek("api-version")) },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := vectorstore.NewVectorStore(t.Context(), &vectorstore.Config{
+				Enabled: true, Type: vectorstore.VectorStoreTypeChromem, Config: vectorstore.ChromemConfig{},
+			}, &mockLogger{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			llm, err := semanticcache.Init(t.Context(), &semanticcache.Config{Dimension: 1, DefaultCacheKey: "protocol-options"}, &mockLogger{}, store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cache := llm.(*semanticcache.Plugin)
+			t.Cleanup(func() { _ = cache.Cleanup() })
+			transformer := &fakeResponseHeadersPlugin{
+				name: "protocol-options",
+				preHook: func(_ *schemas.BifrostContext, req *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
+					tc.rewrite(req, req.CaseInsensitiveHeaderLookup("X-Protocol-Option"))
+					return nil, nil
+				},
+				hook: func(_ *schemas.BifrostContext, _ *schemas.HTTPRequest, _ *schemas.HTTPResponseMetadata) error {
+					return nil
+				},
+			}
+			// Exercise native placement sorting, including the default custom placement.
+			config := responseHeadersTestConfig(t, transformer, cache)
+			config.SetPluginOrderInfo(cache.GetName(), schemas.Ptr(schemas.PluginPlacementBuiltin), schemas.Ptr(7))
+			config.SetPluginOrderInfo(transformer.GetName(), nil, nil)
+			config.SortAndRebuildPlugins()
+			plugins := config.GetLoadedHTTPTransportPlugins()
+			if len(plugins) != 2 || plugins[0] != cache || plugins[1] != transformer {
+				t.Fatal("test requires the supported custom hook to run after cache")
+			}
+			request := &schemas.BifrostRequest{
+				RequestType: schemas.ChatCompletionRequest,
+				ChatRequest: &schemas.BifrostChatRequest{
+					Provider: schemas.Anthropic, Model: "test-model",
+					Input: []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("same input")}}},
+				},
+			}
+			generated := 0
+			var cacheHit bool
+			handler := TransportInterceptorMiddleware(config)(func(httpCtx *fasthttp.RequestCtx) {
+				ctx, cancel := lib.ConvertToBifrostContext(httpCtx, nil)
+				defer cancel()
+				_, cached, err := cache.PreLLMHook(ctx, request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				cacheHit = cached != nil
+				var response *schemas.BifrostResponse
+				if cacheHit {
+					response = cached.Response
+				} else {
+					generated++
+					response = &schemas.BifrostResponse{ChatResponse: &schemas.BifrostChatResponse{
+						Choices: []schemas.BifrostResponseChoice{{ChatNonStreamResponseChoice: &schemas.ChatNonStreamResponseChoice{
+							Message: &schemas.ChatMessage{Role: schemas.ChatMessageRoleAssistant, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("answer:" + tc.final(httpCtx))}},
+						}}},
+						ExtraFields: schemas.BifrostResponseExtraFields{Provider: schemas.Anthropic, OriginalModelRequested: "test-model", ResolvedModelUsed: "test-model", RequestType: schemas.ChatCompletionRequest},
+					}}
+				}
+				response, bifrostErr, err := cache.PostLLMHook(ctx, response, nil)
+				if err != nil || bifrostErr != nil {
+					t.Fatalf("cache post-hook: %v, %v", err, bifrostErr)
+				}
+				cache.WaitForPendingOperations()
+				if response == nil || response.ChatResponse == nil || len(response.ChatResponse.Choices) != 1 {
+					t.Fatalf("missing completion: %+v", response)
+				}
+				httpCtx.SetBodyString(*response.ChatResponse.Choices[0].Message.Content.ContentStr)
+			})
+			for _, step := range []struct {
+				option    string
+				hit       bool
+				generated int
+			}{
+				{"variant-a", false, 1},
+				{"variant-a", true, 1},
+				{"variant-b", false, 2},
+				{"variant-b", true, 2},
+			} {
+				ctx := preAuthTestCtx()
+				ctx.Request.SetRequestURI("/anthropic/v1/messages?api-version=before-hooks")
+				ctx.Request.Header.Set("Anthropic-Beta", "before-hooks")
+				ctx.Request.Header.Set("X-Protocol-Option", step.option)
+				handler(ctx)
+				if got := string(ctx.Response.Body()); got != "answer:"+step.option || cacheHit != step.hit || generated != step.generated {
+					t.Fatalf("final %s=%s: answer=%q hit=%v generated=%d; want answer=%q hit=%v generated=%d", tc.name, step.option, got, cacheHit, generated, "answer:"+step.option, step.hit, step.generated)
+				}
 			}
 		})
 	}

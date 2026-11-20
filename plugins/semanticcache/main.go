@@ -478,9 +478,14 @@ func (*Plugin) HTTPTransportPreAuthHook(_ *schemas.BifrostContext, _ *schemas.HT
 	return nil, nil
 }
 
-// HTTPTransportPreHook records protocol options that can change the native response.
+// HTTPTransportPreHook records the immutable route without retaining the pooled
+// request. Later HTTP hooks may still change its protocol headers and query.
 func (plugin *Plugin) HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
-	ctx.SetValue(httpCacheIdentityKey, cacheHTTPIdentity(req))
+	if req == nil {
+		ctx.ClearValue(httpCacheRouteKey)
+		return nil, nil
+	}
+	ctx.SetValue(httpCacheRouteKey, cacheHTTPRoute{method: req.Method, path: req.Path})
 	return nil, nil
 }
 
@@ -584,7 +589,7 @@ func (plugin *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.Bifro
 		plugin.logger.Debug("metadata build failed, caching disabled for this request: %v", err)
 		return req, nil, nil
 	}
-	if identity := ctx.Value(httpCacheIdentityKey); identity != nil {
+	if identity := cacheHTTPIdentity(ctx); identity != nil {
 		metadata["http"] = identity
 	}
 	paramsHash, err := hashMap(metadata)

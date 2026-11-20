@@ -244,10 +244,14 @@ func TestCacheIdentityHTTPContext(t *testing.T) {
 	p := identityScopeTestPlugin(t, newObservableStore(), "")
 	context := func(version, beta, query, trace string) *schemas.BifrostContext {
 		ctx := identityContext(t, "test", identityRef{vk: "a"})
-		_, err := p.HTTPTransportPreHook(ctx, &schemas.HTTPRequest{Method: "POST", Path: "/anthropic/v1/messages", Headers: map[string]string{"anthropic-version": version, "anthropic-beta": beta, "x-request-id": trace, "authorization": trace}, Query: map[string]string{"api-version": query}})
+		req := &schemas.HTTPRequest{Method: "POST", Path: "/anthropic/v1/messages", Headers: map[string]string{"anthropic-version": version, "anthropic-beta": beta, "x-request-id": trace, "authorization": trace}, Query: map[string]string{"api-version": query}}
+		_, err := p.HTTPTransportPreHook(ctx, req)
 		if err != nil {
 			t.Fatal(err)
 		}
+		// The inference context receives these native snapshots after HTTP hooks.
+		ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, req.Headers)
+		ctx.SetValue(schemas.BifrostContextKeyRequestQuery, req.Query)
 		return ctx
 	}
 	req := identityTestChatRequest("same input", nil)
@@ -398,6 +402,35 @@ func BenchmarkCacheIdentity(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		if _, err := p.generateRequestHash(req, metadata); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkCacheIdentityHTTPContext(b *testing.B) {
+	llm, err := Init(b.Context(), &Config{Dimension: 1, DefaultCacheKey: "benchmark"}, bifrost.NewDefaultLogger(schemas.LogLevelError), newObservableStore())
+	if err != nil {
+		b.Fatal(err)
+	}
+	p := llm.(*Plugin)
+	b.Cleanup(func() { _ = p.Cleanup() })
+	ctx := schemas.NewBifrostContext(b.Context(), schemas.NoDeadline)
+	defer ctx.Cancel()
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "cache-http-benchmark")
+	httpReq := &schemas.HTTPRequest{
+		Method: "POST", Path: "/anthropic/v1/messages",
+		Headers: map[string]string{"anthropic-version": "2023-06-01", "anthropic-beta": "feature-a"},
+		Query:   map[string]string{"api-version": "v1"},
+	}
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, httpReq.Headers)
+	ctx.SetValue(schemas.BifrostContextKeyRequestQuery, httpReq.Query)
+	req := identityTestChatRequest("same input", nil)
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := p.HTTPTransportPreHook(ctx, httpReq); err != nil {
+			b.Fatal(err)
+		}
+		if _, _, err := p.PreLLMHook(ctx, req); err != nil {
 			b.Fatal(err)
 		}
 	}

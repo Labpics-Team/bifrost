@@ -223,8 +223,11 @@ def check_unit(root, manifest):
     packages = changed_test_packages(root, manifest, env, modules)
     for package in packages:
         print(f"Testing full short corpus: {package}", flush=True)
+        # Complete native HTTP suites exceed five minutes even while individual
+        # tests make progress. Keep their aggregate budget separate from the
+        # targeted mandatory-regression budget in test_command.
         run_test_package(root, env, package, [
-            "go", "test", "-json", "-short", "-race", "-count=1", "-timeout=5m", package,
+            "go", "test", "-json", "-short", "-race", "-count=1", "-timeout=15m", package,
         ])
     print(f"All {len(packages)} changed package short suites passed", flush=True)
 
