@@ -2526,7 +2526,7 @@ type BifrostErrorExtraFields struct {
 	ConvertedRequestType      RequestType           `json:"converted_request_type,omitempty"`
 	DroppedCompatPluginParams []string              `json:"dropped_compat_plugin_params,omitempty"`
 	Latency                   int64                 `json:"latency,omitempty"`        // in milliseconds
-	RetryAfter                int64                 `json:"retry_after_ms,omitempty"` // provider's retry hint in milliseconds, clamped to 1s..5m; zero when it gave none
+	RetryAfter                int64                 `json:"retry_after_ms,omitempty"` // Retry hint in milliseconds; zero when no deadline is known.
 	KeyStatuses               []KeyStatus           `json:"key_statuses,omitempty"`
 	FallbackAttempts          []FallbackAttempt     `json:"fallback_attempts,omitempty"` // fallbacks that failed or were skipped, set when the primary's error is returned after the chain ran out
 	MCPAuthRequired           *MCPAuthRequiredError `json:"mcp_auth_required,omitempty"` // Set when a per-user MCP tool requires the caller to complete an inline auth flow (OAuth or headers)

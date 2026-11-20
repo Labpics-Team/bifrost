@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -247,59 +248,28 @@ func TestNewBifrostContext_NoGoroutineLeakWithBackgroundAndNoDeadline(t *testing
 	}
 }
 
-func TestNewBifrostContext_GoroutineStartsWithDeadline(t *testing.T) {
-	// Get baseline goroutine count
-	runtime.GC()
-	time.Sleep(10 * time.Millisecond)
-	baseline := runtime.NumGoroutine()
-
-	// Create context with a deadline - should spawn goroutine
-	deadline := time.Now().Add(1 * time.Hour)
-	ctx := NewBifrostContext(context.Background(), deadline)
-
-	// Give time for goroutine to start
-	runtime.Gosched()
-	time.Sleep(10 * time.Millisecond)
-
-	afterCreate := runtime.NumGoroutine()
-
-	// Should have at least one more goroutine for the deadline watcher
-	if afterCreate <= baseline {
-		t.Errorf("Expected goroutine to be spawned for deadline context: baseline=%d, after=%d", baseline, afterCreate)
-	}
-
-	// Clean up
-	ctx.Cancel()
+func TestNewBifrostContext_DeadlineCancellation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		deadline := time.Now().Add(time.Second)
+		ctx := NewBifrostContext(context.Background(), deadline)
+		defer ctx.Cancel()
+		if got, ok := ctx.Deadline(); !ok || !got.Equal(deadline) || ctx.Err() != nil {
+			t.Fatal("deadline context did not preserve its live deadline")
+		}
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if ctx.Err() != context.DeadlineExceeded || context.Cause(ctx) != context.DeadlineExceeded {
+			t.Fatal("deadline did not cancel the context with its own cause")
+		}
+	})
 }
 
-func TestNewBifrostContext_GoroutineStartsWithCancellableParent(t *testing.T) {
-	// Get baseline goroutine count
-	runtime.GC()
-	time.Sleep(10 * time.Millisecond)
-	baseline := runtime.NumGoroutine()
-
-	// Create a cancellable parent
+func TestNewBifrostContext_ParentCancellation(t *testing.T) {
 	parent, parentCancel := context.WithCancel(context.Background())
 	defer parentCancel()
-
-	// Create BifrostContext with cancellable parent but no deadline
-	// Should spawn goroutine to watch parent
 	ctx := NewBifrostContext(parent, NoDeadline)
-
-	// Give time for goroutine to start
-	runtime.Gosched()
-	time.Sleep(10 * time.Millisecond)
-
-	afterCreate := runtime.NumGoroutine()
-
-	// Should have goroutine for watching parent cancellation
-	if afterCreate <= baseline {
-		t.Errorf("Expected goroutine to be spawned for cancellable parent: baseline=%d, after=%d", baseline, afterCreate)
-	}
-
-	// Verify parent cancellation propagates
+	defer ctx.Cancel()
 	parentCancel()
-	time.Sleep(10 * time.Millisecond)
 
 	select {
 	case <-ctx.Done():
@@ -533,10 +503,7 @@ func TestPluginLog_PoolReuse(t *testing.T) {
 	}
 }
 
-// TestRoot_UnwrapsChainedValueDelegates verifies Root() walks the entire
-// delegate chain. A naive single-step unwrap would return an intermediate
-// pooled scope, which loses the async-safety guarantee as soon as that
-// intermediate scope is recycled.
+// Root walks the entire plugin delegate chain and returns the request context.
 func TestRoot_UnwrapsChainedValueDelegates(t *testing.T) {
 	root := NewBifrostContext(context.Background(), NoDeadline)
 
@@ -567,20 +534,7 @@ func TestRoot_UnwrapsChainedValueDelegates(t *testing.T) {
 	}
 }
 
-// TestNewBifrostContext_DerivedFromReleasedScope_NoPanic locks in the
-// deterministic half of the scoped-parent-release bug: a derived BifrostContext
-// must not deref a pool-released scoped ancestor when its accessors are called.
-//
-// Pre-fix shape (see plugins/semanticcache/utils.go:71):
-//
-//	root := NewBifrostContext(...)
-//	scope := root.WithPluginScope(...)
-//	derived := NewBifrostContext(scope, NoDeadline)   // derived.parent = scope
-//	scope.ReleasePluginScope()                        // scope.parent = nil, valueDelegate = nil
-//	derived.Deadline()                                 // → scope.Deadline() → nil deref panic
-//
-// The fix unwraps scoped parents to their valueDelegate (root) at construction
-// time, so derived.parent is root and the release of scope cannot affect it.
+// Releasing hook metadata must not invalidate a derived request context.
 func TestNewBifrostContext_DerivedFromReleasedScope_NoPanic(t *testing.T) {
 	root := NewBifrostContext(context.Background(), NoDeadline)
 	pluginName := "release-race"
@@ -600,13 +554,7 @@ func TestNewBifrostContext_DerivedFromReleasedScope_NoPanic(t *testing.T) {
 	_ = derived.Done()
 }
 
-// TestNewBifrostContext_WatchdogRaceWithReleasedScope is the stress companion
-// to the deterministic test above. Run with `go test -race` to surface the
-// data race between watchCancellation reading bc.parent (context.go:202) and
-// ReleasePluginScope writing bc.parent = nil (context.go:432).
-//
-// With the unwrap fix, watchCancellation observes root (long-lived) instead of
-// the pool-released scope, so the race window does not exist.
+// Cancellation observers may outlive release of hook metadata.
 func TestNewBifrostContext_WatchdogRaceWithReleasedScope(t *testing.T) {
 	root := NewBifrostContext(context.Background(), NoDeadline)
 	pluginName := "watchdog-race"
@@ -615,8 +563,7 @@ func TestNewBifrostContext_WatchdogRaceWithReleasedScope(t *testing.T) {
 	derivedCtxs := make([]*BifrostContext, 0, iterations)
 	for i := 0; i < iterations; i++ {
 		scope := root.WithPluginScope(&pluginName)
-		// Spawning watchCancellation: parent (scope) has a non-nil Done()
-		// channel, so NewBifrostContext schedules the goroutine.
+		// Derive before release, keeping cancellation attached to the request.
 		derivedCtxs = append(derivedCtxs, NewBifrostContext(scope, NoDeadline))
 		scope.ReleasePluginScope()
 	}

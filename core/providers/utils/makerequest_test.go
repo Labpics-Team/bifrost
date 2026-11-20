@@ -676,6 +676,9 @@ func TestContextTransport_TruncatedContentLengthStreamReportsUnexpectedEOFAndDis
 			if !errors.Is(err, io.ErrUnexpectedEOF) {
 				t.Errorf("read error = %v, want io.ErrUnexpectedEOF", err)
 			}
+			if RequestOutcomeUnknown(err) {
+				t.Error("read-only GET was classified as an unknown inference outcome")
+			}
 			if stream.fullyRead {
 				t.Error("truncated fixed-length body was marked fully read")
 			}

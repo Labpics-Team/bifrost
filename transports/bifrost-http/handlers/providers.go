@@ -70,6 +70,7 @@ type ModelsManager interface {
 	// The models listing narrows its provider fan-out to what the request may reach, by the same
 	// rule the integration routes use.
 	NarrowListModelsProviders(bifrostCtx *schemas.BifrostContext)
+	ListRoutingModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError)
 }
 
 // ErrRefreshInProgress is returned by the on-demand model refresh entrypoints

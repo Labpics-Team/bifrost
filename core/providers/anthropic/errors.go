@@ -190,6 +190,16 @@ func ToAnthropicChatCompletionError(bifrostErr *schemas.BifrostError) *Anthropic
 		Type:    anthropicErrorType(bifrostErr),
 		Message: bifrostErr.GetErrorString(),
 	}
+	if detail := bifrostErr.Error; detail != nil {
+		// Preserve delivery evidence without replacing the native error type.
+		// Unknown outcome wins over a later credential/quota classification.
+		if detail.Code != nil && *detail.Code == providerUtils.RequestOutcomeUnknownErrorCode {
+			errorStruct.Code = providerUtils.RequestOutcomeUnknownErrorCode
+		} else if (detail.Code != nil && *detail.Code == "upstream_credentials_exhausted") ||
+			(detail.Type != nil && *detail.Type == "upstream_credentials_exhausted") {
+			errorStruct.Code = "upstream_credentials_exhausted"
+		}
+	}
 
 	return &AnthropicMessageError{
 		Type:  "error", // always "error" for Anthropic

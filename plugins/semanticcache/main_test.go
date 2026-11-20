@@ -3,6 +3,7 @@ package semanticcache
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"testing"
@@ -748,6 +749,10 @@ func TestPreLLMHookRecordsCacheLookup(t *testing.T) {
 // so stale writes from a prior interrupted run would surface as spurious
 // cache hits on the first request of the next run.
 func TestMain(m *testing.M) {
+	flag.Parse()
+	if testing.Short() || flag.Lookup("test.list").Value.String() != "" {
+		os.Exit(m.Run())
+	}
 	dropSharedTestNamespace() // pre-run sweep
 	code := m.Run()
 	dropSharedTestNamespace() // post-run sweep

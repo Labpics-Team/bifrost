@@ -2167,80 +2167,109 @@ func (gs *LocalGovernanceStore) deleteVirtualKeyAlias(value string, vkID string)
 	gs.virtualKeys.CompareAndDelete(value, existing)
 }
 
-// CheckRateLimit checks rate limits for tokens and requests across categories
+// rateLimitRefusal carries reset feedback without changing the store's decision interface.
+type rateLimitRefusal struct {
+	reason     string
+	retryAfter int64
+}
+
+func (e *rateLimitRefusal) Error() string { return e.reason }
+
+type rateLimitFeedback struct {
+	decision     Decision
+	reason       string
+	resetAt      time.Time
+	unknownReset bool
+}
+
+func (f *rateLimitFeedback) includeReset(resetAt time.Time) {
+	if resetAt.IsZero() {
+		f.unknownReset = true
+	} else if resetAt.After(f.resetAt) {
+		f.resetAt = resetAt
+	}
+}
+
+func (f *rateLimitFeedback) retryAfterMilliseconds(now time.Time) int64 {
+	if f.unknownReset || !f.resetAt.After(now) {
+		return 0
+	}
+	delay := f.resetAt.Sub(now)
+	milliseconds := int64(delay / time.Millisecond)
+	if delay%time.Millisecond != 0 {
+		milliseconds++
+	}
+	return milliseconds
+}
+
+// CheckRateLimit checks rate limits for tokens and requests across categories.
 func (gs *LocalGovernanceStore) CheckRateLimit(ctx context.Context, entityWiseRateLimits EntityWiseRateLimits, tokensBaselines map[string]int64, requestsBaselines map[string]int64) (Decision, error) {
-	// A live session's continuation was already counted as one request when the session was admitted.
+	return gs.checkRateLimit(ctx, entityWiseRateLimits, tokensBaselines, requestsBaselines, time.Now())
+}
+
+// checkRateLimit uses the reset owner's clock for admission and retry feedback.
+// Retry-After covers every exhausted limit applying to this attempt.
+func (gs *LocalGovernanceStore) checkRateLimit(ctx context.Context, entityWiseRateLimits EntityWiseRateLimits, tokensBaselines map[string]int64, requestsBaselines map[string]int64, now time.Time) (Decision, error) {
 	sessionContinuation := isLiveSessionContinuation(ctx)
+	var feedback rateLimitFeedback
 	for entity, rateLimits := range entityWiseRateLimits {
 		for _, rateLimit := range rateLimits {
-			var violations []string
-			// Check if rate limit needs reset (in-memory check)
-			// Track which limits are expired so we can skip only those specific checks
-			tokenLimitExpired := false
-			if rateLimit.TokenResetDuration != nil {
-				if duration, err := configstoreTables.ParseDuration(*rateLimit.TokenResetDuration); err == nil {
-					if time.Since(rateLimit.TokenLastReset) >= duration {
-						// Token rate limit expired but hasn't been reset yet - skip token check only
-						tokenLimitExpired = true
+			tokensUsed := rateLimit.TokenCurrentUsage + tokensBaselines[rateLimit.ID]
+			requestsUsed := rateLimit.RequestCurrentUsage + requestsBaselines[rateLimit.ID]
+			tokenBlocked := rateLimit.TokenMaxLimit != nil && tokensUsed >= *rateLimit.TokenMaxLimit
+			requestBlocked := !sessionContinuation && rateLimit.RequestMaxLimit != nil && requestsUsed >= *rateLimit.RequestMaxLimit
+			if !tokenBlocked && !requestBlocked {
+				continue
+			}
+			tokenReset, requestReset := gs.rateLimitResetTargets(rateLimit, now)
+			tokenBlocked = tokenBlocked && tokenReset == nil
+			requestBlocked = requestBlocked && requestReset == nil
+			if !tokenBlocked && !requestBlocked {
+				continue
+			}
+
+			if feedback.reason == "" {
+				var violations []string
+				feedback.decision = DecisionRateLimited
+				if tokenBlocked {
+					duration := "unknown"
+					if rateLimit.TokenResetDuration != nil {
+						duration = *rateLimit.TokenResetDuration
+					}
+					violations = append(violations, fmt.Sprintf("token limit exceeded (%d/%d, resets every %s)",
+						tokensUsed, *rateLimit.TokenMaxLimit, duration))
+					if !requestBlocked {
+						feedback.decision = DecisionTokenLimited
 					}
 				}
-			}
-			requestLimitExpired := false
-			if rateLimit.RequestResetDuration != nil {
-				if duration, err := configstoreTables.ParseDuration(*rateLimit.RequestResetDuration); err == nil {
-					if time.Since(rateLimit.RequestLastReset) >= duration {
-						// Request rate limit expired but hasn't been reset yet - skip request check only
-						requestLimitExpired = true
+				if requestBlocked {
+					duration := "unknown"
+					if rateLimit.RequestResetDuration != nil {
+						duration = *rateLimit.RequestResetDuration
+					}
+					violations = append(violations, fmt.Sprintf("request limit exceeded (%d/%d, resets every %s)",
+						requestsUsed, *rateLimit.RequestMaxLimit, duration))
+					if !tokenBlocked {
+						feedback.decision = DecisionRequestLimited
 					}
 				}
+				feedback.reason = fmt.Sprintf("rate limit violated for %s: %s", entity, violations)
 			}
-
-			tokensBaseline, exists := tokensBaselines[rateLimit.ID]
-			if !exists {
-				tokensBaseline = 0
+			if tokenBlocked {
+				feedback.includeReset(gs.rateLimitNextReset(rateLimit.TokenResetDuration, rateLimit.IsCalendarAligned, rateLimit.CreatedAt, rateLimit.TokenLastReset, now))
 			}
-			requestsBaseline, exists := requestsBaselines[rateLimit.ID]
-			if !exists {
-				requestsBaseline = 0
-			}
-
-			// Token limits - check if total usage (local + remote baseline) exceeds limit
-			// Skip this check if token limit has expired
-			if !tokenLimitExpired && rateLimit.TokenMaxLimit != nil && rateLimit.TokenCurrentUsage+tokensBaseline >= *rateLimit.TokenMaxLimit {
-				duration := "unknown"
-				if rateLimit.TokenResetDuration != nil {
-					duration = *rateLimit.TokenResetDuration
-				}
-				violations = append(violations, fmt.Sprintf("token limit exceeded (%d/%d, resets every %s)",
-					rateLimit.TokenCurrentUsage+tokensBaseline, *rateLimit.TokenMaxLimit, duration))
-			}
-
-			// Request limits - check if total usage (local + remote baseline) exceeds limit
-			// Skip this check if request limit has expired
-			if !sessionContinuation && !requestLimitExpired && rateLimit.RequestMaxLimit != nil && rateLimit.RequestCurrentUsage+requestsBaseline >= *rateLimit.RequestMaxLimit {
-				duration := "unknown"
-				if rateLimit.RequestResetDuration != nil {
-					duration = *rateLimit.RequestResetDuration
-				}
-				violations = append(violations, fmt.Sprintf("request limit exceeded (%d/%d, resets every %s)",
-					rateLimit.RequestCurrentUsage+requestsBaseline, *rateLimit.RequestMaxLimit, duration))
-			}
-
-			if len(violations) > 0 {
-				// Determine specific violation type
-				decision := DecisionRateLimited // Default to general rate limited decision
-				if len(violations) == 1 {
-					if strings.Contains(violations[0], "token") {
-						decision = DecisionTokenLimited // More specific violation type
-					} else if strings.Contains(violations[0], "request") {
-						decision = DecisionRequestLimited // More specific violation type
-					}
-				}
-				return decision, fmt.Errorf("rate limit violated for %s: %s", entity, violations)
+			if requestBlocked {
+				feedback.includeReset(gs.rateLimitNextReset(rateLimit.RequestResetDuration, rateLimit.IsCalendarAligned, rateLimit.CreatedAt, rateLimit.RequestLastReset, now))
 			}
 		}
 	}
-	return DecisionAllow, nil
+	if feedback.reason == "" {
+		return DecisionAllow, nil
+	}
+	return feedback.decision, &rateLimitRefusal{
+		reason:     feedback.reason,
+		retryAfter: feedback.retryAfterMilliseconds(now),
+	}
 }
 
 // Generic check budget method
@@ -2724,13 +2753,6 @@ func (gs *LocalGovernanceStore) rateLimitResetTarget(resetDuration *string, cale
 	if resetDuration == nil {
 		return nil
 	}
-	if calendarAligned && configstoreTables.IsCalendarAlignableDuration(*resetDuration) {
-		period := configstoreTables.GetCalendarPeriodStart(*resetDuration, now, configstoreTables.QuarterStartNotApplicable)
-		if period.After(lastReset) {
-			return &period
-		}
-		return nil
-	}
 	duration, err := configstoreTables.ParseDuration(*resetDuration)
 	if err != nil {
 		gs.logger.Error("invalid rate limit reset duration %s: %v", *resetDuration, err)
@@ -2742,6 +2764,13 @@ func (gs *LocalGovernanceStore) rateLimitResetTarget(resetDuration *string, cale
 		gs.logger.Error("non-positive rate limit reset duration %s: counter will not auto-reset", *resetDuration)
 		return nil
 	}
+	if calendarAligned && configstoreTables.IsCalendarAlignableDuration(*resetDuration) {
+		period := configstoreTables.GetCalendarPeriodStart(*resetDuration, now, configstoreTables.QuarterStartNotApplicable)
+		if period.After(lastReset) {
+			return &period
+		}
+		return nil
+	}
 	if anchor.IsZero() {
 		anchor = lastReset
 	}
@@ -2750,6 +2779,46 @@ func (gs *LocalGovernanceStore) rateLimitResetTarget(resetDuration *string, cale
 		return &target
 	}
 	return nil
+}
+
+// rateLimitNextReset returns the first boundary at which the reset owner can clear a
+// blocked counter. It uses the same persisted anchor and calendar cadence as
+// rateLimitResetTarget, including a future LastReset after a clock rollback.
+func (gs *LocalGovernanceStore) rateLimitNextReset(resetDuration *string, calendarAligned bool, anchor, lastReset, now time.Time) time.Time {
+	if resetDuration == nil {
+		return time.Time{}
+	}
+	duration, err := configstoreTables.ParseDuration(*resetDuration)
+	if err != nil || duration <= 0 {
+		return time.Time{}
+	}
+	horizon := now
+	if lastReset.After(horizon) {
+		horizon = lastReset
+	}
+	if calendarAligned && configstoreTables.IsCalendarAlignableDuration(*resetDuration) {
+		period := configstoreTables.GetCalendarPeriodStart(*resetDuration, horizon, configstoreTables.QuarterStartNotApplicable)
+		switch (*resetDuration)[len(*resetDuration)-1] {
+		case 'd':
+			return period.AddDate(0, 0, 1)
+		case 'w':
+			return period.AddDate(0, 0, 7)
+		case 'M':
+			return period.AddDate(0, 1, 0)
+		case 'Q':
+			return period.AddDate(0, 3, 0)
+		case 'Y':
+			return period.AddDate(1, 0, 0)
+		}
+	}
+	if anchor.IsZero() {
+		anchor = lastReset
+	}
+	next := configstoreTables.RollingWindowStart(anchor, duration, horizon).Add(duration)
+	if !next.After(now) || !next.After(lastReset) {
+		return time.Time{}
+	}
+	return next
 }
 
 // rateLimitResetTargets returns reset targets for the token and request counters.

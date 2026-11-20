@@ -105,13 +105,11 @@ var errTooManyInterimResponses = errors.New("too many 1xx interim responses")
 // watcher could close a socket that is about to be pooled.
 var testHookBeforeConnRelease func()
 
-// RoundTrip implements fasthttp.RoundTripper. The retry flag is true only for a
-// failure before the response headers were parsed on a connection reused from
-// the pool: the upstream may have closed it while idle, and RetryIfErr
-// (network.StaleConnectionRetryIfErr) walks past such sockets. The same failure
-// on a socket dialed for this request is the upstream failing, so it is
-// reported without a fasthttp-level retry and counts against Bifrost's own
-// max_retries (maximhq/bifrost#7035). ErrBodyTooLarge never retries.
+// RoundTrip implements fasthttp.RoundTripper. A reused connection may be retried
+// only for an idempotent method or a proven zero-byte write failure. Once any
+// non-idempotent request byte was sent, losing the reply is an unknown outcome,
+// not evidence that the upstream was idle. Fresh-dial failures remain subject
+// to Bifrost's retry budget. ErrBodyTooLarge never retries.
 func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Request, resp *fasthttp.Response) (retry bool, err error) {
 	ctx := lookupRequestContext(req)
 	if ctxErr := ctx.Err(); ctxErr != nil {
@@ -132,11 +130,22 @@ func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Requ
 	}
 	conn := cc.Conn()
 	resp.ParseNetConn(conn)
+	writeConn := &requestWriteConn{Conn: conn}
+	idempotent := requestMethodIsIdempotent(req.Header.Method())
+	if !idempotent {
+		writeConn.outcomeState = providerRequestOutcome(ctx)
+	}
+	outcome := func(err error) error {
+		if idempotent {
+			return err
+		}
+		return writeConn.outcome(err)
+	}
 	// fasthttp stamps lastUseTime only when a connection is returned to the
 	// pool, so a zero value means this socket was dialed for this request.
 	reused := !cc.LastUseTime().IsZero()
 	retryOn := func(err error) bool {
-		return reused && !errors.Is(err, fasthttp.ErrBodyTooLarge)
+		return reused && (idempotent || !writeConn.written) && !errors.Is(err, fasthttp.ErrBodyTooLarge)
 	}
 
 	watcher := startCancelWatcher(ctx, abort, conn)
@@ -153,7 +162,7 @@ func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Requ
 		resetConnection = true
 	}
 
-	bw := hc.AcquireWriter(conn)
+	bw := hc.AcquireWriter(writeConn)
 	err = req.Write(bw)
 	if resetConnection {
 		req.Header.ResetConnectionClose()
@@ -164,14 +173,14 @@ func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Requ
 	hc.ReleaseWriter(bw)
 	if err != nil {
 		hc.CloseConn(cc)
-		return retryOn(err), watcher.classify(err)
+		return retryOn(err), outcome(watcher.classify(err))
 	}
 
 	// Setting a deadline fails with "use of closed network connection" when the
 	// watcher closed the socket a moment ago; classify turns that into ctx.Err().
 	if err = conn.SetReadDeadline(deadlineFor(hc.ReadTimeout, ctx)); err != nil {
 		hc.CloseConn(cc)
-		return retryOn(err), watcher.classify(err)
+		return retryOn(err), outcome(watcher.classify(err))
 	}
 
 	if customSkipBody || req.Header.IsHead() {
@@ -187,29 +196,28 @@ func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Requ
 		// Buffered body: the read deadline covers the whole response, which is
 		// what a unary call wants. Headers and body are read as two steps so a
 		// failure can be told apart by whether the upstream ever answered: a
-		// failure before the status line is parsed is what the stale keep-alive
-		// walk (RetryIfErr) exists for, while a body cut short after it means the
-		// upstream has processed the request, so the POST surfaces as an error
-		// and is never replayed on a new socket.
+		// failure before the status line may still follow a dispatched request.
+		// Both phases preserve the write evidence so no POST is silently replayed.
 		resp.ResetBody()
 		if err = readResponseHeaders(resp, br); err != nil {
 			hc.ReleaseReader(br)
 			hc.CloseConn(cc)
-			return retryOn(err), watcher.classify(err)
+			return retryOn(err), outcome(watcher.classify(err))
 		}
 		err = readBufferedBody(resp, br, hc.MaxResponseBodySize)
 		hc.ReleaseReader(br)
 		if err != nil {
 			hc.CloseConn(cc)
-			return false, watcher.classify(err)
+			return false, outcome(watcher.classify(err))
 		}
+		writeConn.outcomeState.acknowledge(resp.StatusCode())
 		// The watcher must not outlive our ownership of the socket: once the
 		// connection is pooled, a late cancellation would close a connection
 		// another request may already hold. Same order as the streamed path.
 		watcher.stop()
 		if watcher.wasCancelled() {
 			hc.CloseConn(cc)
-			return false, watcher.cancelErr()
+			return false, outcome(watcher.cancelErr())
 		}
 		if testHookBeforeConnRelease != nil {
 			testHookBeforeConnRelease()
@@ -227,7 +235,7 @@ func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Requ
 	if err = readResponseHeaders(resp, br); err != nil {
 		hc.ReleaseReader(br)
 		hc.CloseConn(cc)
-		return retryOn(err), watcher.classify(err)
+		return retryOn(err), outcome(watcher.classify(err))
 	}
 
 	// Headers are in: the header wait is over. From here on the body is bounded
@@ -237,12 +245,12 @@ func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Requ
 	if watcher.wasCancelled() {
 		hc.ReleaseReader(br)
 		hc.CloseConn(cc)
-		return false, watcher.cancelErr()
+		return false, outcome(watcher.cancelErr())
 	}
 	if err = conn.SetDeadline(time.Time{}); err != nil {
 		hc.ReleaseReader(br)
 		hc.CloseConn(cc)
-		return false, err
+		return false, outcome(err)
 	}
 
 	// Decide reuse from req now: the caller releases req to fasthttp's pool as
@@ -253,8 +261,9 @@ func (t *contextTransport) RoundTrip(hc *fasthttp.HostClient, req *fasthttp.Requ
 	// does, since a consumer may mark the connection unusable mid-body.
 	closeConn := resetConnection || req.ConnectionClose() || resp.ConnectionClose()
 	body := &streamBody{
-		reader: newStreamBodyReader(resp, br),
-		conn:   conn,
+		reader:        newStreamBodyReader(resp, br),
+		conn:          conn,
+		nonIdempotent: !idempotent,
 		release: func(discard bool) {
 			hc.ReleaseReader(br)
 			if discard || closeConn || resp.ConnectionClose() {
@@ -394,23 +403,31 @@ func (c *chunkedBody) Read(p []byte) (int, error) {
 // read is running. Only CloseWithError is implemented, never io.Closer, because
 // fasthttp's closeBodyStreamReader would call both.
 type streamBody struct {
-	reader    io.Reader
-	conn      net.Conn
-	release   func(discard bool)
-	closed    atomic.Bool
-	fullyRead bool
-	readLock  sync.Mutex
-	closeOnce sync.Once
+	reader        io.Reader
+	conn          net.Conn
+	release       func(discard bool)
+	closed        atomic.Bool
+	fullyRead     bool
+	readLock      sync.Mutex
+	closeOnce     sync.Once
+	nonIdempotent bool
+}
+
+func (s *streamBody) outcome(err error) error {
+	if s.nonIdempotent && err != nil && !errors.Is(err, io.EOF) && !RequestOutcomeUnknown(err) {
+		return &requestOutcomeUnknownError{cause: err}
+	}
+	return err
 }
 
 func (s *streamBody) Read(p []byte) (int, error) {
 	if s.closed.Load() {
-		return 0, io.ErrClosedPipe
+		return 0, s.outcome(io.ErrClosedPipe)
 	}
 	s.readLock.Lock()
 	defer s.readLock.Unlock()
 	if s.closed.Load() {
-		return 0, io.ErrClosedPipe
+		return 0, s.outcome(io.ErrClosedPipe)
 	}
 	n, err := s.reader.Read(p)
 	if errors.Is(err, io.EOF) {
@@ -419,7 +436,7 @@ func (s *streamBody) Read(p []byte) (int, error) {
 		// The peer closed before the terminating 0-length chunk. fasthttp's own
 		// streaming reader reports that as a plain io.EOF, and every provider read
 		// loop plus the semantic truncation check (#5546) is built on that contract:
-		// an EOF without a terminal marker becomes the retryable 502 truncation
+		// an EOF without a terminal marker becomes the 502 truncation
 		// error, while any other read error is a generic stream failure. The
 		// standard-library chunked reader says io.ErrUnexpectedEOF for the same
 		// close, so restore that contract only for chunked bodies. Fixed-length
@@ -429,7 +446,7 @@ func (s *streamBody) Read(p []byte) (int, error) {
 			err = io.EOF
 		}
 	}
-	return n, err
+	return n, s.outcome(err)
 }
 
 // CloseWithError implements fasthttp.ReadCloserWithError. A non-nil err, a read

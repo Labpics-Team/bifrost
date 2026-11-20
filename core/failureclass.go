@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 
+	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
@@ -232,6 +233,9 @@ func ClassifyFailure(err *schemas.BifrostError) schemas.FailureClass {
 		case schemas.RequestCancelled:
 			return schemas.FailureClassCancelled
 		}
+	}
+	if err.Error != nil && providerUtils.RequestOutcomeUnknown(err.Error.Error) {
+		return schemas.FailureClassUnknown
 	}
 	if err.IsBifrostError {
 		return schemas.FailureClassUnknown

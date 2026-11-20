@@ -1,6 +1,7 @@
 package bifrost
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -906,7 +907,7 @@ func TestStreamRecoveredAfterClientLeftLeavesNoBlockedSender(t *testing.T) {
 // fallback must then be used. Before the fix the streaming client had no read
 // timeout and the provider worker stayed pinned in client.Do until the upstream
 // itself closed the socket; the fallback was never attempted.
-func TestStreamFallbackAfterSilentPrimaryHeaderTimeout(t *testing.T) {
+func TestStreamSilentPrimaryHeaderTimeoutDoesNotFallback(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -949,8 +950,7 @@ func TestStreamFallbackAfterSilentPrimaryHeaderTimeout(t *testing.T) {
 	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, "http://"+ln.Addr().String())
 	account.AddProviderWithBaseURL(schemas.Anthropic, 1, 1, fallback.URL)
 	// The reporter's config: 2 retries and a short request timeout. The timeout
-	// must apply to the header wait, and a header timeout goes straight to the
-	// fallback (504 RequestTimedOut is not retried).
+	// must apply to the header wait; a dispatched timeout cannot start a fallback.
 	account.configs[schemas.OpenAI].NetworkConfig.DefaultRequestTimeoutInSeconds = 1
 	account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = 2
 	account.configs[schemas.Anthropic].NetworkConfig.MaxRetries = 0
@@ -1000,24 +1000,17 @@ func TestStreamFallbackAfterSilentPrimaryHeaderTimeout(t *testing.T) {
 		t.Fatalf("silent primary never timed out: no stream and no error after 10s (primary hit %d time(s), fallback hit %d time(s)); issue #7034", primaryHits.Load(), fallbackHits.Load())
 	}
 	elapsed := time.Since(start)
-	if got.err != nil {
-		t.Fatalf("fallback stream failed after %v (primary hit %d, fallback hit %d): %s", elapsed, primaryHits.Load(), fallbackHits.Load(), got.err.Error.Message)
+	if got.err == nil || got.stream != nil || got.err.Error.Type == nil || *got.err.Error.Type != schemas.RequestTimedOut {
+		t.Fatalf("expected timeout without replay: stream=%v error=%v", got.stream, got.err)
 	}
-	content, errs := drainChatStream(got.stream)
-	if hits := fallbackHits.Load(); hits != 1 {
-		t.Fatalf("fallback server hits = %d, want 1", hits)
-	}
-	if len(errs) > 0 {
-		t.Fatalf("fallback stream emitted error chunks: %v", errs)
-	}
-	if content != "hello" {
-		t.Fatalf("fallback stream content = %q, want %q", content, "hello")
+	if primaryHits.Load() != 1 || fallbackHits.Load() != 0 {
+		t.Fatalf("primary=%d fallback=%d, want 1 and 0", primaryHits.Load(), fallbackHits.Load())
 	}
 	if elapsed < 900*time.Millisecond {
-		t.Fatalf("fallback answered after %v, before the 1s request timeout could have fired", elapsed)
+		t.Fatalf("request ended after %v, before the 1s timeout could have fired", elapsed)
 	}
 	if elapsed > 6*time.Second {
-		t.Fatalf("fallback answered after %v, want roughly the 1s request timeout", elapsed)
+		t.Fatalf("request ended after %v, want roughly the 1s timeout", elapsed)
 	}
 }
 
@@ -1027,6 +1020,10 @@ func TestStreamFallbackAfterSilentPrimaryHeaderTimeout(t *testing.T) {
 // counter; the latter is the signal that an attempt has actually failed, since
 // accept happens before the request is read and the socket closed.
 func newClosingListener(t *testing.T) (net.Listener, *atomic.Int32, *atomic.Int32) {
+	return newFailureListener(t, "")
+}
+
+func newFailureListener(t *testing.T, response string) (net.Listener, *atomic.Int32, *atomic.Int32) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -1042,9 +1039,12 @@ func newClosingListener(t *testing.T) (net.Listener, *atomic.Int32, *atomic.Int3
 			}
 			accepted.Add(1)
 			go func() {
-				buf := make([]byte, 64*1024)
 				_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-				_, _ = conn.Read(buf)
+				if req, err := http.ReadRequest(bufio.NewReader(conn)); err == nil {
+					_, _ = io.Copy(io.Discard, req.Body)
+					req.Body.Close()
+					_, _ = io.WriteString(conn, response)
+				}
 				_ = conn.Close()
 				closed.Add(1)
 			}()
@@ -1074,8 +1074,8 @@ func awaitFirstClose(t *testing.T, closed *atomic.Int32) {
 // fired on any close-before-headers, including on a socket dialed for this very
 // attempt, so each Bifrost attempt could become four upstream dials. With
 // max_retries 2 the reporter counted 10 upstream attempts for one request (12
-// was the ceiling). The budget must be max_retries + 1 upstream attempts,
-// whoever closed the socket.
+// was the ceiling). A sent request with a lost reply now permits only one
+// upstream attempt, even when a larger retry budget is configured.
 func TestStreamRetryBudgetWhenUpstreamClosesBeforeHeaders(t *testing.T) {
 	ln, accepted, _ := newClosingListener(t)
 
@@ -1108,10 +1108,10 @@ func TestStreamRetryBudgetWhenUpstreamClosesBeforeHeaders(t *testing.T) {
 		t.Fatalf("expected an upstream connection error, got %v (upstream accepted %d)", bifrostErr, accepted.Load())
 	}
 	if msg := bifrostErr.Error.Message; msg != schemas.ErrProviderDoRequest && msg != schemas.ErrProviderNetworkError {
-		t.Fatalf("error message = %q, want a retryable connection error", msg)
+		t.Fatalf("error message = %q, want a connection error with unknown outcome", msg)
 	}
-	if got := accepted.Load(); got != 3 {
-		t.Fatalf("upstream accepted %d connection(s), want 3 (one attempt plus max_retries 2): fasthttp retried inside each Bifrost attempt (issue #7035)", got)
+	if got := accepted.Load(); got != 1 {
+		t.Fatalf("upstream accepted %d connection(s), want 1 after lost acknowledgement", got)
 	}
 	if elapsed > 5*time.Second {
 		t.Fatalf("request took %v, want well under the 5s request timeout", elapsed)
@@ -1126,7 +1126,7 @@ func TestStreamRetryBudgetWhenUpstreamClosesBeforeHeaders(t *testing.T) {
 // loop must also leave the backoff as a cancellation, not as one more attempt:
 // the attempt trail keeps exactly the attempt that ran.
 func TestRetryBackoffStopsWhenRequestCancelled(t *testing.T) {
-	ln, accepted, closed := newClosingListener(t)
+	ln, accepted, closed := newFailureListener(t, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 
 	account := NewMockAccount()
 	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, "http://"+ln.Addr().String())
@@ -1210,7 +1210,7 @@ func TestRetryBackoffStopsWhenRequestCancelled(t *testing.T) {
 // the worker is freed at once and the routing log records a timeout, not an
 // internal Bifrost error, even though the timeout error carries IsBifrostError.
 func TestRetryBackoffStopsWhenRequestDeadlineExpires(t *testing.T) {
-	ln, accepted, closed := newClosingListener(t)
+	ln, accepted, closed := newFailureListener(t, "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 
 	account := NewMockAccount()
 	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, "http://"+ln.Addr().String())
@@ -1575,8 +1575,8 @@ func ttftContext(timeout time.Duration) *schemas.BifrostContext {
 var anthropicFallback = schemas.Fallback{Provider: schemas.Anthropic, Model: "claude-3-5-haiku-20241022"}
 
 // A primary that opens the stream but sends only startup events is cut off at
-// the TTFT deadline, without a same-provider retry, and the fallback serves the
-// whole stream. The primary's socket is closed, not left to the idle timeout.
+// the TTFT deadline. Its accepted request must not be repeated by retry or
+// fallback. The primary's socket is closed, not left to the idle timeout.
 func TestStreamTTFTCutsOffStartupOnlyPrimary(t *testing.T) {
 	primary, fallback := newTTFTUpstream(), newTTFTUpstream()
 	client := newTTFTTestClient(t, primary.slowOpenAIHandler(10*time.Second), fallback.slowAnthropicHandler(0))
@@ -1584,21 +1584,17 @@ func TestStreamTTFTCutsOffStartupOnlyPrimary(t *testing.T) {
 	ctx := ttftContext(300 * time.Millisecond)
 	start := time.Now()
 	stream, bifrostErr := client.ChatCompletionStreamRequest(ctx, ttftChatRequest(anthropicFallback))
-	if bifrostErr != nil {
-		t.Fatalf("expected the fallback to serve the stream, got %s", bifrostErr.Error.Message)
+	if bifrostErr == nil || stream != nil || bifrostErr.Error.Type == nil || *bifrostErr.Error.Type != schemas.RequestTimedOut {
+		t.Fatalf("expected a timeout without replay, got stream=%v error=%v", stream, bifrostErr)
 	}
-	content, errs := drainChatStream(stream)
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("TTFT cutoff took %v; the primary was not cut off at 300ms", elapsed)
-	}
-	if content != "hello" || len(errs) > 0 {
-		t.Fatalf("content = %q errs = %v, want the fallback's %q", content, errs, "hello")
 	}
 	if got := primary.hits.Load(); got != 1 {
 		t.Fatalf("primary hits = %d, want 1: a TTFT miss must not retry the same provider", got)
 	}
-	if got := fallback.hits.Load(); got != 1 {
-		t.Fatalf("fallback hits = %d, want 1", got)
+	if got := fallback.hits.Load(); got != 0 {
+		t.Fatalf("fallback hits = %d, want 0 after dispatched timeout", got)
 	}
 	select {
 	case <-primary.hangups:
@@ -1631,15 +1627,14 @@ func TestStreamTTFTCutsOffSilentPrimaryHeaderWait(t *testing.T) {
 
 	start := time.Now()
 	stream, bifrostErr := client.ChatCompletionStreamRequest(ttftContext(300*time.Millisecond), ttftChatRequest(anthropicFallback))
-	if bifrostErr != nil {
-		t.Fatalf("expected the fallback to serve the stream, got %s", bifrostErr.Error.Message)
+	if bifrostErr == nil || stream != nil || bifrostErr.Error.Type == nil || *bifrostErr.Error.Type != schemas.RequestTimedOut {
+		t.Fatalf("expected a timeout without replay, got stream=%v error=%v", stream, bifrostErr)
 	}
-	content, _ := drainChatStream(stream)
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("TTFT cutoff took %v during the header wait", elapsed)
 	}
-	if content != "hello" {
-		t.Fatalf("content = %q, want the fallback's %q", content, "hello")
+	if got := fallback.hits.Load(); got != 0 {
+		t.Fatalf("fallback hits = %d, want 0 after dispatched timeout", got)
 	}
 	if got := primary.hits.Load(); got != 1 {
 		t.Fatalf("primary hits = %d, want 1: a TTFT miss must not retry the same provider", got)
@@ -1656,7 +1651,11 @@ func TestStreamTTFTCutsOffSilentPrimaryHeaderWait(t *testing.T) {
 func TestStreamTTFTNeverCutsOffLastAttempt(t *testing.T) {
 	t.Run("last fallback", func(t *testing.T) {
 		primary, fallback := newTTFTUpstream(), newTTFTUpstream()
-		client := newTTFTTestClient(t, primary.slowOpenAIHandler(10*time.Second), fallback.slowAnthropicHandler(time.Second))
+		client := newTTFTTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			primary.hits.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"error":{"message":"model unavailable","code":"model_not_found"}}`)
+		}), fallback.slowAnthropicHandler(time.Second))
 		stream, bifrostErr := client.ChatCompletionStreamRequest(ttftContext(200*time.Millisecond), ttftChatRequest(anthropicFallback))
 		if bifrostErr != nil {
 			t.Fatalf("the last fallback was cut off: %s", bifrostErr.Error.Message)
@@ -1826,8 +1825,8 @@ func streamFallbackAnsweredByPlugins(t *testing.T, plugins ...schemas.LLMPlugin)
 	t.Helper()
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"error":{"message":"upstream down","type":"server_error"}}`))
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"message":"model unavailable","code":"model_not_found"}}`))
 	}))
 	t.Cleanup(primary.Close)
 

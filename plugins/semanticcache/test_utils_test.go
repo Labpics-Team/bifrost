@@ -517,6 +517,9 @@ func ensureSharedTestNamespace(ctx context.Context, store vectorstore.VectorStor
 // NewTestSetupWithVectorStore creates a new test setup with custom configuration and vector store type.
 // extraPlugins are forwarded to getMockedBifrostClient — see its doc comment.
 func NewTestSetupWithVectorStore(t *testing.T, config *Config, storeType vectorstore.VectorStoreType, extraPlugins ...schemas.LLMPlugin) *TestSetup {
+	if testing.Short() {
+		t.Skip("external vector store test; run without -short")
+	}
 	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
 	logger := bifrost.NewDefaultLogger(schemas.LogLevelDebug)
 

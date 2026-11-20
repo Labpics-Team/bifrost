@@ -5764,3 +5764,31 @@ func BenchmarkBasePathMiddleware(b *testing.B) {
 		}
 	})
 }
+
+func TestCacheIdentityNativeBetaHeaders(t *testing.T) {
+	for _, name := range []string{"Anthropic-Beta", "OpenAI-Beta"} {
+		t.Run(name, func(t *testing.T) {
+			var ctx fasthttp.RequestCtx
+			ctx.Request.Header.SetMethod("POST")
+			ctx.Request.SetRequestURI("/v1/messages")
+			ctx.Request.Header.Add(name, "feature-a")
+			ctx.Request.Header.Add(name, "feature-b")
+			ctx.Request.Header.Set("X-App-Id", "app")
+			req := schemas.AcquireHTTPRequest()
+			defer schemas.ReleaseHTTPRequest(req)
+			fasthttpToHTTPRequest(&ctx, req)
+			if got := req.CaseInsensitiveHeaderLookup(name); got != "feature-a,feature-b" {
+				t.Fatalf("plugin/cache projection lost native flags: %q", got)
+			}
+			if !applyHTTPRequestToCtx(&ctx, req) {
+				t.Fatal("unmodified request rejected")
+			}
+			if got := string(ctx.Request.Header.Peek(name)); got != "feature-a,feature-b" {
+				t.Fatalf("provider received incomplete flags: %q", got)
+			}
+			if got := string(ctx.Request.Header.Peek("X-App-Id")); got != "app" {
+				t.Fatal("ordinary header changed")
+			}
+		})
+	}
+}

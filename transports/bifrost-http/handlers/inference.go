@@ -840,6 +840,7 @@ var PathToTypeMapping = map[string]schemas.RequestType{
 	"/v1/images/variations":      schemas.ImageVariationRequest,
 	"/v1/videos/edits":           schemas.VideoEditRequest,
 	"/v1/models":                 schemas.ListModelsRequest,
+	"/v1/routing/models":         schemas.ListModelsRequest,
 }
 
 // createRequestTypeMiddleware creates a middleware that sets the request type for a specific route
@@ -870,6 +871,7 @@ func (h *CompletionHandler) RegisterRoutes(r *router.Router, middlewares ...sche
 
 	// Model endpoints
 	r.GET("/v1/models", lib.ChainMiddlewares(h.listModels, baseMiddlewares...))
+	r.GET("/v1/routing/models", lib.ChainMiddlewares(h.listRoutingModels, baseMiddlewares...))
 	// Catch-all so a model can be addressed the way it is everywhere else: "provider/model".
 	modelRetrieveMW := append([]schemas.BifrostHTTPMiddleware{createRequestTypeMiddleware(schemas.ModelRetrieveRequest)}, middlewares...)
 	r.GET("/v1/models/{model:*}", lib.ChainMiddlewares(h.modelRetrieve, modelRetrieveMW...))

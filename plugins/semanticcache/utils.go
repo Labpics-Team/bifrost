@@ -1,14 +1,15 @@
 package semanticcache
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"maps"
+	"io"
 	"math"
-	"sort"
 	"strings"
 	"time"
 
@@ -17,6 +18,8 @@ import (
 	"github.com/google/uuid"
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/vectorstore"
+	"github.com/tidwall/gjson"
 )
 
 // Cache the same completion usage fields sent to clients, so explicit zeros
@@ -43,8 +46,29 @@ func marshalCachedResponse(res *schemas.BifrostResponse) ([]byte, error) {
 }
 
 func unmarshalCachedResponse(data []byte, res *schemas.BifrostResponse) error {
-	if err := json.Unmarshal(data, res); err != nil {
+	// Native raw JSON is held in interface{} fields. Keep its exact numbers;
+	// converting through float64 would corrupt integers beyond 2^53 on replay.
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(res); err != nil {
 		return err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return fmt.Errorf("cached response contains trailing data")
+	}
+	// Some response variants have custom JSON decoders, which do not inherit
+	// UseNumber. Restore opaque native JSON from the validated cache envelope,
+	// without interpreting it through those typed decoders. SSE strings keep
+	// their string type. The union's active variant is the only non-null payload.
+	if extra := res.GetExtraFields(); extra != nil && extra.RawResponse != nil {
+		gjson.ParseBytes(data).ForEach(func(_, response gjson.Result) bool {
+			raw := response.Get("extra_fields.raw_response")
+			if raw.IsObject() || raw.IsArray() {
+				extra.RawResponse = json.RawMessage(raw.Raw)
+				return false
+			}
+			return true
+		})
 	}
 	if res.ChatResponse != nil {
 		res.ChatResponse.Usage.PreserveTokenCountZeros(data, "ChatResponse.usage.prompt_tokens", "ChatResponse.usage.completion_tokens")
@@ -88,73 +112,14 @@ func isSemanticCacheSupportedRequestType(requestType schemas.RequestType) bool {
 	}
 }
 
-// hashSortedSet returns a deterministic hex hash for an order-insensitive
-// list of items. Some request fields are semantically sets but JSON-encoded
-// as lists (most notably Tools, where MCP's randomized map iteration would
-// otherwise perturb the request hash). The caller supplies a key extractor
-// because shapes differ across fields (e.g. ChatTool.Function.Name vs
-// ResponsesTool.Name). Use this for set-shaped fields large enough to be
-// worth compressing; for short []string sets, prefer sortedStringSet which
-// keeps the metadata human-debuggable.
-func hashSortedSet[T any](items []T, key func(T) string) (string, error) {
-	if len(items) == 0 {
-		return "", nil
-	}
-	sorted := make([]T, len(items))
-	copy(sorted, items)
-	sort.SliceStable(sorted, func(i, j int) bool {
-		return key(sorted[i]) < key(sorted[j])
-	})
-	payload := make([]any, len(sorted))
-	for i, t := range sorted {
-		payload[i] = t
-	}
-	itemsJSON, err := schemas.MarshalDeeplySorted(payload)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", xxhash.Sum64(itemsJSON)), nil
-}
-
-// hashMap returns a deterministic xxhash hex digest of the map. Uses
-// MarshalDeeplySorted because plain json.Marshal doesn't guarantee key
-// ordering on Go maps.
+// hashMap preserves integer precision and array ordering. encoding/json sorts
+// map keys without converting typed values through float64.
 func hashMap(m map[string]interface{}) (string, error) {
-	jsonData, err := schemas.MarshalDeeplySorted(m)
+	data, err := json.Marshal(m)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal metadata for metadata hash: %w", err)
+		return "", fmt.Errorf("failed to marshal cache metadata: %w", err)
 	}
-	return fmt.Sprintf("%x", xxhash.Sum64(jsonData)), nil
-}
-
-// sortedStringSet returns a sorted copy of a string slice that is semantically
-// a set (e.g. modalities, stop sequences, include flags). Sorting in place
-// would mutate the caller's parameters, so a copy is returned.
-func sortedStringSet(values []string) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	sorted := make([]string, len(values))
-	copy(sorted, values)
-	sort.Strings(sorted)
-	return sorted
-}
-
-// putIfSet writes m[key] = *v when v is non-nil. Used by extract*ParametersToMetadata
-// to collapse the if-nil-set boilerplate that dominates those functions.
-func putIfSet[T any](m map[string]any, key string, v *T) {
-	if v != nil {
-		m[key] = *v
-	}
-}
-
-// putSortedSetIfNonEmpty writes m[key] = sortedStringSet(values) when values
-// has any entries — otherwise leaves the key absent so the resulting metadata
-// hash treats "unset" and "empty" identically.
-func putSortedSetIfNonEmpty(m map[string]any, key string, values []string) {
-	if len(values) > 0 {
-		m[key] = sortedStringSet(values)
-	}
+	return fmt.Sprintf("%x", xxhash.Sum64(data)), nil
 }
 
 // normalizeText applies consistent normalization to text inputs for better cache hit rates.
@@ -266,13 +231,15 @@ func flattenToFloat32Embedding(values [][]float64) []float32 {
 // then anchors both direct and semantic lookups.
 func (plugin *Plugin) buildRequestMetadataForCaching(state *cacheState, req *schemas.BifrostRequest) (map[string]interface{}, error) {
 	metadata := map[string]interface{}{
-		"stream": bifrost.IsStreamRequestType(req.RequestType),
+		"stream":                 bifrost.IsStreamRequestType(req.RequestType),
+		"cache_identity_version": 2,
 	}
 
 	if attachments := plugin.extractAttachmentsForCaching(state, req); len(attachments) > 0 {
 		metadata["attachments"] = attachments
 	}
 
+	var rawBody []byte
 	// request_family separates endpoints whose input and params hash the same,
 	// such as chat and responses (issue #7560). It is set after the params so
 	// extra params cannot override it. Stream variants share a family because
@@ -282,60 +249,83 @@ func (plugin *Plugin) buildRequestMetadataForCaching(state *cacheState, req *sch
 		if req.TextCompletionRequest == nil {
 			return nil, fmt.Errorf("text completion payload is nil")
 		}
+		rawBody = req.TextCompletionRequest.RawRequestBody
 		if req.TextCompletionRequest != nil && req.TextCompletionRequest.Params != nil {
-			plugin.extractTextCompletionParametersToMetadata(req.TextCompletionRequest.Params, metadata)
+			metadata["parameters"] = req.TextCompletionRequest.Params
+			metadata["extra_parameters"] = req.TextCompletionRequest.Params.ExtraParams
 		}
 		metadata["request_family"] = schemas.TextCompletionRequest
 	case schemas.ChatCompletionRequest, schemas.ChatCompletionStreamRequest:
 		if req.ChatRequest == nil {
 			return nil, fmt.Errorf("chat payload is nil")
 		}
+		rawBody = req.ChatRequest.RawRequestBody
 		if req.ChatRequest != nil && req.ChatRequest.Params != nil {
-			plugin.extractChatParametersToMetadata(req.ChatRequest.Params, metadata)
+			metadata["parameters"] = req.ChatRequest.Params
+			metadata["extra_parameters"] = req.ChatRequest.Params.ExtraParams
 		}
 		metadata["request_family"] = schemas.ChatCompletionRequest
 	case schemas.ResponsesRequest, schemas.ResponsesStreamRequest, schemas.WebSocketResponsesRequest:
 		if req.ResponsesRequest == nil {
 			return nil, fmt.Errorf("responses payload is nil")
 		}
+		rawBody = req.ResponsesRequest.RawRequestBody
 		if req.ResponsesRequest != nil && req.ResponsesRequest.Params != nil {
-			plugin.extractResponsesParametersToMetadata(req.ResponsesRequest.Params, metadata)
+			metadata["parameters"] = req.ResponsesRequest.Params
+			metadata["extra_parameters"] = req.ResponsesRequest.Params.ExtraParams
 		}
 		metadata["request_family"] = schemas.ResponsesRequest
 	case schemas.SpeechRequest, schemas.SpeechStreamRequest:
 		if req.SpeechRequest == nil {
 			return nil, fmt.Errorf("speech payload is nil")
 		}
+		rawBody = req.SpeechRequest.RawRequestBody
 		if req.SpeechRequest != nil && req.SpeechRequest.Params != nil {
-			plugin.extractSpeechParametersToMetadata(req.SpeechRequest.Params, metadata)
+			metadata["parameters"] = req.SpeechRequest.Params
+			metadata["extra_parameters"] = req.SpeechRequest.Params.ExtraParams
 		}
 		metadata["request_family"] = schemas.SpeechRequest
 	case schemas.EmbeddingRequest:
 		if req.EmbeddingRequest == nil {
 			return nil, fmt.Errorf("embedding payload is nil")
 		}
+		rawBody = req.EmbeddingRequest.RawRequestBody
 		if req.EmbeddingRequest != nil && req.EmbeddingRequest.Params != nil {
-			plugin.extractEmbeddingParametersToMetadata(req.EmbeddingRequest.Params, metadata)
+			metadata["parameters"] = req.EmbeddingRequest.Params
+			metadata["extra_parameters"] = req.EmbeddingRequest.Params.ExtraParams
 		}
 		metadata["request_family"] = schemas.EmbeddingRequest
 	case schemas.TranscriptionRequest, schemas.TranscriptionStreamRequest:
 		if req.TranscriptionRequest == nil {
 			return nil, fmt.Errorf("transcription payload is nil")
 		}
+		rawBody = req.TranscriptionRequest.RawRequestBody
 		if req.TranscriptionRequest != nil && req.TranscriptionRequest.Params != nil {
-			plugin.extractTranscriptionParametersToMetadata(req.TranscriptionRequest.Params, metadata)
+			metadata["parameters"] = req.TranscriptionRequest.Params
+			metadata["extra_parameters"] = req.TranscriptionRequest.Params.ExtraParams
 		}
 		metadata["request_family"] = schemas.TranscriptionRequest
 	case schemas.ImageGenerationRequest, schemas.ImageGenerationStreamRequest:
 		if req.ImageGenerationRequest == nil {
 			return nil, fmt.Errorf("image generation payload is nil")
 		}
+		rawBody = req.ImageGenerationRequest.RawRequestBody
 		if req.ImageGenerationRequest != nil && req.ImageGenerationRequest.Params != nil {
-			plugin.extractImageGenerationParametersToMetadata(req.ImageGenerationRequest.Params, metadata)
+			metadata["parameters"] = req.ImageGenerationRequest.Params
+			metadata["extra_parameters"] = req.ImageGenerationRequest.Params.ExtraParams
 		}
 		metadata["request_family"] = schemas.ImageGenerationRequest
 	default:
 		return nil, fmt.Errorf("unsupported request type for semantic caching")
+	}
+
+	if state != nil && state.UseRawRequestBody {
+		if len(rawBody) == 0 {
+			return nil, fmt.Errorf("raw request body unavailable for cache identity")
+		}
+		// A native passthrough may carry fields absent from the typed request.
+		// It can only use exact replay; never expose its body in stored metadata.
+		metadata["raw_body_sha256"] = fmt.Sprintf("%x", sha256.Sum256(rawBody))
 	}
 
 	// identity_scope keeps entries with the identity that wrote them (see
@@ -618,6 +608,9 @@ func (plugin *Plugin) addNonStreamingResponse(ctx context.Context, responseID st
 	metadata["stream_chunks"] = []string{}
 
 	if err := plugin.store.Add(ctx, plugin.config.VectorStoreNamespace, responseID, embedding, metadata); err != nil {
+		if vectorstore.IsUnavailable(err) {
+			plugin.requestNamespaceRecovery()
+		}
 		return fmt.Errorf("failed to store unified cache entry: %w", err)
 	}
 
@@ -787,373 +780,6 @@ func filterResponsesMessages(msgs []schemas.ResponsesMessage, excludeSystem bool
 		out = append(out, m)
 	}
 	return out
-}
-
-// getNormalizedInputForCaching returns a copy of req.Input with text fields
-// lowercased + trimmed, suitable for hashing/embedding. System messages are
-// dropped when ExcludeSystemPrompt is enabled.
-//
-// Allocation strategy: the original request must never be mutated, but the
-// returned value only needs to round-trip through json.Marshal — it's hashed,
-// not stored. So we shallow-copy each message struct and rewrite Content
-// (the only field we normalize), sharing all other pointer fields with the
-// original. This avoids the per-call message-graph deep copy that
-// schemas.DeepCopy*Message would otherwise do.
-func (plugin *Plugin) getNormalizedInputForCaching(req *schemas.BifrostRequest) interface{} {
-	excludeSystem := plugin.config.ExcludeSystemPrompt != nil && *plugin.config.ExcludeSystemPrompt
-	switch req.RequestType {
-	case schemas.TextCompletionRequest, schemas.TextCompletionStreamRequest:
-		input := req.TextCompletionRequest.Input
-		out := schemas.TextCompletionInput{}
-		if input.PromptStr != nil {
-			ns := normalizeText(*input.PromptStr)
-			out.PromptStr = &ns
-		} else if len(input.PromptArray) > 0 {
-			arr := make([]string, len(input.PromptArray))
-			for i, p := range input.PromptArray {
-				arr[i] = normalizeText(p)
-			}
-			out.PromptArray = arr
-		}
-		return out
-	case schemas.ChatCompletionRequest, schemas.ChatCompletionStreamRequest:
-		originalMessages := req.ChatRequest.Input
-		normalizedMessages := make([]schemas.ChatMessage, 0, len(originalMessages))
-		for _, msg := range originalMessages {
-			if excludeSystem && msg.Role == schemas.ChatMessageRoleSystem {
-				continue
-			}
-			normalizedMessages = append(normalizedMessages, normalizeChatMessage(msg))
-		}
-		return normalizedMessages
-	case schemas.ResponsesRequest, schemas.ResponsesStreamRequest, schemas.WebSocketResponsesRequest:
-		originalMessages := req.ResponsesRequest.Input
-		normalizedMessages := make([]schemas.ResponsesMessage, 0, len(originalMessages))
-		for _, msg := range originalMessages {
-			if excludeSystem && msg.Role != nil && *msg.Role == schemas.ResponsesInputMessageRoleSystem {
-				continue
-			}
-			normalizedMessages = append(normalizedMessages, normalizeResponsesMessage(msg))
-		}
-		return normalizedMessages
-	case schemas.SpeechRequest, schemas.SpeechStreamRequest:
-		return normalizeText(req.SpeechRequest.Input.Input)
-	case schemas.EmbeddingRequest:
-		// Deep copy contents and normalize text parts; non-text parts are
-		// copied as-is so multimodal inputs participate in cache hashing.
-		src := req.EmbeddingRequest.Input
-		copiedItems := make([]schemas.EmbeddingInputItem, len(src))
-		for i, item := range src {
-			copiedContent := make(schemas.EmbeddingContent, len(item.Content))
-			for j, part := range item.Content {
-				copied := part
-				if part.Type == schemas.EmbeddingContentPartTypeText && part.Text != nil {
-					normalized := normalizeText(*part.Text)
-					copied.Text = &normalized
-				}
-				copiedContent[j] = copied
-			}
-			// Per-item params change the vector, so they belong in the hash.
-			copiedItems[i] = schemas.EmbeddingInputItem{Content: copiedContent, Params: item.Params}
-		}
-		return copiedItems
-	case schemas.TranscriptionRequest, schemas.TranscriptionStreamRequest:
-		return req.TranscriptionRequest.Input
-	case schemas.ImageGenerationRequest, schemas.ImageGenerationStreamRequest:
-		if req.ImageGenerationRequest != nil && req.ImageGenerationRequest.Input != nil {
-			return &schemas.ImageGenerationInput{
-				Prompt: normalizeText(req.ImageGenerationRequest.Input.Prompt),
-			}
-		}
-		return nil
-	default:
-		return nil
-	}
-}
-
-// normalizeChatMessage returns a shallow copy of msg with its Content
-// rewritten so text fields are lowercased + trimmed. Other pointer fields
-// (ToolCalls, Annotations, ChatToolMessage, ChatAssistantMessage) are
-// aliased — safe because we don't mutate them.
-func normalizeChatMessage(msg schemas.ChatMessage) schemas.ChatMessage {
-	out := msg
-	if msg.Content == nil {
-		return out
-	}
-	nc := *msg.Content
-	if msg.Content.ContentStr != nil {
-		ns := normalizeText(*msg.Content.ContentStr)
-		nc.ContentStr = &ns
-	} else if msg.Content.ContentBlocks != nil {
-		blocks := make([]schemas.ChatContentBlock, len(msg.Content.ContentBlocks))
-		for i, b := range msg.Content.ContentBlocks {
-			blocks[i] = b
-			if b.Text != nil {
-				nt := normalizeText(*b.Text)
-				blocks[i].Text = &nt
-			}
-		}
-		nc.ContentBlocks = blocks
-	}
-	out.Content = &nc
-	return out
-}
-
-// normalizeResponsesMessage mirrors normalizeChatMessage for the Responses API.
-func normalizeResponsesMessage(msg schemas.ResponsesMessage) schemas.ResponsesMessage {
-	out := msg
-	if msg.Content == nil {
-		return out
-	}
-	nc := *msg.Content
-	if msg.Content.ContentStr != nil {
-		ns := normalizeText(*msg.Content.ContentStr)
-		nc.ContentStr = &ns
-	} else if msg.Content.ContentBlocks != nil {
-		blocks := make([]schemas.ResponsesMessageContentBlock, len(msg.Content.ContentBlocks))
-		for i, b := range msg.Content.ContentBlocks {
-			blocks[i] = b
-			if b.Text != nil {
-				nt := normalizeText(*b.Text)
-				blocks[i].Text = &nt
-			}
-		}
-		nc.ContentBlocks = blocks
-	}
-	out.Content = &nc
-	return out
-}
-
-// extractChatParametersToMetadata extracts Chat API parameters into metadata map.
-func (plugin *Plugin) extractChatParametersToMetadata(params *schemas.ChatParameters, metadata map[string]interface{}) {
-	if params.ToolChoice != nil {
-		if params.ToolChoice.ChatToolChoiceStr != nil {
-			metadata["tool_choice"] = *params.ToolChoice.ChatToolChoiceStr
-		} else if params.ToolChoice.ChatToolChoiceStruct != nil && params.ToolChoice.ChatToolChoiceStruct.Function != nil && params.ToolChoice.ChatToolChoiceStruct.Function.Name != "" {
-			metadata["tool_choice"] = params.ToolChoice.ChatToolChoiceStruct.Function.Name
-		}
-	}
-	putIfSet(metadata, "temperature", params.Temperature)
-	putIfSet(metadata, "top_p", params.TopP)
-	putIfSet(metadata, "max_tokens", params.MaxCompletionTokens)
-	putSortedSetIfNonEmpty(metadata, "stop_sequences", params.Stop)
-	putIfSet(metadata, "presence_penalty", params.PresencePenalty)
-	putIfSet(metadata, "frequency_penalty", params.FrequencyPenalty)
-	putIfSet(metadata, "parallel_tool_calls", params.ParallelToolCalls)
-	putIfSet(metadata, "user", params.User)
-	putIfSet(metadata, "logit_bias", params.LogitBias)
-	putIfSet(metadata, "logprobs", params.LogProbs)
-	putSortedSetIfNonEmpty(metadata, "modalities", params.Modalities)
-	putIfSet(metadata, "prompt_cache_key", params.PromptCacheKey)
-	if params.Reasoning != nil {
-		putIfSet(metadata, "reasoning_enabled", params.Reasoning.Enabled)
-		putIfSet(metadata, "reasoning_effort", params.Reasoning.Effort)
-	}
-	if params.ResponseFormat != nil {
-		// ResponseFormat is a struct pointer that callers expect to round-trip
-		// through JSON; store the pointer directly so MarshalDeeplySorted walks it.
-		metadata["response_format"] = params.ResponseFormat
-	}
-	putIfSet(metadata, "safety_identifier", params.SafetyIdentifier)
-	putIfSet(metadata, "seed", params.Seed)
-	putIfSet(metadata, "service_tier", params.ServiceTier)
-	putIfSet(metadata, "store", params.Store)
-	putIfSet(metadata, "top_logprobs", params.TopLogProbs)
-	putIfSet(metadata, "verbosity", params.Verbosity)
-	if len(params.ExtraParams) > 0 {
-		maps.Copy(metadata, params.ExtraParams)
-	}
-	if len(params.Tools) > 0 {
-		// Tools are an order-insensitive set; producer-side ordering (notably
-		// MCP's randomized map iteration) must not perturb the request hash.
-		if toolsHash, err := hashSortedSet(params.Tools, func(t schemas.ChatTool) string {
-			if t.Function == nil {
-				return ""
-			}
-			return t.Function.Name
-		}); err != nil {
-			plugin.logger.Warn("Failed to marshal tools for metadata: %v", err)
-		} else if toolsHash != "" {
-			metadata["tools_hash"] = toolsHash
-		}
-	}
-}
-
-// extractResponsesParametersToMetadata extracts Responses API parameters into metadata map.
-func (plugin *Plugin) extractResponsesParametersToMetadata(params *schemas.ResponsesParameters, metadata map[string]interface{}) {
-	if params.ToolChoice != nil {
-		if params.ToolChoice.ResponsesToolChoiceStr != nil {
-			metadata["tool_choice"] = *params.ToolChoice.ResponsesToolChoiceStr
-		} else if params.ToolChoice.ResponsesToolChoiceStruct != nil && params.ToolChoice.ResponsesToolChoiceStruct.Name != nil {
-			metadata["tool_choice"] = *params.ToolChoice.ResponsesToolChoiceStruct.Name
-		}
-	}
-	putIfSet(metadata, "temperature", params.Temperature)
-	putIfSet(metadata, "top_p", params.TopP)
-	putIfSet(metadata, "max_tokens", params.MaxOutputTokens)
-	putIfSet(metadata, "parallel_tool_calls", params.ParallelToolCalls)
-	putIfSet(metadata, "background", params.Background)
-	if params.Conversation != nil {
-		if params.Conversation.ResponsesResponseConversationStr != nil {
-			metadata["conversation"] = *params.Conversation.ResponsesResponseConversationStr
-		} else if params.Conversation.ResponsesResponseConversationStruct != nil {
-			metadata["conversation"] = params.Conversation.ResponsesResponseConversationStruct.ID
-		}
-	}
-	putSortedSetIfNonEmpty(metadata, "include", params.Include)
-	putIfSet(metadata, "instructions", params.Instructions)
-	putIfSet(metadata, "max_tool_calls", params.MaxToolCalls)
-	putIfSet(metadata, "previous_response_id", params.PreviousResponseID)
-	putIfSet(metadata, "prompt_cache_key", params.PromptCacheKey)
-	if params.Reasoning != nil {
-		putIfSet(metadata, "reasoning_effort", params.Reasoning.Effort)
-		putIfSet(metadata, "reasoning_max_tokens", params.Reasoning.MaxTokens)
-		putIfSet(metadata, "reasoning_summary", params.Reasoning.Summary)
-	}
-	putIfSet(metadata, "safety_identifier", params.SafetyIdentifier)
-	putIfSet(metadata, "service_tier", params.ServiceTier)
-	putIfSet(metadata, "store", params.Store)
-	if params.Text != nil {
-		putIfSet(metadata, "text_verbosity", params.Text.Verbosity)
-		if params.Text.Format != nil {
-			metadata["text_format_type"] = params.Text.Format.Type
-		}
-	}
-	putIfSet(metadata, "top_logprobs", params.TopLogProbs)
-	putIfSet(metadata, "truncation", params.Truncation)
-	if len(params.ExtraParams) > 0 {
-		maps.Copy(metadata, params.ExtraParams)
-	}
-	if len(params.Tools) > 0 {
-		// Tools are an order-insensitive set; producer-side ordering (notably
-		// MCP's randomized map iteration) must not perturb the request hash.
-		if toolsHash, err := hashSortedSet(params.Tools, func(t schemas.ResponsesTool) string {
-			if t.Name == nil {
-				return ""
-			}
-			return *t.Name
-		}); err != nil {
-			plugin.logger.Warn("Failed to marshal tools for metadata: %v", err)
-		} else if toolsHash != "" {
-			metadata["tools_hash"] = toolsHash
-		}
-	}
-}
-
-// extractTextCompletionParametersToMetadata extracts Text Completion parameters into metadata map.
-func (plugin *Plugin) extractTextCompletionParametersToMetadata(params *schemas.TextCompletionParameters, metadata map[string]interface{}) {
-	putIfSet(metadata, "temperature", params.Temperature)
-	putIfSet(metadata, "top_p", params.TopP)
-	putIfSet(metadata, "max_tokens", params.MaxTokens)
-	putSortedSetIfNonEmpty(metadata, "stop_sequences", params.Stop)
-	putIfSet(metadata, "presence_penalty", params.PresencePenalty)
-	putIfSet(metadata, "frequency_penalty", params.FrequencyPenalty)
-	putIfSet(metadata, "user", params.User)
-	putIfSet(metadata, "best_of", params.BestOf)
-	putIfSet(metadata, "echo", params.Echo)
-	putIfSet(metadata, "logit_bias", params.LogitBias)
-	putIfSet(metadata, "logprobs", params.LogProbs)
-	putIfSet(metadata, "n", params.N)
-	putIfSet(metadata, "seed", params.Seed)
-	putIfSet(metadata, "suffix", params.Suffix)
-	if len(params.ExtraParams) > 0 {
-		maps.Copy(metadata, params.ExtraParams)
-	}
-}
-
-// extractSpeechParametersToMetadata extracts Speech parameters into metadata map.
-func (plugin *Plugin) extractSpeechParametersToMetadata(params *schemas.SpeechParameters, metadata map[string]interface{}) {
-	if params == nil {
-		return
-	}
-	putIfSet(metadata, "speed", params.Speed)
-	if params.ResponseFormat != "" {
-		metadata["response_format"] = params.ResponseFormat
-	}
-	if params.Instructions != "" {
-		metadata["instructions"] = params.Instructions
-	}
-	putIfSet(metadata, "voice", params.VoiceConfig.Voice)
-	if len(params.VoiceConfig.MultiVoiceConfig) > 0 {
-		flattenedVC := make([]string, len(params.VoiceConfig.MultiVoiceConfig))
-		for i, vc := range params.VoiceConfig.MultiVoiceConfig {
-			flattenedVC[i] = fmt.Sprintf("%s:%s", vc.Speaker, vc.Voice)
-		}
-		metadata["multi_voice_count"] = flattenedVC
-	}
-	if len(params.PronunciationDictionaryLocators) > 0 {
-		if hash, err := hashSortedSet(params.PronunciationDictionaryLocators, func(l schemas.SpeechPronunciationDictionaryLocator) string {
-			return l.PronunciationDictionaryID
-		}); err != nil {
-			plugin.logger.Warn("Failed to marshal pronunciation_dictionary_locators for metadata: %v", err)
-		} else if hash != "" {
-			metadata["pronunciation_dictionary_locators_hash"] = hash
-		}
-	}
-	if len(params.ExtraParams) > 0 {
-		maps.Copy(metadata, params.ExtraParams)
-	}
-}
-
-// extractEmbeddingParametersToMetadata extracts Embedding parameters into metadata map.
-func (plugin *Plugin) extractEmbeddingParametersToMetadata(params *schemas.EmbeddingParameters, metadata map[string]interface{}) {
-	putIfSet(metadata, "encoding_format", params.EncodingFormat)
-	putIfSet(metadata, "dimensions", params.Dimensions)
-	putIfSet(metadata, "task_type", params.TaskType)
-	putIfSet(metadata, "title", params.Title)
-	putIfSet(metadata, "auto_truncate", params.AutoTruncate)
-	if len(params.ExtraParams) > 0 {
-		maps.Copy(metadata, params.ExtraParams)
-	}
-}
-
-// extractTranscriptionParametersToMetadata extracts Transcription parameters into metadata map.
-func (plugin *Plugin) extractTranscriptionParametersToMetadata(params *schemas.TranscriptionParameters, metadata map[string]interface{}) {
-	putIfSet(metadata, "language", params.Language)
-	putIfSet(metadata, "response_format", params.ResponseFormat)
-	putIfSet(metadata, "prompt", params.Prompt)
-	putIfSet(metadata, "file_format", params.Format)
-	putSortedSetIfNonEmpty(metadata, "timestamp_granularities", params.TimestampGranularities)
-	putSortedSetIfNonEmpty(metadata, "include", params.Include)
-	if len(params.AdditionalFormats) > 0 {
-		if hash, err := hashSortedSet(params.AdditionalFormats, func(f schemas.TranscriptionAdditionalFormat) string {
-			return string(f.Format)
-		}); err != nil {
-			plugin.logger.Warn("Failed to marshal additional_formats for metadata: %v", err)
-		} else if hash != "" {
-			metadata["additional_formats_hash"] = hash
-		}
-	}
-	if len(params.ExtraParams) > 0 {
-		maps.Copy(metadata, params.ExtraParams)
-	}
-}
-
-// extractImageGenerationParametersToMetadata extracts Image Generation parameters into metadata map.
-func (plugin *Plugin) extractImageGenerationParametersToMetadata(params *schemas.ImageGenerationParameters, metadata map[string]interface{}) {
-	if params == nil {
-		return
-	}
-	putIfSet(metadata, "n", params.N)
-	putIfSet(metadata, "background", params.Background)
-	putIfSet(metadata, "moderation", params.Moderation)
-	putIfSet(metadata, "partial_images", params.PartialImages)
-	putIfSet(metadata, "size", params.Size)
-	putIfSet(metadata, "quality", params.Quality)
-	putIfSet(metadata, "output_compression", params.OutputCompression)
-	putIfSet(metadata, "output_format", params.OutputFormat)
-	putIfSet(metadata, "style", params.Style)
-	putIfSet(metadata, "response_format", params.ResponseFormat)
-	putIfSet(metadata, "seed", params.Seed)
-	putIfSet(metadata, "negative_prompt", params.NegativePrompt)
-	putIfSet(metadata, "num_inference_steps", params.NumInferenceSteps)
-	putIfSet(metadata, "user", params.User)
-	if len(params.InputImages) > 0 {
-		metadata["input_images"] = params.InputImages
-	}
-	if len(params.ExtraParams) > 0 {
-		maps.Copy(metadata, params.ExtraParams)
-	}
 }
 
 // isConversationHistoryThresholdExceeded returns true when the request's

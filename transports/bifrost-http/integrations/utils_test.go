@@ -435,3 +435,82 @@ func TestSendHelpers_ExtraFieldsPlacement(t *testing.T) {
 		assert.Equal(t, "openai", string(streamErrCtx.Response.Header.Peek(lib.HeaderBifrostProvider)))
 	}
 }
+
+func TestRateLimitFeedbackHTTP(t *testing.T) {
+	router := newTestGenericRouter()
+	converter := func(_ *schemas.BifrostContext, err *schemas.BifrostError) interface{} { return err }
+	for _, tc := range []struct {
+		name  string
+		delay int64
+		want  string
+	}{
+		{"eight seconds", 8000, "8"},
+		{"fractional second rounds up", 8001, "9"},
+		{"subsecond rounds up", 1, "1"},
+		{"owner deadline is not provider-clamped", 600000, "600"},
+		{"maximum integer cannot overflow", 9223372036854775807, "9223372036854776"},
+		{"unknown deadline clears stale provider hint", 0, ""},
+		{"negative deadline clears stale provider hint", -1, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, streaming := range []bool{false, true} {
+				ctx := &fasthttp.RequestCtx{}
+				bifrostCtx := newTestBifrostContext()
+				bifrostCtx.SetValue(schemas.BifrostContextKeyProviderResponseHeaders, map[string]string{"Retry-After": "300"})
+				failure := &schemas.BifrostError{
+					Type: strPtr("request_limited"), StatusCode: ptr(429),
+					Error: &schemas.ErrorField{Message: "rate limit exceeded"},
+					ExtraFields: schemas.BifrostErrorExtraFields{
+						ErrorType:  schemas.ErrorTypePolicyRateLimited,
+						RetryAfter: tc.delay,
+					},
+				}
+				if streaming {
+					router.sendStreamError(ctx, bifrostCtx, RouteConfig{ErrorConverter: converter}, failure)
+				} else {
+					router.sendError(ctx, bifrostCtx, converter, failure)
+				}
+				require.Equal(t, 429, ctx.Response.StatusCode())
+				assert.Equal(t, tc.want, string(ctx.Response.Header.Peek("Retry-After")))
+				var decoded schemas.BifrostError
+				require.NoError(t, sonic.Unmarshal(ctx.Response.Body(), &decoded))
+				require.NotNil(t, decoded.Type)
+				assert.Equal(t, "request_limited", *decoded.Type)
+				require.NotNil(t, decoded.StatusCode)
+				assert.Equal(t, 429, *decoded.StatusCode)
+				assert.Equal(t, schemas.ErrorTypePolicyRateLimited, decoded.ExtraFields.ErrorType)
+				assert.Equal(t, tc.delay, decoded.ExtraFields.RetryAfter)
+			}
+		})
+	}
+}
+
+func TestRateLimitFeedbackPreservesProviderHeader(t *testing.T) {
+	router := newTestGenericRouter()
+	converter := func(_ *schemas.BifrostContext, err *schemas.BifrostError) interface{} { return err }
+	for _, streaming := range []bool{false, true} {
+		ctx := &fasthttp.RequestCtx{}
+		bifrostCtx := newTestBifrostContext()
+		bifrostCtx.SetValue(schemas.BifrostContextKeyProviderResponseHeaders, map[string]string{"Retry-After": "300"})
+		failure := &schemas.BifrostError{
+			StatusCode: ptr(429), Error: &schemas.ErrorField{Message: "upstream rate limit"},
+			ExtraFields: schemas.BifrostErrorExtraFields{RetryAfter: 8000},
+		}
+		if streaming {
+			router.sendStreamError(ctx, bifrostCtx, RouteConfig{ErrorConverter: converter}, failure)
+		} else {
+			router.sendError(ctx, bifrostCtx, converter, failure)
+		}
+		assert.Equal(t, "300", string(ctx.Response.Header.Peek("Retry-After")), "provider headers must remain authoritative for provider refusals")
+	}
+}
+
+func TestRateLimitFeedbackCommonHeaderWriter(t *testing.T) {
+	// Native handlers and integration routes call this same header writer.
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Response.Header.Set("Retry-After", "300")
+	lib.ApplyBifrostErrorResponseHeaders(ctx, nil, schemas.BifrostErrorExtraFields{
+		ErrorType: schemas.ErrorTypePolicyRateLimited, RetryAfter: 8000,
+	})
+	assert.Equal(t, "8", string(ctx.Response.Header.Peek("Retry-After")))
+}

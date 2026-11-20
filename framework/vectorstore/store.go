@@ -126,6 +126,17 @@ type VectorStore interface {
 	Close(ctx context.Context, namespace string) error
 }
 
+// FilteredDeleter is an optional capability for conditional, server-side deletion.
+// Every query is ANDed and evaluated by the backend when selecting points for
+// deletion; implementations must not replace this with a client-side scan
+// followed by ID-only deletes.
+// Empty or unsupported filters must fail without deleting anything. A successful
+// return means the store has applied the operation. Cancellation must stop waiting,
+// but does not guarantee that a submitted operation had no effect.
+type FilteredDeleter interface {
+	DeleteByFilter(ctx context.Context, namespace string, queries []Query) error
+}
+
 // WithDisableScanFallback returns a derived context that tells vector stores not
 // to fall back to full scans when indexed search fails.
 func WithDisableScanFallback(ctx context.Context) context.Context {

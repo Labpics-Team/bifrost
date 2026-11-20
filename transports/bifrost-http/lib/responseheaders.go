@@ -275,6 +275,17 @@ func applyCacheMetadataHeaders(ctx *fasthttp.RequestCtx, metadata *schemas.Bifro
 // converted_request_type, dropped_compat_plugin_params) are written too, since the
 // body loses extra_fields.
 func ApplyBifrostErrorResponseHeaders(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostContext, extra schemas.BifrostErrorExtraFields) {
+	if extra.ErrorType == schemas.ErrorTypePolicyRateLimited {
+		// A prior provider attempt cannot set the deadline of a local policy refusal.
+		ctx.Response.Header.Del("Retry-After")
+		if extra.RetryAfter > 0 {
+			seconds := extra.RetryAfter / 1000
+			if extra.RetryAfter%1000 != 0 {
+				seconds++
+			}
+			ctx.Response.Header.Set("Retry-After", strconv.FormatInt(seconds, 10))
+		}
+	}
 	// Error latency is omitempty in the body, so a 0 stays absent here too.
 	applyBifrostResponseHeaders(ctx, bifrostCtx, schemas.BifrostResponseExtraFields{
 		RequestType:               extra.RequestType,

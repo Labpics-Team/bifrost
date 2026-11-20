@@ -25,12 +25,23 @@ func NewHealthHandler(config *lib.Config) *HealthHandler {
 // RegisterRoutes registers the health-related routes.
 func (h *HealthHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
 	r.GET("/health", lib.ChainMiddlewares(h.getHealth, middlewares...))
+	r.GET("/readyz", lib.ChainMiddlewares(h.getReady, middlewares...))
 }
 
 // getHealth handles GET /api/health - Get the health status of the server.
 func (h *HealthHandler) getHealth(ctx *fasthttp.RequestCtx) {
-	// If DB pings are disabled, just return OK
-	if h.config.ClientConfig.DisableDBPingsInHealth {
+	h.checkStores(ctx, true)
+}
+
+// getReady checks the stores required to accept requests. Optional vector-store
+// diagnostics remain on /health and never remove the gateway from service.
+func (h *HealthHandler) getReady(ctx *fasthttp.RequestCtx) {
+	h.checkStores(ctx, false)
+}
+
+func (h *HealthHandler) checkStores(ctx *fasthttp.RequestCtx, includeVector bool) {
+	// The diagnostic opt-out cannot hide a required store failure from readiness.
+	if includeVector && h.config.ClientConfig.DisableDBPingsInHealth {
 		SendJSON(ctx, map[string]any{"status": "ok", "components": map[string]any{"db_pings": "disabled"}})
 		return
 	}
@@ -67,7 +78,7 @@ func (h *HealthHandler) getHealth(ctx *fasthttp.RequestCtx) {
 	}
 
 	// Pinging vector store
-	if h.config.VectorStore != nil {
+	if includeVector && h.config.VectorStore != nil {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

@@ -1,12 +1,57 @@
 package anthropic
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	schemas "github.com/maximhq/bifrost/core/schemas"
 )
+
+func TestAnthropicRequestOutcomeEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name, sourceType, sourceCode, wantType, wantCode string
+		status                                           int
+	}{
+		{"credentials type", "upstream_credentials_exhausted", "", "api_error", "upstream_credentials_exhausted", 502},
+		{"credentials code", "api_error", "upstream_credentials_exhausted", "api_error", "upstream_credentials_exhausted", 502},
+		{"unknown overrides credentials", "upstream_credentials_exhausted", "request_outcome_unknown", "api_error", "request_outcome_unknown", 502},
+		{"unknown overrides quota", "rate_limit_error", "request_outcome_unknown", "rate_limit_error", "request_outcome_unknown", 429},
+		{"ordinary quota", "rate_limit_error", "", "rate_limit_error", "", 429},
+		{"provider code is not delivery evidence", "api_error", "provider_specific", "api_error", "", 502},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := &schemas.BifrostError{
+				StatusCode: &tc.status,
+				Error: &schemas.ErrorField{
+					Type: schemas.Ptr(tc.sourceType), Code: schemas.Ptr(tc.sourceCode), Message: "provider message",
+				},
+			}
+			direct, err := providerUtils.MarshalSorted(ToAnthropicChatCompletionError(input))
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream := ToAnthropicResponsesStreamError(input)
+			if stream != "event: error\ndata: "+string(direct)+"\n\n" {
+				t.Fatalf("JSON and SSE evidence differ: JSON=%s SSE=%q", direct, stream)
+			}
+			var envelope struct {
+				Type  string            `json:"type"`
+				Error map[string]string `json:"error"`
+			}
+			if err := json.Unmarshal(direct, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope.Type != "error" || envelope.Error["type"] != tc.wantType || envelope.Error["message"] != "provider message" || envelope.Error["code"] != tc.wantCode {
+				t.Fatalf("unexpected native envelope: %s", direct)
+			}
+			if _, present := envelope.Error["code"]; present != (tc.wantCode != "") {
+				t.Fatalf("ordinary errors must omit code: %s", direct)
+			}
+		})
+	}
+}
 
 // TestToAnthropicChatCompletionError checks that the envelope's error.type is always a
 // documented Anthropic type (or a Bifrost wire-level type) that agrees with the status.

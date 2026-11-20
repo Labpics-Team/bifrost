@@ -35,7 +35,7 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-var loggingSkipPaths = []string{"/health", "/_next", "/api/dev/"}
+var loggingSkipPaths = []string{"/health", "/readyz", "/_next", "/api/dev/"}
 var realtimeTransportPaths = buildRealtimeTransportPathSet()
 
 // apiPathPrefix is the route prefix whose responses must never be served from a shared cache.
@@ -1205,7 +1205,19 @@ func fasthttpToHTTPRequest(ctx *fasthttp.RequestCtx, req *schemas.HTTPRequest) {
 
 	// Copy headers
 	for key, value := range ctx.Request.Header.All() {
-		req.Headers[string(key)] = string(value)
+		name := string(key)
+		listValued := strings.EqualFold(name, "anthropic-beta") || strings.EqualFold(name, "openai-beta")
+		if listValued {
+			name = strings.ToLower(name)
+		}
+		// Native beta headers are list-valued. The plugin wire format stores
+		// one string per name, so retain repeated fields as an equivalent list.
+		// The same projection reaches cache identity and the provider request.
+		if listValued && req.Headers[name] != "" {
+			req.Headers[name] += "," + string(value)
+		} else {
+			req.Headers[name] = string(value)
+		}
 	}
 
 	// Copy query params
@@ -1793,6 +1805,7 @@ var apiSystemWhitelistedRoutes = []string{
 	// Client ID Metadata Document
 	"/api/oauth/client-metadata.json",
 	"/health",
+	"/readyz",
 	"/login",
 	"/favicon.ico",
 	"/assets/*",

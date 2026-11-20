@@ -14,7 +14,19 @@ import (
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/vectorstore"
+	"google.golang.org/grpc/status"
 )
+
+// Bound optional store reads so an unresponsive cache still permits inference.
+// This is a transport availability budget, not an embedding or request deadline.
+const cacheStoreLookupTimeout = 250 * time.Millisecond
+
+// cacheStoreError distinguishes storage failure from embedding and response
+// decoding errors, which can still leave a usable direct-cache write path.
+type cacheStoreError struct{ err error }
+
+func (e *cacheStoreError) Error() string { return e.err.Error() }
+func (e *cacheStoreError) Unwrap() error { return e.err }
 
 // performDirectSearch does an O(1) point fetch on the deterministic directCacheID
 // derived from (provider, model, cacheKey, request_hash, params_hash). Caller
@@ -35,8 +47,19 @@ func (plugin *Plugin) performDirectSearch(ctx *schemas.BifrostContext, state *ca
 
 	// All filters (cacheKey, provider, model, requestHash, paramsHash) are
 	// encoded into directCacheID, so a Get-by-ID is sufficient.
-	result, err := plugin.store.GetChunk(ctx, plugin.config.VectorStoreNamespace, directCacheID)
+	lookupCtx, cancel := context.WithTimeout(ctx, cacheStoreLookupTimeout)
+	result, err := plugin.store.GetChunk(lookupCtx, plugin.config.VectorStoreNamespace, directCacheID)
+	cancel()
 	if err != nil {
+		if vectorstore.IsUnavailable(err) {
+			return nil, &cacheStoreError{fmt.Errorf("failed to fetch direct cache chunk: %w", err)}
+		}
+		// A reachable service's schema or access error can mention "not found"
+		// without meaning a missing cache point. Preserve it before legacy text
+		// classification used by stores that do not return typed point misses.
+		if _, knownStatus := status.FromError(err); knownStatus {
+			return nil, &cacheStoreError{fmt.Errorf("failed to fetch direct cache chunk: %w", err)}
+		}
 		errMsg := strings.ToLower(err.Error())
 		isMiss := errors.Is(err, vectorstore.ErrNotFound) ||
 			strings.Contains(errMsg, "not found") ||
@@ -44,7 +67,7 @@ func (plugin *Plugin) performDirectSearch(ctx *schemas.BifrostContext, state *ca
 		if isMiss {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("failed to fetch direct cache chunk: %w", err)
+		return nil, &cacheStoreError{fmt.Errorf("failed to fetch direct cache chunk: %w", err)}
 	}
 	return plugin.buildResponseFromResult(ctx, state, req, result, CacheTypeDirect, nil, nil)
 }
@@ -90,9 +113,12 @@ func (plugin *Plugin) performSemanticSearch(ctx *schemas.BifrostContext, state *
 	}
 
 	selectFields := selectFieldsForRequest(req.RequestType)
-	results, err := plugin.store.GetNearest(ctx, plugin.config.VectorStoreNamespace, embedding, strictFilters, selectFields, cacheThreshold, 1)
+	// Embedding work must not consume the following store read's availability budget.
+	lookupCtx, cancel := context.WithTimeout(ctx, cacheStoreLookupTimeout)
+	results, err := plugin.store.GetNearest(lookupCtx, plugin.config.VectorStoreNamespace, embedding, strictFilters, selectFields, cacheThreshold, 1)
+	cancel()
 	if err != nil {
-		return nil, fmt.Errorf("failed to search semantic cache: %w", err)
+		return nil, &cacheStoreError{fmt.Errorf("failed to search semantic cache: %w", err)}
 	}
 	if len(results) == 0 {
 		return nil, nil
@@ -139,11 +165,8 @@ func (plugin *Plugin) generateEmbedding(ctx *schemas.BifrostContext, text string
 	}
 
 	embeddingCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
-	// Cancel the derived context once we're done. NewBifrostContext starts a
-	// watchCancellation goroutine that holds a reference to ctx (the scoped
-	// plugin context). Without this, that goroutine outlives the plugin call
-	// and may dereference fields on a parent context that has already been
-	// released back to its sync.Pool — see core/schemas.ReleasePluginScope.
+	// Finish this derived context's cancellation observer when the internal
+	// embedding call ends. Its own cancellation does not cancel the request.
 	defer embeddingCtx.Cancel()
 	// The embedding request targets the plugin's own configured embedding
 	// provider/model. It must skip the plugin pipeline and raw payload capture
@@ -193,14 +216,14 @@ func (plugin *Plugin) generateEmbedding(ctx *schemas.BifrostContext, text string
 	return nil, 0, fmt.Errorf("embedding data is not in expected format")
 }
 
-// generateRequestHash creates an xxhash of the (normalized input, params).
+// generateRequestHash hashes the exact typed input and complete parameters.
 // Fallbacks are excluded since they only affect error handling.
 func (plugin *Plugin) generateRequestHash(req *schemas.BifrostRequest, params map[string]interface{}) (string, error) {
 	hashInput := map[string]interface{}{
-		"input":  plugin.getNormalizedInputForCaching(req),
+		"input":  plugin.getInputForCaching(nil, req),
 		"params": params,
 	}
-	jsonData, err := schemas.MarshalDeeplySorted(hashInput)
+	jsonData, err := json.Marshal(hashInput)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal request for hashing: %w", err)
 	}
@@ -250,18 +273,21 @@ func (plugin *Plugin) buildResponseFromResult(ctx *schemas.BifrostContext, state
 	}
 
 	if expired, miss := isExpiredEntry(properties); expired {
+		if _, ok := plugin.store.(vectorstore.FilteredDeleter); ok {
+			// The retention worker deletes conditionally. An ID-only delete here
+			// could race with a concurrent upsert and remove a fresh response.
+			return nil, nil
+		}
 		// Async best-effort cleanup of the stale entry. Tracked on writersWg
 		// so WaitForPendingOperations + Cleanup block until it finishes,
 		// avoiding a delete racing with namespace teardown.
-		plugin.writersWg.Add(1)
-		go func() {
-			defer plugin.writersWg.Done()
-			deleteCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		plugin.cacheWriter(result.ID, func(cacheCtx context.Context) {
+			deleteCtx, cancel := context.WithTimeout(cacheCtx, 5*time.Second)
 			defer cancel()
 			if err := plugin.store.Delete(deleteCtx, plugin.config.VectorStoreNamespace, result.ID); err != nil {
 				plugin.logger.Warn("Failed to delete expired entry %s: %v", result.ID, err)
 			}
-		}()
+		})
 		return nil, nil
 	} else if miss {
 		// Unparseable expires_at — treat as miss to be safe.

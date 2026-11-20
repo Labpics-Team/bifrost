@@ -2,6 +2,7 @@
 package governance
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -55,12 +56,12 @@ type EvaluationRequest struct {
 // EvaluationResult is a governance verdict: whether the request may proceed, and why not when it
 // may not.
 //
-// The reason is the whole of the answer. Earlier versions also carried the rate limit, the budgets
-// and the usage that produced the verdict, which nothing ever read: a caller that is refused needs
-// to be told what refused it, and one that is allowed needs nothing at all.
+// A refusal carries only its reason and actionable retry feedback, never the policy rows
+// or usage counters that produced it.
 type EvaluationResult struct {
-	Decision Decision `json:"decision"`
-	Reason   string   `json:"reason"`
+	Decision   Decision `json:"decision"`
+	Reason     string   `json:"reason"`
+	RetryAfter int64    `json:"retry_after_ms,omitempty"`
 }
 
 // BudgetResolver provides decision logic for the new hierarchical governance system
@@ -219,10 +220,15 @@ func (r *BudgetResolver) evaluateLimits(ctx *schemas.BifrostContext, evaluationR
 	// would otherwise have been affordable, and reporting the cheaper refusal first keeps the
 	// message stable for a caller that is both throttled and out of money.
 	if decision, err := r.store.CheckRateLimits(ctx, rateLimits, nil, nil); err != nil || isRateLimitViolation(decision) {
-		return &EvaluationResult{
+		result := &EvaluationResult{
 			Decision: decision,
 			Reason:   fmt.Sprintf("Rate limit exceeded: %s", reasonFromErr(err, decision)),
 		}
+		var refusal *rateLimitRefusal
+		if isRateLimitViolation(decision) && errors.As(err, &refusal) {
+			result.RetryAfter = refusal.retryAfter
+		}
+		return result
 	}
 
 	if decision, err := r.store.CheckBudgets(ctx, budgets, nil); err != nil || isBudgetViolation(decision) {

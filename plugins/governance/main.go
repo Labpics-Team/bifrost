@@ -934,6 +934,10 @@ func unusablePermit(access schemas.Access) *EvaluationResult {
 
 // refusal builds the error a governance decision refuses a request with.
 func refusal(result *EvaluationResult, statusCode int, errorType schemas.ErrorType) *schemas.BifrostError {
+	extra := schemas.BifrostErrorExtraFields{ErrorType: errorType}
+	if errorType == schemas.ErrorTypePolicyRateLimited {
+		extra.RetryAfter = result.RetryAfter
+	}
 	return &schemas.BifrostError{
 		// Type stays the raw decision: it is the client-visible error contract.
 		Type:       new(string(result.Decision)),
@@ -941,7 +945,7 @@ func refusal(result *EvaluationResult, statusCode int, errorType schemas.ErrorTy
 		Error: &schemas.ErrorField{
 			Message: result.Reason,
 		},
-		ExtraFields: schemas.BifrostErrorExtraFields{ErrorType: errorType},
+		ExtraFields: extra,
 	}
 }
 
