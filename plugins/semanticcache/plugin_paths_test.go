@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"runtime"
 	"strings"
@@ -1470,5 +1472,145 @@ func TestPostLLMHook_FailedStreamOutlivesReaperUntilFinalChunk(t *testing.T) {
 				t.Fatalf("expected exactly one marshal warning, got %v", warnings)
 			}
 		})
+	}
+}
+
+type nativeReplayAccount struct{ endpoint string }
+
+func (a nativeReplayAccount) GetConfiguredProviders() ([]schemas.ModelProvider, error) {
+	return []schemas.ModelProvider{schemas.OpenAI}, nil
+}
+func (a nativeReplayAccount) GetConfigForProvider(schemas.ModelProvider) (*schemas.ProviderConfig, error) {
+	return &schemas.ProviderConfig{
+		NetworkConfig:            schemas.NetworkConfig{BaseURL: a.endpoint, DefaultRequestTimeoutInSeconds: 5},
+		ConcurrencyAndBufferSize: schemas.ConcurrencyAndBufferSize{Concurrency: 1, BufferSize: 10},
+	}, nil
+}
+func (a nativeReplayAccount) GetKeysForProvider(context.Context, schemas.ModelProvider) ([]schemas.Key, error) {
+	return []schemas.Key{{ID: "fixture", Value: *schemas.NewSecretVar("fixture"), Weight: 1, Models: []string{"*"}}}, nil
+}
+
+func TestCacheReplayPreservesNativeContent(t *testing.T) {
+	for _, content := range []string{`{"answer":`, "opaque model content", `{"answer":true}`} {
+		t.Run(content, func(t *testing.T) {
+			var sends atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				sends.Add(1)
+				var request struct {
+					Stop           []string              `json:"stop"`
+					ResponseFormat struct{ Type string } `json:"response_format"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil || len(request.Stop) != 1 || request.Stop[0] != "END" || request.ResponseFormat.Type != "json_object" {
+					t.Errorf("native parameters changed: %+v, %v", request, err)
+				}
+				response := identityTestChatResponse(content).ChatResponse
+				response.Model = "gpt-4o-mini"
+				response.Choices[0].FinishReason = schemas.Ptr("stop")
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(response)
+			}))
+			defer upstream.Close()
+			plugin := identityScopeTestPlugin(t, newObservableStore(), "")
+			client, err := bifrost.Init(context.Background(), schemas.BifrostConfig{
+				Account: nativeReplayAccount{upstream.URL}, Logger: bifrost.NewDefaultLogger(schemas.LogLevelError),
+				LLMPlugins: []schemas.LLMPlugin{plugin},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Shutdown()
+			request := identityTestChatRequest("native content", nil).ChatRequest
+			var format any = map[string]any{"type": "json_object"}
+			request.Params = &schemas.ChatParameters{ResponseFormat: &format, Stop: []string{"END"}}
+			request.Fallbacks = []schemas.Fallback{{Provider: schemas.OpenAI, Model: "fallback"}}
+			for _, cached := range []bool{false, true} {
+				ctx := identityContext(t, "native-content", identityRef{vk: "tenant"})
+				ctx.SetValue(CacheTypeKey, CacheTypeDirect)
+				response, err := client.ChatCompletionRequest(ctx, request)
+				ctx.Cancel()
+				plugin.WaitForPendingOperations()
+				if err != nil || response == nil {
+					t.Fatalf("native response became an error: cached=%v sends=%d error=%v", cached, sends.Load(), err)
+				}
+				if got := *response.Choices[0].Message.Content.ContentStr; got != content || *response.Choices[0].FinishReason != "stop" {
+					t.Fatalf("native completion changed: %q", got)
+				}
+				if hit := response.ExtraFields.CacheDebug; hit == nil || hit.CacheHit != cached || sends.Load() != 1 {
+					t.Fatalf("expected cached=%v with one upstream call, got cache=%+v sends=%d", cached, hit, sends.Load())
+				}
+			}
+		})
+	}
+}
+
+func TestCacheReplayPreservesRawResponsePrecision(t *testing.T) {
+	p := identityScopeTestPlugin(t, newObservableStore(), "")
+	ctx := identityContext(t, "test", identityRef{vk: "a"})
+	req := identityTestChatRequest("native response", nil)
+	if _, hit, err := p.PreLLMHook(ctx, req); err != nil || hit != nil {
+		t.Fatal("expected miss", err)
+	}
+	response := identityTestChatResponse("ordinary text")
+	const raw = `{"number":9007199254740993,"ordinary":0.25}`
+	response.ChatResponse.ExtraFields.RawResponse = json.RawMessage(raw)
+	if _, _, err := p.PostLLMHook(ctx, response, nil); err != nil {
+		t.Fatal(err)
+	}
+	p.WaitForPendingOperations()
+	_, hit, err := p.PreLLMHook(identityContext(t, "test", identityRef{vk: "a"}), req)
+	if err != nil || hit == nil || hit.Response == nil {
+		t.Fatal("expected replay", err)
+	}
+	got, err := json.Marshal(hit.Response.ChatResponse.ExtraFields.RawResponse)
+	if err != nil || string(got) != raw {
+		t.Fatalf("native response changed: %s, err=%v", got, err)
+	}
+	if _, ok := hit.Response.ChatResponse.ExtraFields.RawResponse.(json.RawMessage); !ok {
+		t.Fatal("native JSON lost its opaque representation")
+	}
+	if got := hit.Response.ChatResponse.Choices[0].Message.Content.ContentStr; got == nil || *got != "ordinary text" {
+		t.Fatal("typed response changed")
+	}
+	// SSE raw responses are strings, not JSON objects. Preserve their type too.
+	response.ChatResponse.ExtraFields.RawResponse = "event: message\ndata: {\"n\":9007199254740993}\n\n"
+	encoded, err := marshalCachedResponse(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded schemas.BifrostResponse
+	if err := unmarshalCachedResponse(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.ChatResponse.ExtraFields.RawResponse != response.ChatResponse.ExtraFields.RawResponse {
+		t.Fatal("native SSE string changed")
+	}
+	if err := unmarshalCachedResponse(append(encoded, []byte(` {}`)...), &decoded); err == nil {
+		t.Fatal("trailing cached JSON accepted")
+	}
+}
+
+func TestCacheReplayPreservesResponsesRawResponsePrecision(t *testing.T) {
+	p := identityScopeTestPlugin(t, newObservableStore(), "")
+	req := &schemas.BifrostRequest{RequestType: schemas.ResponsesRequest, ResponsesRequest: &schemas.BifrostResponsesRequest{Provider: schemas.OpenAI, Model: "native"}}
+	ctx := identityContext(t, "test", identityRef{vk: "a"})
+	if _, hit, err := p.PreLLMHook(ctx, req); err != nil || hit != nil {
+		t.Fatal("expected miss", err)
+	}
+	const raw = `{"number":9007199254740993,"ordinary":0.25}`
+	response := &schemas.BifrostResponse{ResponsesResponse: &schemas.BifrostResponsesResponse{ID: schemas.Ptr("native"), Model: "native", ExtraFields: schemas.BifrostResponseExtraFields{Provider: schemas.OpenAI, RequestType: schemas.ResponsesRequest, OriginalModelRequested: "native", ResolvedModelUsed: "native", RawResponse: json.RawMessage(raw)}}}
+	if _, _, err := p.PostLLMHook(ctx, response, nil); err != nil {
+		t.Fatal(err)
+	}
+	p.WaitForPendingOperations()
+	_, hit, err := p.PreLLMHook(identityContext(t, "test", identityRef{vk: "a"}), req)
+	if err != nil || hit == nil || hit.Response == nil {
+		t.Fatal("expected replay", err)
+	}
+	got, err := json.Marshal(hit.Response.ResponsesResponse.ExtraFields.RawResponse)
+	if err != nil || string(got) != raw {
+		t.Fatalf("native Responses response changed: %s, err=%v", got, err)
+	}
+	if _, ok := hit.Response.ResponsesResponse.ExtraFields.RawResponse.(json.RawMessage); !ok {
+		t.Fatal("native Responses JSON lost its opaque representation")
 	}
 }

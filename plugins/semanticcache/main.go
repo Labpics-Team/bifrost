@@ -497,14 +497,8 @@ func (*Plugin) HTTPTransportPreAuthHook(_ *schemas.BifrostContext, _ *schemas.HT
 	return nil, nil
 }
 
-// HTTPTransportPreHook records the immutable route without retaining the pooled
-// request. Later HTTP hooks may still change its protocol headers and query.
+// HTTPTransportPreHook is not used by the semantic cache plugin.
 func (plugin *Plugin) HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
-	if req == nil {
-		ctx.ClearValue(httpCacheRouteKey)
-		return nil, nil
-	}
-	ctx.SetValue(httpCacheRouteKey, cacheHTTPRoute{method: req.Method, path: req.Path})
 	return nil, nil
 }
 
@@ -561,7 +555,6 @@ func (plugin *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.Bifro
 
 	// Create state up front so a reused/retried request ID never inherits stale fields.
 	state := plugin.createCacheState(requestID)
-	state.UseRawRequestBody, _ = ctx.Value(schemas.BifrostContextKeyUseRawRequestBody).(bool)
 
 	if plugin.isConversationHistoryThresholdExceeded(state, req) {
 		plugin.clearCacheState(requestID)
@@ -588,8 +581,7 @@ func (plugin *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.Bifro
 		plugin.config.EmbeddingModel != "" &&
 		plugin.config.Dimension > 1 &&
 		req.EmbeddingRequest == nil &&
-		req.TranscriptionRequest == nil &&
-		!state.UseRawRequestBody
+		req.TranscriptionRequest == nil
 	if !performDirectSearch && (!performSemanticSearch || !canDoSemanticSearch) {
 		plugin.clearCacheState(requestID)
 		msg := "skipping cache: no search path available for this request (cache_type narrowed to a path that the current plugin configuration cannot serve)"
@@ -607,9 +599,6 @@ func (plugin *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.Bifro
 		plugin.clearCacheState(requestID)
 		plugin.logger.Debug("metadata build failed, caching disabled for this request: %v", err)
 		return req, nil, nil
-	}
-	if identity := cacheHTTPIdentity(ctx); identity != nil {
-		metadata["http"] = identity
 	}
 	paramsHash, err := hashMap(metadata)
 	if err != nil {

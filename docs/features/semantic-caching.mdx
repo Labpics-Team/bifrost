@@ -17,8 +17,8 @@ for 1h). They are independent and can both be on.
 
 Bifrost can cache LLM responses and replay them for repeated requests, avoiding a round-trip to the provider. It offers two complementary lookup paths:
 
-- **Direct (hash) matching** — deterministic replay for matching request input and parameters. Text keeps its case and whitespace, and arrays keep their order. No embeddings required.
-- **Semantic (similarity) matching** — approximate, embedding-based lookup that serves a cached answer when a *new* request is close enough to a previous one, even if the wording differs. Enable it only when that approximation is acceptable.
+- **Direct (hash) matching** — deterministic, exact-match replay. The request is normalized and hashed; an identical request is served instantly. No embeddings required.
+- **Semantic (similarity) matching** — embedding-based lookup that serves a cached answer when a *new* request is close enough to a previous one, even if the wording differs.
 
 Both paths can run together (direct first, semantic on miss), or you can run direct-only with no embedding provider at all.
 
@@ -356,30 +356,24 @@ bifrostConfig := schemas.BifrostConfig{
 
 | | Direct only | Direct + Semantic |
 |---|---|---|
-| **Matches** | Exact input and parameters | Exact **and** approximately similar input, with matching parameters |
+| **Matches** | Exact (normalized) request | Exact **and** semantically similar |
 | **Embedding provider** | Not needed | Required |
 | **Cost per miss** | Zero embedding cost | One embedding call per miss |
 | **Added latency** | One vector store round-trip per request | Store round-trip, plus an embedding call + similarity search on every direct miss |
-| **Best for** | Repeated requests, including code and case-sensitive text | Paraphrased queries where approximate answer reuse is acceptable |
+| **Best for** | Repeated prompts after normalization | Paraphrased / varied user queries |
 | **`dimension`** | `1` | The model's real vector size (`> 1`) |
 
-### Exact input and approximate matching
+### Normalization and parameter matching
 
-Direct mode preserves text exactly when computing identity: `US`, `us`, and ` US ` are different inputs. For example, questions about Python's `print('US'.isupper())` and `print('us'.isupper())` require different answers. Lowercasing those questions would make a direct cache return one question's answer for the other.
+Direct matching follows the upstream cache contract: text is lowercased and leading and trailing whitespace is trimmed before hashing. `Hello`, `hello`, and ` hello ` therefore share a direct entry when the other cache dimensions match. Internal whitespace is preserved. The upstream [normalization change](https://github.com/maximhq/bifrost/commit/ef07c60e3666523c468fb6ec9e40bf876bcbcb14) states its purpose as “for better cache hit rates”. Direct-only mode keeps this normalization; it does not select byte-for-byte text comparison.
 
-Identity also includes the complete typed parameters, request family, stream flag, attachments, native HTTP protocol options, and the configured identity, provider, and model scopes. Options such as `exclude_system_prompt` and disabling provider or model scoping deliberately broaden which requests may share an entry. Direct matching therefore means exact input within those configured boundaries, not byte-for-byte equality of the HTTP JSON serialization.
+Parameters use the native per-request metadata extractors and deterministic hashing. Fields treated as sets, including tools, stop sequences, modalities and include flags, are sorted before hashing. [PR #3210](https://github.com/maximhq/bifrost/pull/3210) introduced this handling so order changes, including MCP map iteration, do not cause avoidable misses. This is a response-cache matching rule; it does not reorder the request sent to the provider or change [provider prompt caching](/features/prompt-caching).
 
-Parameter arrays, including tool definitions, retain their order in both lookup paths. A differently ordered tool list gets a different parameter identity, even if an application considers the tools interchangeable. Native MCP discovery already sorts [tool names](https://github.com/maximhq/bifrost/blob/7cb75fb2f8276ca48d0792c857fecb67b8879e2f/core/mcp/utils.go#L249-L254) and [client names](https://github.com/maximhq/bifrost/blob/7cb75fb2f8276ca48d0792c857fecb67b8879e2f/core/mcp/toolmanager.go#L301-L306) before inference; caller-supplied tool lists retain the caller's order. Keeping that order stable also supports [provider prompt caching](https://developers.openai.com/api/docs/guides/prompt-caching). This is a conservative replay boundary, not a claim that every permutation produces a different answer.
-
-<Warning>
-Semantic matching normalizes text for embeddings and then compares vector similarity. It can replay an answer for a different request. Case changes can produce the same normalized embedding text, so even `threshold: 1` does not make this path exact. Use direct-only mode, or send `x-bf-cache-type: direct`, for code, exact quotations, case-sensitive identifiers, or any task where a small text change can change the correct answer.
-</Warning>
-
-Embeddings, transcription, and native raw-body passthrough requests use direct replay only. Their inputs do not participate in semantic similarity matching.
+The fork adds no separate HTTP-header, query or raw-body identity to this contract. Response decoding is a separate concern: cached opaque `raw_response` JSON preserves its numbers, including integers larger than `2^53`, when replayed.
 
 ### Direct-only setup
 
-Direct mode hashes each request deterministically from its exact input and identity fields. Repeated requests within the same scope hit the same entry across retries, streaming, and restarts.
+Direct mode hashes each request deterministically from its normalized input, native parameter metadata, and stream flag. Requests with the same normalized cache identity share an entry. The deterministic cache ID keeps repeated lookups consistent across retries, streaming, and restarts.
 
 To enable direct-only mode, set `dimension: 1` and **omit** `provider` and `embedding_model`. In the UI, pick the **Direct only** tab.
 
@@ -446,13 +440,6 @@ bifrost:
 </Tabs>
 
 In direct-only mode, omit `x-bf-cache-type` or set it to `direct`. No embeddings are generated and no embedding credentials are needed. Explicitly selecting `semantic` when no semantic path is configured skips caching for that request.
-
-To require exact matching for one request on a deployment configured for both paths, use the native cache headers:
-
-```bash
-curl -H "x-bf-cache-key: code-review-session" \
-     -H "x-bf-cache-type: direct" ...
-```
 
 ### Vector stores in direct-only mode
 

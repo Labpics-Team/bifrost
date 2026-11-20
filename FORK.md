@@ -31,13 +31,12 @@ Infra продолжает собирать закреплённый upstream с
 | Отдельный запуск локальных тестов | `-short` и перечисление тестов semantic cache не подключаются к внешним backend и не удаляют их namespace | [TestMain](plugins/semanticcache/main_test.go), [test helpers](plugins/semanticcache/test_utils_test.go) |
 | Отмена | `Done`, `Err` и причина отмены согласованы; обычный дочерний context сохраняет собственный срок | [BifrostContext](core/schemas/context.go) |
 | Доступность кэша | Недоступный кэш отключается до фонового восстановления; ограничение чтения store не сокращает срок embedding или самого запроса | [Qdrant](framework/vectorstore/qdrant.go), [semanticcache](plugins/semanticcache/main.go), [readiness](transports/bifrost-http/handlers/health.go) |
-| Идентичность replay | Direct сохраняет точный ввод и порядок параметров; semantic допускает приблизительное сходство ввода при тех же параметрах; opaque JSON сохраняет числовую точность; raw passthrough получает только direct replay | [cache identity](plugins/semanticcache/cacheidentity.go), [hashing](plugins/semanticcache/utils.go) |
+| Декодирование replay | Сохранённый raw response воспроизводится без округления JSON-чисел; правила сопоставления запросов остаются штатными | [cached response decoding](plugins/semanticcache/utils.go) |
 | Повтор транспорта | Fasthttp не повторяет уже записанный неидемпотентный запрос скрыто внутри одной попытки; решение о следующей попытке остаётся в штатном retry/fallback loop | [transport](core/providers/utils/roundtripper.go), [retry loop](core/bifrost.go) |
 | Каталог Routing Rules | `/v1/routing/models` читает доступные caller публичные имена из живых правил без второго каталога и запросов к провайдерам | [routing](plugins/routing/models.go), [HTTP admission](transports/bifrost-http/server/routingmodels.go) |
 
-Причины проверяются по поведению. Например, upstream сознательно нормализует ввод
-direct-кэша ради частоты попаданий в [utils.go](https://github.com/maximhq/bifrost/blob/7cb75fb2f8276ca48d0792c857fecb67b8879e2f/plugins/semanticcache/utils.go),
-разрешает повтор после записи на reused connection в
+Причины проверяются по поведению. Например, upstream разрешает повтор после
+записи на reused connection в
 [roundtripper.go](https://github.com/maximhq/bifrost/blob/7cb75fb2f8276ca48d0792c857fecb67b8879e2f/core/providers/utils/roundtripper.go)
 после потери ответа.
 Ограничение скрытого транспортного повтора отделено от настроенной политики
@@ -69,22 +68,19 @@ parser и ограничение 1 секунда — 5 минут. Loop ждё�
 Исправление `Retry-After` для собственного governance-лимита остаётся: его значение
 рассчитывается по фактическому окну ограничивающего счётчика.
 
-Direct replay различает регистр и пробелы: вопросы о `print('US'.isupper())`
-и `print('us'.isupper())` требуют разных ответов. Локальная регрессия
-`TestDirectCacheKeepsCaseSensitiveCodeDistinct` воспроизводит ошибочный `True`
-вместо `False` на закреплённом upstream и проходит с точной идентичностью.
-Прежние тесты нормализации описывали намеренное поведение upstream;
-в форке это сознательное изменение границы replay. Semantic остаётся
-приблизительным и нормализует текст для embeddings. Для кода, цитат и других
-чувствительных к регистру задач нужен direct-only либо `x-bf-cache-type: direct`;
-`threshold: 1` не превращает semantic в точное сравнение. Цена точного matching —
-меньше попаданий для вариантов текста и перестановок параметров.
-Настройки и границы описаны в [semantic caching](docs/features/semantic-caching.mdx).
-
-Протокольные HTTP-заголовки и query входят в identity после применения всех
-HTTP pre-hooks: custom plugin, расположенный после cache, может законно менять
-эти параметры. Источник — штатные снимки итогового входящего запроса; это не
-обещание снимка окончательных outbound headers провайдера.
+Сопоставление кэша сохранено как у авторов upstream. Direct сравнивает хеши
+нормализованного ввода и штатно извлечённых параметров. Текст приводится к нижнему
+регистру, пробельные символы по краям удаляются; внутренние пробелы не схлопываются.
+Авторская цель нормализации — «for better cache hit rates», как указано в
+[commit ef07c60e](https://github.com/maximhq/bifrost/commit/ef07c60e3666523c468fb6ec9e40bf876bcbcb14).
+В [PR #3210](https://github.com/maximhq/bifrost/pull/3210) поля, трактуемые как
+множества, включая tools, stop sequences, modalities и include, сортируются для
+устойчивого хеширования; перестановка таких элементов не должна создавать miss.
+Извлечение параметров, hashing и правила поиска соответствуют закреплённой базе.
+Direct-only отключает поиск по сходству embeddings, но сохраняет эту нормализацию.
+Дополнительная HTTP identity, raw-body hash и особое ограничение raw passthrough
+на direct replay удалены. Provider prompt caching остаётся независимым механизмом
+и не изменён. Настройки описаны в [semantic caching](docs/features/semantic-caching.mdx).
 
 Просроченное попадание будит существующий последовательный worker условной
 уборки. Между штатными минутными проходами допускается одна дополнительная

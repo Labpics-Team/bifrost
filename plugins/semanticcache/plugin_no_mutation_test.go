@@ -19,8 +19,9 @@ import (
 // landed in the request that originated from cache-side normalization
 // (lowercase, whitespace-trim, system-prompt filtering, etc.).
 //
-// This complements the in-process unit tests of semantic embedding text and
-// system-prompt filtering: the provider must still receive the original request.
+// This complements the in-process unit tests because those exercise the
+// helpers that DO normalize (getNormalizedInputForCaching) — what we want
+// here is a contract test on the request that flows downstream.
 type requestCapturer struct {
 	mu       sync.Mutex
 	captured *schemas.BifrostRequest

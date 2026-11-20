@@ -216,14 +216,14 @@ func (plugin *Plugin) generateEmbedding(ctx *schemas.BifrostContext, text string
 	return nil, 0, fmt.Errorf("embedding data is not in expected format")
 }
 
-// generateRequestHash hashes the exact typed input and complete parameters.
+// generateRequestHash creates an xxhash of the (normalized input, params).
 // Fallbacks are excluded since they only affect error handling.
 func (plugin *Plugin) generateRequestHash(req *schemas.BifrostRequest, params map[string]interface{}) (string, error) {
 	hashInput := map[string]interface{}{
-		"input":  plugin.getInputForCaching(nil, req),
+		"input":  plugin.getNormalizedInputForCaching(req),
 		"params": params,
 	}
-	jsonData, err := json.Marshal(hashInput)
+	jsonData, err := schemas.MarshalDeeplySorted(hashInput)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal request for hashing: %w", err)
 	}

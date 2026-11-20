@@ -228,9 +228,9 @@ func TestPreLLMHookSkipsUnsupportedCountTokensRequest(t *testing.T) {
 	}
 }
 
-// TestGetInputForCaching_NilContent verifies that getInputForCaching
+// TestGetNormalizedInputForCaching_NilContent verifies that getNormalizedInputForCaching
 // does not panic when chat messages have nil Content.
-func TestGetInputForCaching_NilContent(t *testing.T) {
+func TestGetNormalizedInputForCaching_NilContent(t *testing.T) {
 	plugin := &Plugin{
 		config: &Config{},
 	}
@@ -273,16 +273,16 @@ func TestGetInputForCaching_NilContent(t *testing.T) {
 
 	// Must not panic, and must return a non-nil filtered messages slice
 	// of the right element type (we built a ChatCompletionRequest).
-	result := plugin.getInputForCaching(nil, request)
+	result := plugin.getNormalizedInputForCaching(request)
 	if result == nil {
-		t.Fatal("getInputForCaching returned nil for a valid Chat request")
+		t.Fatal("getNormalizedInputForCaching returned nil for a valid Chat request")
 	}
 	msgs, ok := result.([]schemas.ChatMessage)
 	if !ok {
 		t.Fatalf("expected []schemas.ChatMessage, got %T", result)
 	}
 	if len(msgs) != len(request.ChatRequest.Input) {
-		t.Fatalf("filtered message count %d differs from input %d (filtering changed unexpectedly)", len(msgs), len(request.ChatRequest.Input))
+		t.Fatalf("normalized message count %d differs from input %d (filtering changed unexpectedly)", len(msgs), len(request.ChatRequest.Input))
 	}
 }
 

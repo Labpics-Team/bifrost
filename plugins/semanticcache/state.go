@@ -18,7 +18,6 @@ import (
 // (PostLLMHook's storage goroutine) snapshots the values it needs into locals
 // before launching.
 type cacheState struct {
-	UseRawRequestBody     bool
 	DirectCacheID         string
 	ParamsHash            string
 	Embeddings            []float32

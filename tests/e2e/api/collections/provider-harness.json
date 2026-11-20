@@ -313742,7 +313742,7 @@
     },
     {
       "name": "328. [SERIAL] Labpics gateway contracts (labpics-gateway-contracts) (Labpics PR #2)",
-      "description": "Source-fork wire contracts. Uses the normal OpenAI harness profile and its vector store. The readiness and routing-catalog cases make no inference calls. Catalog rules and virtual keys are run-scoped and removed. The cache case creates a direct-only semantic_cache plugin only when none exists, never overwrites an existing configuration, and deletes only the plugin whose namespace proves it was created by this run; it clears its cache partition. The cache case uses the native /anthropic/v1/messages ingress with openai/gpt-4o-mini and an unchanged anthropic-version. It first proves an identical request hits, then changes only the anthropic-beta option and requires a miss, removes the option and requires the original hit, and finally checks case and literal whitespace misses. This pins ingress/cache partitioning, not beta forwarding or beta behavior at OpenAI. Cache writes are asynchronous, so exact replay is bounded to five attempts (at most nine small origin completions for this case). The governance case uses one small completion, waits for accounted usage without generating more inference requests, then checks two 429 refusals and metadata access. [SERIAL] keeps plugin lifecycle changes separate from the parallel sweep. Optional cache outages and required-store failures are pinned by the native Go readiness tests; this collection does not stop backing services. No unknown-outcome replay policy is asserted.",
+      "description": "Fork wire contracts and native cache-matching controls. Uses the normal OpenAI harness profile and its vector store. The readiness and routing-catalog cases make no inference calls. Catalog rules and virtual keys are run-scoped and removed. The cache case creates a direct-only semantic_cache plugin only when none exists, never overwrites an existing configuration, and deletes only the plugin whose namespace proves it was created by this run; it clears its cache partition. The cache case uses the native /anthropic/v1/messages ingress with openai/gpt-4o-mini and an unchanged anthropic-version. It first proves an identical request hits, then requires case and outer-whitespace variants of the same benign prompt to hit the original direct entry. This preserves upstream normalization; the case makes no HTTP-header, query or raw-body partitioning assertion. Cache writes are asynchronous, so initial exact replay is bounded to five attempts; the two normalization controls each run once. The governance case uses one small completion, waits for accounted usage without generating more inference requests, then checks two 429 refusals and metadata access. [SERIAL] keeps plugin lifecycle changes separate from the parallel sweep. Optional cache outages and required-store failures are pinned by the native Go readiness tests; this collection does not stop backing services. No unknown-outcome replay policy is asserted.",
       "item": [
         {
           "name": "328.1 [NO-CONTENT] openai harness /readyz checks required stores without credentials - labpics-gateway-contracts (Labpics PR #2)",
@@ -313947,7 +313947,7 @@
           }
         },
         {
-          "name": "328.3 openai/gpt-4o-mini /anthropic/v1/messages direct cache partitions protocol, case and literal whitespace - labpics-gateway-contracts (Labpics PR #2)",
+          "name": "328.3 openai/gpt-4o-mini /anthropic/v1/messages native direct cache reuses case and outer-whitespace variants - labpics-gateway-contracts (Labpics PR #2)",
           "event": [
             {
               "listen": "prerequest",
@@ -314067,10 +314067,8 @@
                   "    });",
                   "  });",
                   "}",
-                  "function send(body, cb, protocolHeaders) {",
-                  "  var headers = { 'x-bf-cache-key': state.key, 'x-bf-cache-type': 'direct', 'x-bf-cache-no-store': 'true', 'anthropic-version': '2023-06-01' };",
-                  "  for (var name in (protocolHeaders || {})) { headers[name] = protocolHeaders[name]; }",
-                  "  call('POST', '/anthropic/v1/messages', body, 200, cb, headers);",
+                  "function send(body, cb) {",
+                  "  call('POST', '/anthropic/v1/messages', body, 200, cb, { 'x-bf-cache-key': state.key, 'x-bf-cache-type': 'direct', 'x-bf-cache-no-store': 'true', 'anthropic-version': '2023-06-01' });",
                   "}",
                   "var original = null;",
                   "try { original = pm.response.json(); } catch (e) { pm.test('native response is JSON', function () { pm.expect.fail(pm.response.text()); }); }",
@@ -314091,33 +314089,21 @@
                   "    }",
                   "  });",
                   "}",
+                  "// Native direct matching lowercases text and trims its edges before hashing.",
+                  "// These benign prompt variants retain the same intent and reuse the seeded entry.",
                   "function textVariants() {",
                   "  var lower = JSON.parse(JSON.stringify(seed));",
-                  "  lower.messages[0].content = lower.messages[0].content.replace(\"'US'\", \"'us'\");",
+                  "  lower.messages[0].content = lower.messages[0].content.toLowerCase();",
                   "  send(lower, function (caseOK, caseBody, caseResponse) {",
                   "    if (!caseOK) { return cleanup(); }",
-                  "    outcome('case-sensitive code never replays the uppercase request', caseResponse, caseBody, false);",
+                  "    outcome('native case normalization reuses the original direct response', caseResponse, caseBody, true);",
                   "    var spaces = JSON.parse(JSON.stringify(seed));",
-                  "    spaces.messages[0].content = spaces.messages[0].content.replace(\"'a  b'\", \"'a b'\");",
+                  "    spaces.messages[0].content = '  ' + spaces.messages[0].content + '  ';",
                   "    send(spaces, function (spacesOK, spacesBody, spacesResponse) {",
-                  "      if (spacesOK) { outcome('whitespace inside a code string is part of direct-cache identity', spacesResponse, spacesBody, false); }",
+                  "      if (spacesOK) { outcome('native outer-whitespace normalization reuses the original direct response', spacesResponse, spacesBody, true); }",
                   "      cleanup();",
                   "    });",
                   "  });",
-                  "}",
-                  "// This is the client's Anthropic-shaped protocol, served by the configured OpenAI model.",
-                  "// We assert ingress/cache partitioning, not that OpenAI receives or implements this beta.",
-                  "function protocolVariant() {",
-                  "  send(seed, function (betaOK, betaBody, betaResponse) {",
-                  "    if (!betaOK) { return cleanup(); }",
-                  "    outcome('changing only the native beta option misses the warmed baseline partition', betaResponse, betaBody, false);",
-                  "    send(seed, function (baselineOK, baselineBody, baselineResponse) {",
-                  "      if (!baselineOK) { return cleanup(); }",
-                  "      outcome('removing the beta returns to the original cached native response', baselineResponse, baselineBody, true);",
-                  "      if (baselineResponse.headers.get('x-bifrost-cache-hit') !== 'true') { return cleanup(); }",
-                  "      textVariants();",
-                  "    });",
-                  "  }, { 'anthropic-beta': 'fine-grained-tool-streaming-2025-05-14' });",
                   "}",
                   "if (pm.response.code !== 200 || !original || !Array.isArray(original.content) || pm.response.headers.get('x-bifrost-cache-hit') !== 'false') { cleanup(); } else {",
                   "  var attempts = 0;",
@@ -314127,7 +314113,7 @@
                   "      if (response.headers.get('x-bifrost-cache-hit') !== 'true' && ++attempts < 5) { return setTimeout(replay, 250); }",
                   "      outcome('an identical native request hits the stored direct response', response, body, true);",
                   "      if (response.headers.get('x-bifrost-cache-hit') !== 'true') { return cleanup(); }",
-                  "      protocolVariant();",
+                  "      textVariants();",
                   "    });",
                   "  }",
                   "  setTimeout(replay, 250);",
@@ -314159,7 +314145,7 @@
             "url": "{{baseUrl}}/anthropic/v1/messages",
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"model\": \"openai/gpt-4o-mini\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Evaluate Python: ('US'.isupper(), len('a  b')). Reply with the tuple only.\"\n    }\n  ],\n  \"max_tokens\": 16,\n  \"temperature\": 0\n}"
+              "raw": "{\n  \"model\": \"openai/gpt-4o-mini\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"What is two plus two? Reply with one digit.\"\n    }\n  ],\n  \"max_tokens\": 16,\n  \"temperature\": 0\n}"
             }
           }
         },

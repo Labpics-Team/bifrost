@@ -36,14 +36,9 @@
       "TestCacheRetentionQdrantUsesSingleFilteredDeleteRPC"
     ],
     "github.com/maximhq/bifrost/plugins/semanticcache": [
-      "TestCacheIdentityExactInput",
-      "TestDirectCacheKeepsCaseSensitiveCodeDistinct",
-      "TestCacheIdentityFullParameters",
-      "TestCacheIdentityHTTPContext",
-      "TestCacheIdentityRawReplay",
-      "TestCacheIdentityRawResponsePrecision",
-      "TestCacheIdentityResponsesRawResponsePrecision",
-      "TestCacheIdentitySemanticGrouping",
+      "TestDirectCacheKeepsNativeMatching",
+      "TestCacheReplayPreservesRawResponsePrecision",
+      "TestCacheReplayPreservesResponsesRawResponsePrecision",
       "TestCacheRetentionStartupAndPeriodicSweep",
       "TestCacheRetentionDeadlineAndShutdown",
       "TestCacheRetentionNoOverlap",
@@ -70,8 +65,7 @@
       "TestRecoverStreamProducerReportsPanic"
     ],
     "github.com/maximhq/bifrost/transports/v2/bifrost-http/handlers": [
-      "TestCacheIdentityNativeBetaHeaders",
-      "TestCacheIdentityUsesFinalHTTPProtocolOptions",
+      "TestNativeBetaHeaders",
       "TestTracingMiddleware_StreamingRootSpanEndsAfterLLMSpan",
       "TestTracingMiddleware_RootSpanCarriesStableHTTPSemconv",
       "TestStreamingResponseSkipsDoneAfterErrorChunk",
