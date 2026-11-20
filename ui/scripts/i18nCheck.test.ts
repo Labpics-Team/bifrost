@@ -18,7 +18,10 @@ function run(...flags: string[]) {
 	let stdout: string;
 	let status = 0;
 	try {
-		stdout = execFileSync("node", [SCRIPT, "--json", ...flags], { env: { ...process.env, I18N_CHECK_ROOT: root }, encoding: "utf8" });
+		stdout = execFileSync("node", [SCRIPT, "--json", ...flags], {
+			env: { ...process.env, I18N_CHECK_ROOT: root },
+			encoding: "utf8",
+		});
 	} catch (error) {
 		const failure = error as { stdout: string; status: number };
 		stdout = failure.stdout;
@@ -56,6 +59,9 @@ beforeAll(() => {
 		}
 	`,
 	);
+	write("app/pprof/page.tsx", "export const Page = () => <p>Developer profiler</p>;");
+	write("components/devProfiler.tsx", "export const Profiler = () => <p>Developer profiler</p>;");
+	write("lib/i18n/index.ts", 'export const locales = [{ label: "Language name" }];');
 	write(
 		"app/trans.tsx",
 		`
@@ -122,6 +128,18 @@ describe("literal scan", () => {
 
 	it("honours i18n-ignore", () => {
 		expect(found(result(), "app/ignored.tsx")).toEqual([]);
+	});
+
+	it("excludes developer tooling and locale registration on every platform", () => {
+		const scan = result();
+		expect(Object.keys(scan.literals)).not.toContain("app/pprof/page.tsx");
+		expect(Object.keys(scan.literals)).not.toContain("components/devProfiler.tsx");
+		expect(Object.keys(scan.literals)).not.toContain("lib/i18n/index.ts");
+		expect(
+			Object.values(scan.literals)
+				.flat()
+				.some((finding: any) => finding.text === "Developer profiler"),
+		).toBe(false);
 	});
 });
 
