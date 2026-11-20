@@ -56,6 +56,10 @@ func (m *mockModelsManager) ListRoutingModels(_ *schemas.BifrostContext, _ *sche
 	return &schemas.BifrostListModelsResponse{Data: []schemas.Model{}}, nil
 }
 
+func (m *mockModelsManager) ListAllModels(_ *schemas.BifrostContext, _ *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{Data: []schemas.Model{}}, nil
+}
+
 // NarrowListModelsProviders stands in for the server, which is what resolves access and narrows
 // the fan-out in production. Kept observable so a caller can assert it was asked; the rule itself
 // is the server's, and is exercised there and against a live deployment.

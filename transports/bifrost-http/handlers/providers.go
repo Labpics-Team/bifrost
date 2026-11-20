@@ -69,7 +69,7 @@ type ModelsManager interface {
 	ResolveAccess(ctx *schemas.BifrostContext) (schemas.Access, error)
 	// The models listing narrows its provider fan-out to what the request may reach, by the same
 	// rule the integration routes use.
-	NarrowListModelsProviders(bifrostCtx *schemas.BifrostContext)
+	AccessResolver
 	ListRoutingModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError)
 }
 

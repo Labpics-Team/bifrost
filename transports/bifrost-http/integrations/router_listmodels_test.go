@@ -36,6 +36,10 @@ func (s *stubAccessResolver) NarrowListModelsProviders(bifrostCtx *schemas.Bifro
 	bifrostCtx.SetValue(schemas.BifrostContextKeyAvailableProviders, s.providers)
 }
 
+func (s *stubAccessResolver) ListAllModels(_ *schemas.BifrostContext, _ *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	return &schemas.BifrostListModelsResponse{Data: []schemas.Model{}}, nil
+}
+
 func listModelsCtx() *schemas.BifrostContext {
 	return schemas.NewBifrostContext(context.Background(), time.Time{})
 }
