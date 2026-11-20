@@ -1646,13 +1646,16 @@ func loadClientConfig(ctx context.Context, config *Config, configData *ConfigDat
 			return fmt.Errorf("failed to get auth config from store: %w", err)
 		}
 		firstAdmin = existingAuth == nil
-		if firstAdmin && (fileAuth.AdminUserName == nil || fileAuth.AdminUserName.GetValue() == "" ||
+		if err := fileAuth.OIDC.Validate(); err != nil {
+			return err
+		}
+		if firstAdmin && !fileAuth.OIDCEnabled() && (fileAuth.AdminUserName == nil || fileAuth.AdminUserName.GetValue() == "" ||
 			fileAuth.AdminPassword == nil || fileAuth.AdminPassword.GetValue() == "") {
 			return fmt.Errorf("auth username and password must be provided for initial admin setup")
 		}
 		// Check hashability before saving client settings. loadAuthConfig accepts
 		// this prepared hash, so initial setup does not hash the password twice.
-		if firstAdmin && !isBcryptHash(fileAuth.AdminPassword.GetValue()) {
+		if firstAdmin && fileAuth.HasPassword() && !isBcryptHash(fileAuth.AdminPassword.GetValue()) {
 			hashed, hashErr := encrypt.Hash(fileAuth.AdminPassword.GetValue())
 			if hashErr != nil {
 				return fmt.Errorf("invalid initial admin password: %w", hashErr)
@@ -6476,15 +6479,24 @@ func loadAuthConfig(ctx context.Context, config *Config, configData *ConfigData)
 	if authConfig.AdminPassword != nil && authConfig.AdminPassword.GetValue() == "" && authConfig.AdminPassword.IsFromSecret() {
 		logger.Warn("password set with external reference but value is empty: %s", authConfig.AdminPassword.GetRawRef())
 	}
-	if authConfig.AdminPassword == nil || authConfig.AdminUserName == nil {
+	if err := authConfig.OIDC.Validate(); err != nil {
+		return err
+	}
+	if !authConfig.OIDCEnabled() && (authConfig.AdminPassword == nil || authConfig.AdminUserName == nil) {
 		logger.Warn("auth config is missing admin_username or admin_password, skipping auth config processing")
 		return nil
+	}
+	if authConfig.AdminUserName == nil {
+		authConfig.AdminUserName = &schemas.SecretVar{}
+	}
+	if authConfig.AdminPassword == nil {
+		authConfig.AdminPassword = &schemas.SecretVar{}
 	}
 	filePassword := authConfig.AdminPassword.GetValue()
 	// If DB already matches file config, skip hashing and DB write
 	if dbAuthConfig != nil {
 		usernameMatch := dbAuthConfig.AdminUserName.GetValue() == authConfig.AdminUserName.GetValue()
-		boolsMatch := dbAuthConfig.IsEnabled == authConfig.IsEnabled
+		boolsMatch := dbAuthConfig.IsEnabled == authConfig.IsEnabled && dbAuthConfig.OIDC.Equals(authConfig.OIDC)
 		var passwordMatch bool
 		if filePassword == "" {
 			passwordMatch = dbAuthConfig.AdminPassword.GetValue() == ""
@@ -6499,10 +6511,11 @@ func loadAuthConfig(ctx context.Context, config *Config, configData *ConfigData)
 				AdminUserName: authConfig.AdminUserName,
 				AdminPassword: preserveSecretVar(authConfig.AdminPassword, dbAuthConfig.AdminPassword.GetValue()),
 				IsEnabled:     authConfig.IsEnabled,
+				OIDC:          authConfig.OIDC.Clone(),
 			}
 			return nil
 		}
-		if !passwordMatch {
+		if !passwordMatch || !usernameMatch || !boolsMatch {
 			// Here we nuke all sessions
 			if err := config.ConfigStore.FlushSessions(ctx); err != nil {
 				return fmt.Errorf("failed to flush sessions: %w", err)
@@ -6523,6 +6536,7 @@ func loadAuthConfig(ctx context.Context, config *Config, configData *ConfigData)
 		AdminUserName: authConfig.AdminUserName,
 		AdminPassword: preserveSecretVar(authConfig.AdminPassword, hashedPassword),
 		IsEnabled:     authConfig.IsEnabled,
+		OIDC:          authConfig.OIDC.Clone(),
 	}
 	// Persist to config store
 	if err := config.ConfigStore.UpdateAuthConfig(ctx, config.GovernanceConfig.AuthConfig); err != nil {

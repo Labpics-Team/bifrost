@@ -789,11 +789,22 @@ export const LIVE_MODELS_SYNC_DISABLED = 0;
 /** Server-side floor for a non-zero live models sync interval, in seconds. */
 export const MIN_LIVE_MODELS_SYNC_INTERVAL = 60;
 
+export interface OIDCConfig {
+	enabled: boolean;
+	issuer_url: string;
+	client_id: string;
+	client_secret?: SecretVar;
+	redirect_url: string;
+	allowed_subjects?: string[];
+	allowed_emails?: string[];
+}
+
 // Auth config
 export interface AuthConfig {
 	admin_username: SecretVar;
 	admin_password: SecretVar;
 	is_enabled: boolean;
+	oidc?: OIDCConfig | null;
 	/** Write-only: the operator-configured setup token (setup_token in config.json or the
 	 *  BIFROST_SETUP_TOKEN env var). Required when this PUT request creates the very first
 	 *  admin account, and also accepted instead of current_password to confirm a change made

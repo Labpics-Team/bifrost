@@ -1756,8 +1756,11 @@ func (s *BifrostHTTPServer) UpdateAuthConfig(ctx context.Context, authConfig *co
 		return fmt.Errorf("config store not found")
 	}
 	// Allow disabling auth without credentials, but require them when enabling
-	if authConfig.IsEnabled && (authConfig.AdminUserName == nil || authConfig.AdminUserName.GetValue() == "" || authConfig.AdminPassword == nil || authConfig.AdminPassword.GetValue() == "") {
-		return fmt.Errorf("username and password are required when auth is enabled")
+	if authConfig.IsEnabled && !authConfig.OIDCEnabled() && !authConfig.HasPassword() {
+		return fmt.Errorf("password credentials or OIDC are required when auth is enabled")
+	}
+	if err := authConfig.OIDC.Validate(); err != nil {
+		return err
 	}
 	// Update the config store
 	if err := s.Config.ConfigStore.UpdateAuthConfig(ctx, authConfig); err != nil {

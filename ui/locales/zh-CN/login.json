@@ -1,4 +1,6 @@
 {
+	"oidcSignIn": "使用 OpenID Connect 登录",
+	"oidcError": "登录失败或未获授权。请重试或联系管理员。",
 	"title": "登录",
 	"subtitle": "登录 Bifrost",
 	"welcomeBack": "欢迎回来",

@@ -169,6 +169,23 @@
 		}
 	},
 	"security": {
+		"oidc": {
+			"localPassword": "Mot de passe administrateur local (facultatif)",
+			"protectDashboard": "Protéger le tableau de bord",
+			"dashboardHelp": "Connectez-vous avec OpenID Connect ou un mot de passe administrateur local.",
+			"title": "OpenID Connect",
+			"description": "Utilisez votre fournisseur d’identité pour accéder à ce tableau de bord.",
+			"issuer": "URL de l’émetteur",
+			"clientId": "ID du client",
+			"clientSecret": "Secret du client",
+			"secretHelp": "Facultatif pour les clients publics. Une valeur vide conserve le secret enregistré.",
+			"redirect": "URL de redirection",
+			"redirectHelp": "Enregistrez cette URL exacte auprès du fournisseur. Elle doit se terminer par /api/session/oidc/callback et inclure le chemin de base éventuel.",
+			"subjects": "Identifiants subject autorisés",
+			"emails": "Adresses e-mail vérifiées autorisées",
+			"allowHelp": "Une entrée par ligne. Au moins un subject ou e-mail vérifié est requis. Les utilisateurs correspondants obtiennent un accès administrateur.",
+			"authRequired": "Configurez OpenID Connect ou indiquez un nom et un mot de passe administrateur."
+		},
 		"title": "Paramètres de sécurité",
 		"description": "Configurez les paramètres de sécurité et de contrôle d’accès.",
 		"loadingAuth": "Chargement des paramètres d’authentification",

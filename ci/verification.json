@@ -63,7 +63,8 @@
       "TestStartSSEHeartbeatCallsOnDisconnectAfterClose",
       "TestSSEStreamReaderSendDoneByteExact",
       "TestRecoverStreamProducerCancelsAndDrains",
-      "TestRecoverStreamProducerReportsPanic"
+      "TestRecoverStreamProducerReportsPanic",
+      "TestLoadOIDCOnlyConfig"
     ],
     "github.com/maximhq/bifrost/transports/v2/bifrost-http/handlers": [
       "TestNativeBetaHeaders",
@@ -76,7 +77,10 @@
       "TestStreamingResponseTeardownPanicIsRecovered",
       "TestCacheAvailabilityReadinessAndDiagnosticHealth",
       "TestCacheAvailabilityReadinessKeepsAdminAuthentication",
-      "TestNativeBetaHeadersPreserveHookKey"
+      "TestNativeBetaHeadersPreserveHookKey",
+      "TestOIDCSignIn",
+      "TestOIDCGoto",
+      "TestOIDCSettings"
     ],
     "github.com/maximhq/bifrost/transports/v2/bifrost-http/integrations": [
       "TestStreamErrorEventFramingPerRoute",
@@ -157,6 +161,11 @@
     "github.com/maximhq/bifrost/core/providers/anthropic": [
       "TestToAnthropicChatCompletionError",
       "TestToAnthropicChatCompletionErrorNeverEmitsEmptyMessage"
+    ],
+    "github.com/maximhq/bifrost/framework/configstore": [
+      "TestOIDCConfig",
+      "TestOIDCConfigStoreRoundTrip",
+      "TestOIDCConfigEncryption"
     ]
   }
 }

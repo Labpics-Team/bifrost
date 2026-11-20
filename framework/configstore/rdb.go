@@ -7641,6 +7641,14 @@ func (s *RDBConfigStore) GetAuthConfig(ctx context.Context) (*AuthConfig, error)
 	var username *string
 	var password *string
 	var isEnabled bool
+	var oidcRow tables.TableGovernanceConfig
+	if err := s.DB().WithContext(ctx).First(&oidcRow, "key = ?", tables.ConfigOIDCKey).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+	oidcConfig, err := decodeOIDCConfig(oidcRow.Value)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read oidc configuration: %w", err)
+	}
 	if err := s.DB().WithContext(ctx).First(&tables.TableGovernanceConfig{}, "key = ?", tables.ConfigAdminUsernameKey).Select("value").Scan(&username).Error; err != nil {
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return nil, err
@@ -7656,19 +7664,33 @@ func (s *RDBConfigStore) GetAuthConfig(ctx context.Context) (*AuthConfig, error)
 			return nil, err
 		}
 	}
-	if username == nil || password == nil {
+	if (username == nil || password == nil) && oidcConfig == nil {
 		return nil, nil
+	}
+	if username == nil {
+		username = new(string)
+	}
+	if password == nil {
+		password = new(string)
 	}
 	return &AuthConfig{
 		AdminUserName: schemas.NewSecretVar(*username),
 		AdminPassword: schemas.NewSecretVar(*password),
 		IsEnabled:     isEnabled,
+		OIDC:          oidcConfig,
 	}, nil
 }
 
 // UpdateAuthConfig updates the auth configuration in the database.
 func (s *RDBConfigStore) UpdateAuthConfig(ctx context.Context, config *AuthConfig) error {
+	oidcValue, err := encodeOIDCConfig(config.OIDC)
+	if err != nil {
+		return err
+	}
 	return s.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Save(&tables.TableGovernanceConfig{Key: tables.ConfigOIDCKey, Value: oidcValue}).Error; err != nil {
+			return err
+		}
 		if err := tx.Save(&tables.TableGovernanceConfig{
 			Key:   tables.ConfigAdminUsernameKey,
 			Value: config.AdminUserName.GetValue(),

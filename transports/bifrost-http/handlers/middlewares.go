@@ -1809,6 +1809,8 @@ func (m *AuthMiddleware) InferenceMiddleware() schemas.BifrostHTTPMiddleware {
 var apiSystemWhitelistedRoutes = []string{
 	"/api/session/is-auth-enabled",
 	"/api/session/login",
+	"/api/session/oidc/login",
+	"/api/session/oidc/callback",
 	// Idempotent: the handler clears the cookie and returns 200 whether or
 	// not a session token is present, so a repeat logout must not 401 here.
 	"/api/session/logout",

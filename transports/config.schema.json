@@ -7184,6 +7184,20 @@
           "type": "boolean",
           "description": "Whether authentication is enabled"
         },
+        "oidc": {
+          "type": ["object", "null"],
+          "description": "OpenID Connect sign-in for explicitly allowed dashboard administrators.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "issuer_url": { "type": "string", "format": "uri" },
+            "client_id": { "type": "string" },
+            "client_secret": { "type": "string", "description": "Client secret, or env.VARIABLE reference. Omit for a public client." },
+            "redirect_url": { "type": "string", "format": "uri", "description": "Registered callback URL including server.base_path and /api/session/oidc/callback." },
+            "allowed_subjects": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "allowed_emails": { "type": "array", "items": { "type": "string", "format": "email" }, "uniqueItems": true }
+          },
+          "additionalProperties": false
+        },
         "disable_auth_on_inference": {
           "type": "boolean",
           "deprecated": true,

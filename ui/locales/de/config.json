@@ -169,6 +169,23 @@
 		}
 	},
 	"security": {
+		"oidc": {
+			"localPassword": "Lokales Administratorpasswort (optional)",
+			"protectDashboard": "Dashboard schützen",
+			"dashboardHelp": "Anmeldung mit OpenID Connect oder einem lokalen Administratorpasswort.",
+			"title": "OpenID Connect",
+			"description": "Melden Sie sich über Ihren Identitätsanbieter am Dashboard an.",
+			"issuer": "Aussteller-URL",
+			"clientId": "Client-ID",
+			"clientSecret": "Client-Geheimnis",
+			"secretHelp": "Für öffentliche Clients optional. Ein leeres Feld behält das gespeicherte Geheimnis.",
+			"redirect": "Weiterleitungs-URL",
+			"redirectHelp": "Registrieren Sie diese genaue URL beim Anbieter. Sie muss mit /api/session/oidc/callback enden und einen vorhandenen Basispfad enthalten.",
+			"subjects": "Erlaubte Subject-IDs",
+			"emails": "Erlaubte bestätigte E-Mail-Adressen",
+			"allowHelp": "Ein Eintrag pro Zeile. Mindestens eine Subject-ID oder bestätigte E-Mail-Adresse ist erforderlich. Passende Benutzer erhalten Administratorzugriff.",
+			"authRequired": "Konfigurieren Sie OpenID Connect oder geben Sie Administratorname und Passwort an."
+		},
 		"title": "Sicherheits-Einstellungen",
 		"description": "Konfiguriere Sicherheit- und Zugriffskontroll-Einstellungen.",
 		"loadingAuth": "Lade Authentifizierungs-Einstellungen",
