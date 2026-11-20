@@ -578,6 +578,10 @@ type ConfigStore interface {
 	// Session CRUD
 	GetSession(ctx context.Context, token string) (*tables.SessionsTable, error)
 	CreateSession(ctx context.Context, session *tables.SessionsTable) error
+	// CreateSessionIfAuthMatches atomically verifies the enabled auth snapshot and
+	// inserts the session, serialized with UpdateAuthConfig and its revocation.
+	// The caller must have verified the credentials against expectedAuth.
+	CreateSessionIfAuthMatches(ctx context.Context, session *tables.SessionsTable, expectedAuth *AuthConfig) error
 	DeleteSession(ctx context.Context, token string) error
 	FlushSessions(ctx context.Context) error
 

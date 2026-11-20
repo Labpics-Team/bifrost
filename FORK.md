@@ -36,6 +36,20 @@ Infra продолжает собирать закреплённый upstream с
 | Каталог Routing Rules | `/v1/routing/models` читает доступные caller публичные имена из живых правил без второго каталога и запросов к провайдерам | [routing](plugins/routing/models.go), [HTTP admission](transports/bifrost-http/server/routingmodels.go) |
 | Вход OpenID Connect | Настройки Security и обычные dashboard sessions поддерживают OIDC без отдельного auth-сервиса; допускаются явно указанные subject или подтверждённые email | [настройка и сессии](docs/quickstart/gateway/oidc.mdx), [HTTP flow](transports/bifrost-http/handlers/oidc.go) |
 
+Первый выпуск OIDC сохраняет работающий вход по локальному паролю. Версия
+[`b3682eb10`](https://github.com/Labpics-Team/bifrost/commit/b3682eb10ec6a479b0139f33253aa03fcb2297bb),
+предшествующая OIDC, не знает этот способ входа: возврат к ней после удаления
+локальных credentials оставит панель без доступного входа. До появления и
+проверки OIDC-совместимой версии для возврата локальные username/password
+сохраняются в настройках и файле конфигурации; вход по ним проверяется в
+отдельной браузерной сессии. Порядок перехода описан в
+[инструкции OIDC](docs/quickstart/gateway/oidc.mdx#first-release-and-rollback).
+
+Создание парольной или OIDC-сессии сверяет использованную политику доступа и
+записывает сессию в одной транзакции. Эта операция и смена auth-настроек
+блокируют одни и те же строки: устаревший вход не восстанавливает доступ после
+отзыва, а сохранение неизменённой политики не сбрасывает сессии.
+
 Причины проверяются по поведению. Например, upstream разрешает повтор после
 записи на reused connection в
 [roundtripper.go](https://github.com/maximhq/bifrost/blob/7cb75fb2f8276ca48d0792c857fecb67b8879e2f/core/providers/utils/roundtripper.go)

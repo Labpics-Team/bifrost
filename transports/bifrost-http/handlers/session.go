@@ -248,7 +248,11 @@ func (h *SessionHandler) login(ctx *fasthttp.RequestCtx) {
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
-	err = h.configStore.CreateSession(ctx, session)
+	err = h.configStore.CreateSessionIfAuthMatches(ctx, session, authConfig)
+	if errors.Is(err, configstore.ErrAuthConfigChanged) {
+		SendError(ctx, fasthttp.StatusUnauthorized, "Authentication settings changed. Please sign in again.")
+		return
+	}
 	if err != nil {
 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to create session: %v", err))
 		return

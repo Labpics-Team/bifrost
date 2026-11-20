@@ -40,10 +40,27 @@ Initial setup uses the existing setup token. Saving authentication changes
 invalidates existing dashboard sessions in the same database transaction; a
 failed write retains the old policy and sessions, and can be retried. Saving
 unchanged authentication settings preserves sessions. Sign in again after a
-successful change. A failed sign-in preserves the original workspace or consent
+successful change. Password and OIDC sign-ins create a session only while the
+authentication settings used to verify them still match, in the same database
+transaction as session creation. A concurrent policy change either rejects the
+sign-in or revokes its session. A failed sign-in preserves the original workspace or consent
 page for the next attempt once its browser-bound state has been verified.
 If protection is disabled and no local password exists, the setup token is the
 recovery proof for re-enabling it. Keep that operator credential available.
+
+## First release and rollback
+
+Keep a working local administrator username and password during the first OIDC
+release. The previous Labpics build at `b3682eb10` does not understand OIDC. Rolling
+back to it after removing the local credentials leaves no usable dashboard
+sign-in method; an existing browser session is not a recovery plan.
+
+Before enabling OIDC in production, verify local password sign-in in a separate
+browser session. Keep those credentials in both file configuration and the
+stored settings while that older build remains the rollback target. Switch to
+OIDC-only only after the rollback target also supports OIDC and its sign-in has
+been checked. To return to an older build, restore and verify local credentials
+on the OIDC-capable build first.
 
 ## Configure with a file
 
@@ -52,6 +69,8 @@ recovery proof for re-enabling it. Keep that operator credential available.
   "governance": {
     "auth_config": {
       "is_enabled": true,
+      "admin_username": "env.BIFROST_ADMIN_USERNAME",
+      "admin_password": "env.BIFROST_ADMIN_PASSWORD",
       "oidc": {
         "enabled": true,
         "issuer_url": "https://identity.example.com",

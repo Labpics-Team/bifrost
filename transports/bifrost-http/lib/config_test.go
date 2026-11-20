@@ -1554,6 +1554,13 @@ func (m *MockConfigStore) CreateSession(ctx context.Context, session *tables.Ses
 	return nil
 }
 
+func (m *MockConfigStore) CreateSessionIfAuthMatches(ctx context.Context, session *tables.SessionsTable, expectedAuth *configstore.AuthConfig) error {
+	if expectedAuth == nil || !expectedAuth.IsEnabled || !m.authConfig.Equals(expectedAuth) {
+		return configstore.ErrAuthConfigChanged
+	}
+	return m.CreateSession(ctx, session)
+}
+
 func (m *MockConfigStore) DeleteSession(ctx context.Context, token string) error {
 	return nil
 }

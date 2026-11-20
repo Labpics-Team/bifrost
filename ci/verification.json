@@ -80,7 +80,8 @@
       "TestNativeBetaHeadersPreserveHookKey",
       "TestOIDCSignIn",
       "TestOIDCGoto",
-      "TestOIDCSettings"
+      "TestOIDCSettings",
+      "TestPasswordLoginUsesCurrentAuthPolicy"
     ],
     "github.com/maximhq/bifrost/transports/v2/bifrost-http/integrations": [
       "TestStreamErrorEventFramingPerRoute",

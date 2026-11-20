@@ -7846,6 +7846,25 @@ func (s *RDBConfigStore) CreateSession(ctx context.Context, session *tables.Sess
 	return s.DB().WithContext(ctx).Create(session).Error
 }
 
+// CreateSessionIfAuthMatches orders sign-in with auth changes using the same
+// row locks as UpdateAuthConfig. A later change revokes this session; an earlier
+// change refuses insertion against the obsolete credential/policy snapshot.
+func (s *RDBConfigStore) CreateSessionIfAuthMatches(ctx context.Context, session *tables.SessionsTable, expectedAuth *AuthConfig) error {
+	if expectedAuth == nil || !expectedAuth.IsEnabled {
+		return ErrAuthConfigChanged
+	}
+	return s.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		current, err := readAuthConfig(tx.Clauses(clause.Locking{Strength: "UPDATE"}))
+		if err != nil {
+			return err
+		}
+		if !current.Equals(expectedAuth) {
+			return ErrAuthConfigChanged
+		}
+		return tx.Create(session).Error
+	})
+}
+
 // DeleteSession deletes a session from the database.
 func (s *RDBConfigStore) DeleteSession(ctx context.Context, token string) error {
 	tokenHash := encrypt.HashSHA256(token)

@@ -27,8 +27,9 @@ import (
 
 type oidcTestStore struct {
 	configstore.ConfigStore
-	auth     *configstore.AuthConfig
-	sessions map[string]*tables.SessionsTable
+	auth         *configstore.AuthConfig
+	sessions     map[string]*tables.SessionsTable
+	beforeCreate func()
 }
 
 func (s *oidcTestStore) GetAuthConfig(context.Context) (*configstore.AuthConfig, error) {
@@ -37,11 +38,20 @@ func (s *oidcTestStore) GetAuthConfig(context.Context) (*configstore.AuthConfig,
 func (s *oidcTestStore) GetClientConfig(context.Context) (*configstore.ClientConfig, error) {
 	return &configstore.ClientConfig{}, nil
 }
-func (s *oidcTestStore) CreateSession(_ context.Context, session *tables.SessionsTable) error {
-	s.sessions[session.Token] = session
-	if s.ConfigStore != nil {
-		return s.ConfigStore.CreateSession(context.Background(), session)
+func (s *oidcTestStore) CreateSessionIfAuthMatches(_ context.Context, session *tables.SessionsTable, expectedAuth *configstore.AuthConfig) error {
+	if s.beforeCreate != nil {
+		s.beforeCreate()
+		s.beforeCreate = nil
 	}
+	token := session.Token
+	if s.ConfigStore != nil {
+		if err := s.ConfigStore.CreateSessionIfAuthMatches(context.Background(), session, expectedAuth); err != nil {
+			return err
+		}
+	} else if expectedAuth == nil || !expectedAuth.IsEnabled || !s.auth.Equals(expectedAuth) {
+		return configstore.ErrAuthConfigChanged
+	}
+	s.sessions[token] = session
 	return nil
 }
 func (s *oidcTestStore) GetSession(_ context.Context, token string) (*tables.SessionsTable, error) {
@@ -62,7 +72,7 @@ func TestOIDCSignIn(t *testing.T) {
 	SetLogger(&mockLogger{})
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
-	for _, test := range []string{"success", "verified-email", "cookie", "state", "nonce", "audience", "issuer", "expiry", "signature", "unapproved", "unverified-email", "reconfigured", "expired-flow", "provider-error", "token-error", "encrypted-session"} {
+	for _, test := range []string{"success", "verified-email", "cookie", "state", "nonce", "audience", "issuer", "expiry", "signature", "unapproved", "unverified-email", "reconfigured", "reconfigured-on-insert", "expired-flow", "provider-error", "token-error", "encrypted-session"} {
 		t.Run(test, func(t *testing.T) {
 			lib.SetBasePath("/bifrost")
 			t.Cleanup(func() { lib.SetBasePath("") })
@@ -123,9 +133,20 @@ func TestOIDCSignIn(t *testing.T) {
 			}
 			store := &oidcTestStore{auth: &configstore.AuthConfig{IsEnabled: true, OIDC: conf}, sessions: map[string]*tables.SessionsTable{}}
 			if test == "encrypted-session" {
-				store.ConfigStore = newRealOAuth2Store(t)
 				encrypt.Init("oidc-test-encryption-passphrase", &mockLogger{})
 				t.Cleanup(func() { encrypt.Init("", &mockLogger{}) })
+			}
+			if test == "encrypted-session" || test == "reconfigured-on-insert" {
+				store.ConfigStore = newRealOAuth2Store(t)
+				require.NoError(t, store.ConfigStore.UpdateAuthConfig(context.Background(), store.auth))
+			}
+			if test == "reconfigured-on-insert" {
+				store.beforeCreate = func() {
+					next := *store.auth
+					next.OIDC = conf.Clone()
+					next.OIDC.AllowedSubjects = []string{"different-admin"}
+					require.NoError(t, store.ConfigStore.UpdateAuthConfig(context.Background(), &next))
+				}
 			}
 			h := NewSessionHandler(store, nil)
 			authMiddleware, err := InitAuthMiddleware(store, nil, nil, "")

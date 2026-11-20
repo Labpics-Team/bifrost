@@ -198,28 +198,13 @@ func (h *SessionHandler) oidcCallback(ctx *fasthttp.RequestCtx) {
 		oidcFailure(ctx, flow.gotoPath)
 		return
 	}
-	// Recheck after network I/O and again after insertion. If policy changes
-	// after insertion, the normal settings update flushes this session too.
-	auth, err = h.configStore.GetAuthConfig(ctx)
-	if err != nil || !auth.OIDCEnabled() || !auth.OIDC.Equals(flow.config) {
-		oidcFailure(ctx, flow.gotoPath)
-		return
-	}
 	expires := time.Now().Add(8 * time.Hour)
 	if idToken.Expiry.Before(expires) {
 		expires = idToken.Expiry
 	}
 	sessionToken := uuid.NewString()
 	session := &tables.SessionsTable{Token: sessionToken, ExpiresAt: expires, CreatedAt: time.Now(), UpdatedAt: time.Now()}
-	if err := h.configStore.CreateSession(ctx, session); err != nil {
-		oidcFailure(ctx, flow.gotoPath)
-		return
-	}
-	auth, err = h.configStore.GetAuthConfig(ctx)
-	if err != nil || !auth.OIDCEnabled() || !auth.OIDC.Equals(flow.config) {
-		if err := h.configStore.DeleteSession(ctx, sessionToken); err != nil {
-			logger.Error("failed to revoke session after OIDC configuration changed")
-		}
+	if err := h.configStore.CreateSessionIfAuthMatches(ctx, session, auth); err != nil {
 		oidcFailure(ctx, flow.gotoPath)
 		return
 	}
