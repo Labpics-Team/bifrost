@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore/tables"
@@ -53,11 +54,16 @@ func TestOIDCConfigStoreRoundTrip(t *testing.T) {
 	require.True(t, loaded.OIDCEnabled())
 	require.False(t, loaded.HasPassword())
 	require.True(t, conf.OIDC.Equals(loaded.OIDC))
+	require.NoError(t, store.CreateSession(context.Background(), &tables.SessionsTable{Token: "unchanged-policy", ExpiresAt: time.Now().Add(time.Hour)}))
+	conf.OIDC.AllowedEmails = []string{}
+	require.NoError(t, store.UpdateAuthConfig(context.Background(), conf))
+	session, err := store.GetSession(context.Background(), "unchanged-policy")
+	require.NoError(t, err)
+	require.NotNil(t, session, "empty and omitted allowlists describe the same policy")
 }
 
 func TestOIDCConfigEncryption(t *testing.T) {
-	encrypt.Init("oidc-test-encryption-passphrase", testMigrationLogger)
-	t.Cleanup(func() { encrypt.Init("", testMigrationLogger) })
+	require.True(t, encrypt.IsEnabled(), "use the package's shared encryption fixture")
 	conf := &OIDCConfig{ClientSecret: schemas.NewSecretVar("stored-client-secret")}
 	encoded, err := encodeOIDCConfig(conf)
 	require.NoError(t, err)

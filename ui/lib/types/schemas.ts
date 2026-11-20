@@ -523,6 +523,39 @@ export const isHTTPSOrLoopbackURL = (raw: string): boolean => {
 	return hasHTTPSOrLoopbackScheme(raw);
 };
 
+export const oidcConfigSchema = z
+	.object({
+		enabled: z.boolean(),
+		issuer_url: z.string(),
+		client_id: z.string(),
+		client_secret: secretVarSchema.optional(),
+		redirect_url: z.string(),
+		allowed_subjects: z.array(z.string()).optional(),
+		allowed_emails: z.array(z.string()).optional(),
+	})
+	.superRefine((config, ctx) => {
+		if (!config.enabled) return;
+		for (const field of ["issuer_url", "redirect_url"] as const) {
+			if (!isHTTPSOrLoopbackURL(config[field]) || new URL(config[field]).search !== "") {
+				ctx.addIssue({ code: "custom", path: [field], message: i18n.t("validation.validUrl") });
+			} else if (field === "redirect_url" && !new URL(config[field]).pathname.endsWith("/api/session/oidc/callback")) {
+				ctx.addIssue({ code: "custom", path: [field], message: i18n.t("security.oidc.redirectHelp", { ns: "config" }) });
+			}
+		}
+		if (!config.client_id.trim()) {
+			ctx.addIssue({ code: "custom", path: ["client_id"], message: i18n.t("validation.fieldRequired") });
+		}
+		if (!config.allowed_subjects?.length && !config.allowed_emails?.length) {
+			ctx.addIssue({ code: "custom", path: ["allowed_subjects"], message: i18n.t("security.oidc.allowHelp", { ns: "config" }) });
+		}
+		if (config.allowed_subjects?.some((subject) => !subject.trim())) {
+			ctx.addIssue({ code: "custom", path: ["allowed_subjects"], message: i18n.t("validation.fieldRequired") });
+		}
+		if (config.allowed_emails?.some((email) => !z.email().safeParse(email).success)) {
+			ctx.addIssue({ code: "custom", path: ["allowed_emails"], message: i18n.t("validation.validEmail") });
+		}
+	});
+
 // isLiteralHTTPSOrLoopbackURL checks only the scheme: the OAuth token URL's credentials, query and
 // fragment are reported separately, pointing at extra_params.
 const isLiteralHTTPSOrLoopbackURL = (v: { value?: string; ref?: string; type?: string } | undefined): boolean => {

@@ -6482,7 +6482,7 @@ func loadAuthConfig(ctx context.Context, config *Config, configData *ConfigData)
 	if err := authConfig.OIDC.Validate(); err != nil {
 		return err
 	}
-	if !authConfig.OIDCEnabled() && (authConfig.AdminPassword == nil || authConfig.AdminUserName == nil) {
+	if authConfig.IsEnabled && !authConfig.OIDCEnabled() && (authConfig.AdminPassword == nil || authConfig.AdminUserName == nil) {
 		logger.Warn("auth config is missing admin_username or admin_password, skipping auth config processing")
 		return nil
 	}

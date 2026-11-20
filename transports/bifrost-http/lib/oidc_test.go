@@ -29,4 +29,11 @@ func TestLoadOIDCOnlyConfig(t *testing.T) {
 	data.Governance.AuthConfig.OIDC.AllowedSubjects = []string{"different-admin"}
 	require.NoError(t, loadAuthConfig(context.Background(), cfg, data))
 	require.True(t, store.flushSessionsCalled)
+	store.flushSessionsCalled = false
+	data.Governance.AuthConfig = &configstore.AuthConfig{IsEnabled: false, OIDC: data.Governance.AuthConfig.OIDC.Clone()}
+	require.NoError(t, loadAuthConfig(context.Background(), cfg, data))
+	loaded, err := store.GetAuthConfig(context.Background())
+	require.NoError(t, err)
+	require.False(t, loaded.IsEnabled, "a disabled OIDC-only file configuration must reach the store")
+	require.True(t, store.flushSessionsCalled)
 }

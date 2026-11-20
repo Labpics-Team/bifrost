@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/mail"
 	"net/url"
-	"reflect"
 	"slices"
 	"strings"
 
@@ -46,7 +45,12 @@ func (c *OIDCConfig) Redacted() *OIDCConfig {
 }
 
 func (c *OIDCConfig) Equals(other *OIDCConfig) bool {
-	return reflect.DeepEqual(c, other)
+	if c == nil || other == nil {
+		return c == other
+	}
+	return c.Enabled == other.Enabled && c.IssuerURL == other.IssuerURL && c.ClientID == other.ClientID &&
+		c.ClientSecret.Equals(other.ClientSecret) && c.RedirectURL == other.RedirectURL &&
+		slices.Equal(c.AllowedSubjects, other.AllowedSubjects) && slices.Equal(c.AllowedEmails, other.AllowedEmails)
 }
 
 func (c *OIDCConfig) Validate() error {

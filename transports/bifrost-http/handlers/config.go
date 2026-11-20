@@ -509,6 +509,9 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 			return
 		}
 		if existingAuthConfig != nil {
+			if _, present := requestFields.AuthConfig["admin_username"]; !present {
+				payload.AuthConfig.AdminUserName = existingAuthConfig.AdminUserName.Clone()
+			}
 			if _, present := requestFields.AuthConfig["oidc"]; !present {
 				payload.AuthConfig.OIDC = existingAuthConfig.OIDC.Clone()
 			} else if payload.AuthConfig.OIDC != nil && payload.AuthConfig.OIDC.ClientSecret.ShouldPreserveStored() && existingAuthConfig.OIDC != nil {

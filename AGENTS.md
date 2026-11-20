@@ -13,6 +13,11 @@ are declared in `ci/verification.json`.
 The first import reproduced the previously deployed source and tests. Subsequent
 review removes overrides that conflict with native behavior; FORK.md records the
 retained differences. Verify behavior changes with the applicable guidance below.
+For this fork, dashboard authentication and management routes use native Go HTTP
+tests with their registered routes, middleware and local stores. These tests run
+in fork CI without provider credentials. Extend that coverage for OIDC rather
+than duplicating it in the upstream provider-harness collection; reserve that
+collection for provider/SDK interoperability. Check the changed UI in a browser.
 This first slice covers the repository and its verification only. Infra still
 builds the pinned upstream with patches. Switching its source, publishing an
 image or deploying the fork requires a separate task; merging `labpics` only

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fasthttp/router"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
 	"github.com/maximhq/bifrost/framework/configstore/tables"
@@ -32,6 +33,9 @@ type oidcTestStore struct {
 
 func (s *oidcTestStore) GetAuthConfig(context.Context) (*configstore.AuthConfig, error) {
 	return s.auth, nil
+}
+func (s *oidcTestStore) GetClientConfig(context.Context) (*configstore.ClientConfig, error) {
+	return &configstore.ClientConfig{}, nil
 }
 func (s *oidcTestStore) CreateSession(_ context.Context, session *tables.SessionsTable) error {
 	s.sessions[session.Token] = session
@@ -124,13 +128,28 @@ func TestOIDCSignIn(t *testing.T) {
 				t.Cleanup(func() { encrypt.Init("", &mockLogger{}) })
 			}
 			h := NewSessionHandler(store, nil)
+			authMiddleware, err := InitAuthMiddleware(store, nil, nil, "")
+			require.NoError(t, err)
+			routes := router.New()
+			h.RegisterRoutes(routes, authMiddleware.APIMiddleware())
+			if test == "success" {
+				status := &fasthttp.RequestCtx{}
+				status.Request.SetRequestURI("/api/session/is-auth-enabled")
+				routes.Handler(status)
+				require.Equal(t, fasthttp.StatusOK, status.Response.StatusCode())
+				var body map[string]any
+				require.NoError(t, json.Unmarshal(status.Response.Body(), &body))
+				require.Equal(t, "oidc", body["auth_type"])
+				require.Equal(t, true, body["oidc_enabled"])
+				require.Equal(t, false, body["password_enabled"])
+			}
 			login := &fasthttp.RequestCtx{}
 			destination := "/workspace/logs?model=test"
 			if test == "provider-error" {
 				destination = "/oauth/consent?client_id=test&response_type=code"
 			}
 			login.Request.SetRequestURI("https://ai.example/api/session/oidc/login?goto=" + url.QueryEscape(destination))
-			h.oidcLogin(login)
+			routes.Handler(login)
 			require.Equal(t, fasthttp.StatusSeeOther, login.Response.StatusCode())
 			authorize, err := url.Parse(string(login.Response.Header.Peek("Location")))
 			require.NoError(t, err)
@@ -167,7 +186,7 @@ func TestOIDCSignIn(t *testing.T) {
 			if test == "provider-error" {
 				callback.QueryArgs().Set("error", "access_denied")
 			}
-			h.oidcCallback(callback)
+			routes.Handler(callback)
 			sessionCookie := &fasthttp.Cookie{}
 			sessionCookie.SetKey("token")
 			if test != "success" && test != "verified-email" && test != "encrypted-session" {
@@ -185,7 +204,7 @@ func TestOIDCSignIn(t *testing.T) {
 				if test == "provider-error" || test == "token-error" {
 					retry := &fasthttp.RequestCtx{}
 					retry.Request.SetRequestURI("https://ai.example/api/session/oidc/login?goto=" + url.QueryEscape(failureURL.Query().Get("goto")))
-					h.oidcLogin(retry)
+					routes.Handler(retry)
 					require.Equal(t, fasthttp.StatusSeeOther, retry.Response.StatusCode())
 					authorize, err := url.Parse(string(retry.Response.Header.Peek("Location")))
 					require.NoError(t, err)
@@ -203,7 +222,7 @@ func TestOIDCSignIn(t *testing.T) {
 			require.WithinDuration(t, time.Now().Add(time.Hour), session.ExpiresAt, 3*time.Second)
 			// A consumed callback never creates a second session.
 			callback.Response.Reset()
-			h.oidcCallback(callback)
+			routes.Handler(callback)
 			require.Len(t, store.sessions, 1)
 			logout := &fasthttp.RequestCtx{}
 			logout.Request.Header.SetCookie("token", token)

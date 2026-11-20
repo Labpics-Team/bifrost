@@ -18,6 +18,7 @@ import { parseArrayFromText } from "@/lib/utils/array";
 import { formatCooldown } from "@/lib/utils/duration";
 import { getApiBaseUrl } from "@/lib/utils/port";
 import { isSecretVarSet } from "@/lib/utils/secretVarForm";
+import { oidcConfigSchema } from "@/lib/types/schemas";
 import { getPasswordPolicyFailures, type PasswordRequirementKey, validateOrigins } from "@/lib/utils/validation";
 import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
 import { useGetAuthTypeQuery } from "@enterprise/lib/store/apis/scimApi";
@@ -47,6 +48,7 @@ export default function SecurityView() {
 	const passwordInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
 	const passwordUnchangedRef = useRef(true);
 	const inferenceAuthTouchedRef = useRef(false);
+	const [oidcValidationAttempted, setOIDCValidationAttempted] = useState(false);
 
 	const [localValues, setLocalValues] = useState<{
 		allowed_origins: string;
@@ -129,6 +131,11 @@ export default function SecurityView() {
 			authConfig.admin_password?.type !== bifrostConfig?.auth_config?.admin_password?.type;
 		return usernameChanged || passwordChanged || JSON.stringify(authConfig.oidc) !== JSON.stringify(bifrostConfig?.auth_config?.oidc);
 	}, [authConfig, bifrostConfig]);
+	const oidcValidation = useMemo(
+		() => (authConfig.is_enabled && authConfig.oidc ? oidcConfigSchema.safeParse(authConfig.oidc) : null),
+		[authConfig, t],
+	);
+	const oidcErrors = oidcValidationAttempted && oidcValidation && !oidcValidation.success ? oidcValidation.error.flatten().fieldErrors : {};
 
 	const hasChanges = useMemo(() => {
 		if (!config) return false;
@@ -310,6 +317,11 @@ export default function SecurityView() {
 				toast.error(t("security.oidc.authRequired"));
 				return;
 			}
+			setOIDCValidationAttempted(true);
+			if (oidcValidation && !oidcValidation.success) {
+				document.querySelector('[data-testid="oidc-settings"]')?.scrollIntoView({ block: "nearest" });
+				return;
+			}
 			const passwordPolicyFailures =
 				showPasswordSection && authConfig.is_enabled && !authConfig.admin_password?.ref && authConfig.admin_password?.value
 					? getPasswordPolicyFailures(authConfig.admin_password.value, passwordUnchangedRef.current)
@@ -395,6 +407,7 @@ export default function SecurityView() {
 		authorizedBySetupToken,
 		t,
 		formatPasswordPolicyError,
+		oidcValidation,
 	]);
 
 	return (
@@ -431,6 +444,7 @@ export default function SecurityView() {
 							</div>
 							<OIDCSettings
 								value={authConfig.oidc}
+								errors={oidcErrors}
 								disabled={!authConfig.is_enabled || !hasSettingsUpdateAccess}
 								onChange={(oidc) => setAuthConfig((previous) => ({ ...previous, oidc }))}
 							/>

@@ -357,12 +357,18 @@ func (c *CorsMiddleware) UpdateConfig(config *lib.Config) {
 	c.config.Store(newCorsMiddlewareConfig(config))
 }
 
-// logRequestTarget is the request target for the access log with an api-key query value redacted: the
+// logRequestTarget excludes OIDC callback parameters and redacts an api-key query value: the
 // Azure Voice Live JavaScript SDK always sends its key, a virtual key here, in the query string. The
 // parsed names are checked, so a percent-encoded api-key name is redacted too.
 func logRequestTarget(ctx *fasthttp.RequestCtx) string {
 	uri := ctx.RequestURI()
-	if bytes.IndexByte(uri, '?') < 0 || !ctx.QueryArgs().Has("api-key") {
+	if bytes.IndexByte(uri, '?') < 0 {
+		return string(uri)
+	}
+	if strings.HasSuffix(string(ctx.Path()), "/api/session/oidc/callback") {
+		return string(ctx.Request.URI().PathOriginal())
+	}
+	if !ctx.QueryArgs().Has("api-key") {
 		return string(uri)
 	}
 	var args fasthttp.Args
