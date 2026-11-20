@@ -346506,6 +346506,521 @@
           }
         }
       ]
+    },
+    {
+      "name": "373. Key and alias service_tier fill requests that set none (key service tier)",
+      "description": "A key's service_tier, or its alias's, is sent on chat completions and responses requests in place of the request's own tier; the alias's wins over the key's, and the request's tier applies only when neither sets one. Only openai, azure, anthropic, vertex and gemini keys take a tier, each with its own allowed values; every other provider rejects it at save and load.\n\nProfile setup: 'OpenAI Service Tier Key' (weight 0, so other OpenAI cases never pick it) has service_tier 'priority' and an alias gpt-4o-mini-tier-auto (tier 'auto'). The other providers carry one tier alias each on their existing key, which only requests naming that alias reach. Every case selects its key with x-bf-api-key.\n\nWhat each case reads: OpenAI, Azure and Anthropic read the outbound service_tier from extra_fields.raw_request; Anthropic gets 'default' as standard_only. Gemini reads raw_request.serviceTier. Vertex sends the tier as the X-Vertex-AI-LLM-Shared-Request-Type header, which raw_request does not show, so 373.9 reads the served tier Vertex reports back (usageMetadata.trafficType ON_DEMAND_PRIORITY -> service_tier 'priority'). OpenAI uses only 'auto' and 'priority' because the datasheet lists exactly those for openai/gpt-4o-mini, and Bifrost drops any other tier before the wire.\n\n373.1 key tier (chat). 373.2 alias over key. 373.3 key over request. 373.4 alias over request. 373.5 key tier (/v1/responses). 373.6 Azure alias. 373.7 Anthropic alias. 373.8 Gemini alias. 373.9 Vertex alias.",
+      "item": [
+        {
+          "name": "/v1/chat/completions - key service_tier fills a request with none - openai/gpt-4o-mini",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "var body = {};",
+                  "try { body = pm.response.json() || {}; } catch (e) { body = {}; }",
+                  "var rr = (body.extra_fields || {}).raw_request;",
+                  "if (typeof rr === 'string') { try { rr = JSON.parse(rr); } catch (e) { rr = null; } }",
+                  "pm.test('373.1 status is 200', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 400)).to.equal(200);",
+                  "});",
+                  "pm.test('373.1 the key priority tier reaches the wire', function () {",
+                  "  pm.expect(rr, 'raw_request missing or unparseable - x-bf-send-back-raw-request not honored: ' + txt.slice(0, 300)).to.be.an('object');",
+                  "  pm.expect(rr.service_tier, 'outbound service_tier: ' + JSON.stringify(rr).slice(0, 400)).to.eql('priority');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-bf-api-key",
+                "value": "OpenAI Service Tier Key"
+              },
+              {
+                "key": "x-bf-send-back-raw-request",
+                "value": "true"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-4o-mini\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with the single word: ok\"\n    }\n  ],\n  \"max_tokens\": 8\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "/v1/chat/completions - alias service_tier overrides the key's - openai/gpt-4o-mini-tier-auto",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "var body = {};",
+                  "try { body = pm.response.json() || {}; } catch (e) { body = {}; }",
+                  "var rr = (body.extra_fields || {}).raw_request;",
+                  "if (typeof rr === 'string') { try { rr = JSON.parse(rr); } catch (e) { rr = null; } }",
+                  "pm.test('373.2 status is 200', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 400)).to.equal(200);",
+                  "});",
+                  "pm.test('373.2 the alias auto tier wins over the key priority tier', function () {",
+                  "  pm.expect(rr, 'raw_request missing or unparseable - x-bf-send-back-raw-request not honored: ' + txt.slice(0, 300)).to.be.an('object');",
+                  "  pm.expect(rr.service_tier, 'outbound service_tier: ' + JSON.stringify(rr).slice(0, 400)).to.eql('auto');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-bf-api-key",
+                "value": "OpenAI Service Tier Key"
+              },
+              {
+                "key": "x-bf-send-back-raw-request",
+                "value": "true"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-4o-mini-tier-auto\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with the single word: ok\"\n    }\n  ],\n  \"max_tokens\": 8\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "/v1/chat/completions - key service_tier overrides the request's - openai/gpt-4o-mini",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "var body = {};",
+                  "try { body = pm.response.json() || {}; } catch (e) { body = {}; }",
+                  "var rr = (body.extra_fields || {}).raw_request;",
+                  "if (typeof rr === 'string') { try { rr = JSON.parse(rr); } catch (e) { rr = null; } }",
+                  "pm.test('373.3 status is 200', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 400)).to.equal(200);",
+                  "});",
+                  "pm.test('373.3 the key priority tier replaces the request auto tier', function () {",
+                  "  pm.expect(rr, 'raw_request missing or unparseable - x-bf-send-back-raw-request not honored: ' + txt.slice(0, 300)).to.be.an('object');",
+                  "  pm.expect(rr.service_tier, 'outbound service_tier: ' + JSON.stringify(rr).slice(0, 400)).to.eql('priority');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-bf-api-key",
+                "value": "OpenAI Service Tier Key"
+              },
+              {
+                "key": "x-bf-send-back-raw-request",
+                "value": "true"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-4o-mini\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with the single word: ok\"\n    }\n  ],\n  \"max_tokens\": 8,\n  \"service_tier\": \"auto\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "/v1/chat/completions - alias service_tier overrides the request's - openai/gpt-4o-mini-tier-auto",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "var body = {};",
+                  "try { body = pm.response.json() || {}; } catch (e) { body = {}; }",
+                  "var rr = (body.extra_fields || {}).raw_request;",
+                  "if (typeof rr === 'string') { try { rr = JSON.parse(rr); } catch (e) { rr = null; } }",
+                  "pm.test('373.4 status is 200', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 400)).to.equal(200);",
+                  "});",
+                  "pm.test('373.4 the alias auto tier replaces the request priority tier', function () {",
+                  "  pm.expect(rr, 'raw_request missing or unparseable - x-bf-send-back-raw-request not honored: ' + txt.slice(0, 300)).to.be.an('object');",
+                  "  pm.expect(rr.service_tier, 'outbound service_tier: ' + JSON.stringify(rr).slice(0, 400)).to.eql('auto');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-bf-api-key",
+                "value": "OpenAI Service Tier Key"
+              },
+              {
+                "key": "x-bf-send-back-raw-request",
+                "value": "true"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-4o-mini-tier-auto\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with the single word: ok\"\n    }\n  ],\n  \"max_tokens\": 8,\n  \"service_tier\": \"priority\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/chat/completions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "chat",
+                "completions"
+              ]
+            }
+          }
+        },
+        {
+          "name": "/v1/responses - key service_tier fills a request with none - openai/gpt-4o-mini",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var txt = pm.response.text() || '';",
+                  "var body = {};",
+                  "try { body = pm.response.json() || {}; } catch (e) { body = {}; }",
+                  "var rr = (body.extra_fields || {}).raw_request;",
+                  "if (typeof rr === 'string') { try { rr = JSON.parse(rr); } catch (e) { rr = null; } }",
+                  "pm.test('373.5 status is 200', function () {",
+                  "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 400)).to.equal(200);",
+                  "});",
+                  "pm.test('373.5 the key priority tier reaches the wire', function () {",
+                  "  pm.expect(rr, 'raw_request missing or unparseable - x-bf-send-back-raw-request not honored: ' + txt.slice(0, 300)).to.be.an('object');",
+                  "  pm.expect(rr.service_tier, 'outbound service_tier: ' + JSON.stringify(rr).slice(0, 400)).to.eql('priority');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "x-bf-api-key",
+                "value": "OpenAI Service Tier Key"
+              },
+              {
+                "key": "x-bf-send-back-raw-request",
+                "value": "true"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-4o-mini\",\n  \"input\": \"Reply with the single word: ok\",\n  \"max_output_tokens\": 16\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/v1/responses",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "v1",
+                "responses"
+              ]
+            }
+          }
+        },
+      {
+        "name": "/v1/chat/completions - alias service_tier reaches Azure - azure/gpt-4o-mini-tier-auto",
+        "event": [
+          {
+            "listen": "test",
+            "script": {
+              "type": "text/javascript",
+              "exec": [
+                "var txt = pm.response.text() || '';",
+                "var body = {};",
+                "try { body = pm.response.json() || {}; } catch (e) { body = {}; }",
+                "pm.test('373.6 status is 200', function () {",
+                "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 400)).to.equal(200);",
+                "});",
+                "var rr = (body.extra_fields || {}).raw_request;",
+                "if (typeof rr === 'string') { try { rr = JSON.parse(rr); } catch (e) { rr = null; } }",
+                "pm.test('373.6 the alias auto tier reaches the wire', function () {",
+                "  pm.expect(rr, 'raw_request missing or unparseable - x-bf-send-back-raw-request not honored: ' + txt.slice(0, 300)).to.be.an('object');",
+                "  pm.expect(rr.service_tier, 'outbound service_tier: ' + JSON.stringify(rr).slice(0, 400)).to.eql('auto');",
+                "});"
+              ]
+            }
+          }
+        ],
+        "request": {
+          "method": "POST",
+          "header": [
+            {
+              "key": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "key": "x-bf-api-key",
+              "value": "Azure API Key"
+            },
+            {
+              "key": "x-bf-send-back-raw-request",
+              "value": "true"
+            }
+          ],
+          "body": {
+            "mode": "raw",
+            "raw": "{\n  \"model\": \"azure/gpt-4o-mini-tier-auto\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with the single word: ok\"\n    }\n  ],\n  \"max_tokens\": 16\n}"
+          },
+          "url": {
+            "raw": "{{baseUrl}}/v1/chat/completions",
+            "host": [
+              "{{baseUrl}}"
+            ],
+            "path": [
+              "v1",
+              "chat",
+              "completions"
+            ]
+          }
+        }
+      },
+      {
+        "name": "/v1/chat/completions - alias service_tier maps to Anthropic standard_only - anthropic/claude-haiku-4-5-tier-default",
+        "event": [
+          {
+            "listen": "test",
+            "script": {
+              "type": "text/javascript",
+              "exec": [
+                "var txt = pm.response.text() || '';",
+                "var body = {};",
+                "try { body = pm.response.json() || {}; } catch (e) { body = {}; }",
+                "pm.test('373.7 status is 200', function () {",
+                "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 400)).to.equal(200);",
+                "});",
+                "var rr = (body.extra_fields || {}).raw_request;",
+                "if (typeof rr === 'string') { try { rr = JSON.parse(rr); } catch (e) { rr = null; } }",
+                "pm.test('373.7 the alias default tier is sent as Anthropic standard_only', function () {",
+                "  pm.expect(rr, 'raw_request missing or unparseable - x-bf-send-back-raw-request not honored: ' + txt.slice(0, 300)).to.be.an('object');",
+                "  pm.expect(rr.service_tier, 'outbound service_tier: ' + JSON.stringify(rr).slice(0, 400)).to.eql('standard_only');",
+                "});"
+              ]
+            }
+          }
+        ],
+        "request": {
+          "method": "POST",
+          "header": [
+            {
+              "key": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "key": "x-bf-api-key",
+              "value": "Anthropic API Key"
+            },
+            {
+              "key": "x-bf-send-back-raw-request",
+              "value": "true"
+            }
+          ],
+          "body": {
+            "mode": "raw",
+            "raw": "{\n  \"model\": \"anthropic/claude-haiku-4-5-tier-default\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with the single word: ok\"\n    }\n  ],\n  \"max_tokens\": 16\n}"
+          },
+          "url": {
+            "raw": "{{baseUrl}}/v1/chat/completions",
+            "host": [
+              "{{baseUrl}}"
+            ],
+            "path": [
+              "v1",
+              "chat",
+              "completions"
+            ]
+          }
+        }
+      },
+      {
+        "name": "/v1/chat/completions - alias service_tier maps to Gemini serviceTier - gemini/gemini-3.8-flash-tier-priority",
+        "event": [
+          {
+            "listen": "test",
+            "script": {
+              "type": "text/javascript",
+              "exec": [
+                "var txt = pm.response.text() || '';",
+                "var body = {};",
+                "try { body = pm.response.json() || {}; } catch (e) { body = {}; }",
+                "pm.test('373.8 status is 200', function () {",
+                "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 400)).to.equal(200);",
+                "});",
+                "var rr = (body.extra_fields || {}).raw_request;",
+                "if (typeof rr === 'string') { try { rr = JSON.parse(rr); } catch (e) { rr = null; } }",
+                "pm.test('373.8 the alias priority tier is sent as Gemini serviceTier', function () {",
+                "  pm.expect(rr, 'raw_request missing or unparseable - x-bf-send-back-raw-request not honored: ' + txt.slice(0, 300)).to.be.an('object');",
+                "  pm.expect(rr.serviceTier, 'outbound serviceTier: ' + JSON.stringify(rr).slice(0, 400)).to.eql('priority');",
+                "});"
+              ]
+            }
+          }
+        ],
+        "request": {
+          "method": "POST",
+          "header": [
+            {
+              "key": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "key": "x-bf-api-key",
+              "value": "Gemini API Key"
+            },
+            {
+              "key": "x-bf-send-back-raw-request",
+              "value": "true"
+            }
+          ],
+          "body": {
+            "mode": "raw",
+            "raw": "{\n  \"model\": \"gemini/gemini-3.8-flash-tier-priority\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with the single word: ok\"\n    }\n  ],\n  \"max_tokens\": 16\n}"
+          },
+          "url": {
+            "raw": "{{baseUrl}}/v1/chat/completions",
+            "host": [
+              "{{baseUrl}}"
+            ],
+            "path": [
+              "v1",
+              "chat",
+              "completions"
+            ]
+          }
+        }
+      },
+      {
+        "name": "/v1/chat/completions - alias service_tier sends the Vertex Priority PayGo header - vertex/gemini-3.7-flash-tier-priority",
+        "event": [
+          {
+            "listen": "test",
+            "script": {
+              "type": "text/javascript",
+              "exec": [
+                "var txt = pm.response.text() || '';",
+                "var body = {};",
+                "try { body = pm.response.json() || {}; } catch (e) { body = {}; }",
+                "pm.test('373.9 status is 200', function () {",
+                "  pm.expect(pm.response.code, 'failed: ' + txt.slice(0, 400)).to.equal(200);",
+                "});",
+                "pm.test('373.9 Vertex serves the request on Priority PayGo (trafficType ON_DEMAND_PRIORITY)', function () {",
+                "  pm.expect(body.service_tier, 'served service_tier: ' + txt.slice(0, 400)).to.eql('priority');",
+                "});"
+              ]
+            }
+          }
+        ],
+        "request": {
+          "method": "POST",
+          "header": [
+            {
+              "key": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "key": "x-bf-api-key",
+              "value": "Vertex Global (Gemini 3)"
+            },
+            {
+              "key": "x-bf-send-back-raw-request",
+              "value": "true"
+            }
+          ],
+          "body": {
+            "mode": "raw",
+            "raw": "{\n  \"model\": \"vertex/gemini-3.7-flash-tier-priority\",\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Reply with the single word: ok\"\n    }\n  ],\n  \"max_tokens\": 16\n}"
+          },
+          "url": {
+            "raw": "{{baseUrl}}/v1/chat/completions",
+            "host": [
+              "{{baseUrl}}"
+            ],
+            "path": [
+              "v1",
+              "chat",
+              "completions"
+            ]
+          }
+        }
+      }
+      ]
     }
   ]
 }
