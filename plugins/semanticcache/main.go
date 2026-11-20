@@ -184,6 +184,9 @@ type Plugin struct {
 	maintenanceCancel    context.CancelFunc
 	namespaceUnavailable atomic.Bool
 	maintenanceWake      chan struct{}
+	// writersMu protects pending recovery work. Each attempt consumes it before
+	// its RPC, so a later failure cannot be erased by that RPC's success.
+	namespaceRecoveryPending bool
 	// stopCh is closed by Cleanup to signal the background reaper loops to exit.
 	stopCh chan struct{}
 	// cleanupOnce guards Cleanup so close(stopCh) doesn't panic if the harness
@@ -400,6 +403,9 @@ func (plugin *Plugin) startRetentionCleanup() {
 			if !plugin.namespaceUnavailable.Load() || ctx.Err() != nil {
 				return
 			}
+			plugin.writersMu.Lock()
+			plugin.namespaceRecoveryPending = false
+			plugin.writersMu.Unlock()
 			createCtx, stop := context.WithTimeout(ctx, CreateNamespaceTimeout)
 			err := plugin.store.CreateNamespace(createCtx, plugin.config.VectorStoreNamespace,
 				plugin.config.Dimension, VectorStoreProperties)
@@ -417,6 +423,12 @@ func (plugin *Plugin) startRetentionCleanup() {
 				return
 			}
 			plugin.writersMu.Lock()
+			if plugin.namespaceRecoveryPending {
+				plugin.writersMu.Unlock()
+				retryTimer.Reset(time.Second)
+				retry = retryTimer.C
+				return
+			}
 			plugin.namespaceUnavailable.Store(false)
 			plugin.writersMu.Unlock()
 			lastError = ""
@@ -453,6 +465,7 @@ func (plugin *Plugin) startRetentionCleanup() {
 
 func (plugin *Plugin) requestNamespaceRecovery() {
 	plugin.writersMu.Lock()
+	plugin.namespaceRecoveryPending = true
 	changed := plugin.namespaceUnavailable.CompareAndSwap(false, true)
 	plugin.writersMu.Unlock()
 	if changed {

@@ -474,7 +474,7 @@ func (s *QdrantStore) DeleteAll(ctx context.Context, namespace string, queries [
 
 // DeleteByFilter implements FilteredDeleter without a client-side ID snapshot.
 // Equality accepts strings, booleans and signed integers; range comparisons
-// accept finite numbers that can be represented without integer precision loss.
+// accept finite numbers within the signed 64-bit domain, without integer precision loss.
 // Other operators are rejected rather than silently weakening the filter.
 func (s *QdrantStore) DeleteByFilter(ctx context.Context, namespace string, queries []Query) error {
 	if strings.TrimSpace(namespace) == "" {
@@ -538,6 +538,11 @@ func buildQdrantDeleteFilter(queries []Query) (*qdrant.Filter, error) {
 			}
 			if integer > 1<<53 || integer < -(1<<53) || math.IsNaN(number) || math.IsInf(number, 0) {
 				return nil, fmt.Errorf("delete filter %d: range value is not a finite, precisely representable number", i)
+			}
+			// An integer index clamps out-of-domain floating bounds. Reject them
+			// before dispatch so that conversion cannot widen a destructive filter.
+			if number >= float64(1<<63) || number < -float64(1<<63) {
+				return nil, fmt.Errorf("delete filter %d: range value is outside the signed 64-bit integer domain", i)
 			}
 			query.Value = number
 		default:

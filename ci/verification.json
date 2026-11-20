@@ -53,6 +53,7 @@
       "TestCacheAvailabilityCallerCancellationPreservesNamespace",
       "TestCacheAvailabilityHangingStartupAndCleanup",
       "TestCacheAvailabilityWriterAdmissionDuringRecovery",
+      "TestCacheAvailabilityRecoveryKeepsConcurrentNamespaceLoss",
       "TestCacheRetentionExpiredHitWakesSerialWorker",
       "TestCacheRetentionWakeBackoff"
     ],

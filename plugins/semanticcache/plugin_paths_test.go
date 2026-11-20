@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	bifrost "github.com/maximhq/bifrost/core"
@@ -185,6 +186,104 @@ func TestPreLLMHook_FallsBackToDirectWhenExecutorMissing(t *testing.T) {
 	if state.Embeddings != nil {
 		t.Fatalf("expected no embedding generated when executor missing, got %v", state.Embeddings)
 	}
+}
+
+func TestCacheAvailabilityRecoveryKeepsConcurrentNamespaceLoss(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var namespaceExists atomic.Bool
+		var namespaceCalls atomic.Int32
+		var lookups atomic.Int32
+		lookupStarted := make(chan struct{}, 2)
+		releaseLookup := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+		recreated := make(chan struct{})
+		releaseRecovery := make(chan struct{})
+		store := &cacheAvailabilityStore{observableStore: newObservableStore()}
+		store.create = func(ctx context.Context) error {
+			attempt := namespaceCalls.Add(1)
+			namespaceExists.Store(true)
+			if attempt == 2 {
+				// The namespace exists again, but hold the successful response
+				// while another in-flight lookup reports a second deletion.
+				close(recreated)
+				select {
+				case <-releaseRecovery:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		}
+		store.get = func(ctx context.Context, id string) (vectorstore.SearchResult, error) {
+			if lookup := lookups.Add(1); lookup <= 2 {
+				lookupStarted <- struct{}{}
+				select {
+				case <-releaseLookup[lookup-1]:
+				case <-ctx.Done():
+					return vectorstore.SearchResult{}, ctx.Err()
+				}
+			}
+			if !namespaceExists.Load() {
+				return vectorstore.SearchResult{}, vectorstore.ErrNamespaceNotFound
+			}
+			return store.observableStore.GetChunk(ctx, "", id)
+		}
+		store.add = func(context.Context) error {
+			if !namespaceExists.Load() {
+				return vectorstore.ErrNamespaceNotFound
+			}
+			return nil
+		}
+		plugin := cacheAvailabilityInit(t, store, &Config{Dimension: 1})
+		defer plugin.Cleanup()
+		req := cacheAvailabilityRequest()
+		lookupDone := make(chan error, 2)
+		for range 2 {
+			ctx := cacheAvailabilityContext()
+			defer ctx.Cancel()
+			go func() {
+				got, hit, err := plugin.PreLLMHook(ctx, req)
+				if err != nil || got != req || hit != nil {
+					lookupDone <- fmt.Errorf("namespace loss changed provider continuation: got=%p hit=%v error=%v", got, hit, err)
+					return
+				}
+				lookupDone <- nil
+			}()
+		}
+		// Both lookups entered before the first failure closed admission.
+		<-lookupStarted
+		<-lookupStarted
+		namespaceExists.Store(false)
+		close(releaseLookup[0])
+		if err := <-lookupDone; err != nil {
+			t.Fatal(err)
+		}
+		<-recreated
+		namespaceExists.Store(false)
+		close(releaseLookup[1])
+		if err := <-lookupDone; err != nil {
+			t.Fatal(err)
+		}
+		close(releaseRecovery)
+		synctest.Wait()
+		if plugin.cacheWriter("newer-namespace-loss", func(context.Context) {}) {
+			t.Fatal("successful recovery reopened writes after a newer namespace loss")
+		}
+		// Recovery must continue on its own, without a new request rediscovering
+		// the missing namespace and supplying another notification.
+		time.Sleep(time.Second)
+		synctest.Wait()
+		if namespaceCalls.Load() != 3 || !namespaceExists.Load() || plugin.namespaceUnavailable.Load() {
+			t.Fatalf("second namespace loss was not recovered: creates=%d exists=%v unavailable=%v", namespaceCalls.Load(), namespaceExists.Load(), plugin.namespaceUnavailable.Load())
+		}
+		writeCtx := cacheAvailabilityContext()
+		defer writeCtx.Cancel()
+		writeThroughCache(t, plugin, writeCtx, req)
+		replayCtx := cacheAvailabilityContext()
+		defer replayCtx.Cancel()
+		if !cacheHits(t, plugin, replayCtx, req) {
+			t.Fatal("recovered namespace did not resume writes and direct hits")
+		}
+	})
 }
 
 // -----------------------------------------------------------------------------

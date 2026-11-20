@@ -800,7 +800,7 @@ func newCacheAvailabilityQdrant(t *testing.T, stub *cacheAvailabilityQdrantStub)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if serveErr := server.Serve(listener); serveErr != nil {
+		if serveErr := server.Serve(listener); serveErr != nil && !errors.Is(serveErr, grpc.ErrServerStopped) {
 			t.Errorf("Qdrant test server: %v", serveErr)
 		}
 	}()
@@ -1312,11 +1312,22 @@ func TestCacheRetentionQdrantRejectsUnsafeFilters(t *testing.T) {
 		{name: "nan range", queries: []Query{guard, {Field: "expiry", Operator: QueryOperatorLessThan, Value: math.NaN()}}},
 		{name: "infinite range", queries: []Query{guard, {Field: "expiry", Operator: QueryOperatorLessThan, Value: math.Inf(1)}}},
 		{name: "rounded integer", queries: []Query{guard, {Field: "expiry", Operator: QueryOperatorLessThan, Value: int64(1<<53 + 1)}}},
+		{name: "float64 above integer domain", queries: []Query{guard, {Field: "rank", Operator: QueryOperatorGreaterThanOrEqual, Value: float64(1 << 63)}}},
+		{name: "float32 above integer domain", queries: []Query{guard, {Field: "rank", Operator: QueryOperatorGreaterThanOrEqual, Value: float32(1 << 63)}}},
+		{name: "float64 below integer domain", queries: []Query{guard, {Field: "rank", Operator: QueryOperatorLessThanOrEqual, Value: math.Nextafter(-float64(1<<63), math.Inf(-1))}}},
+		{name: "float32 below integer domain", queries: []Query{guard, {Field: "rank", Operator: QueryOperatorLessThanOrEqual, Value: math.Nextafter32(-float32(1<<63), float32(math.Inf(-1)))}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			_, err := buildQdrantDeleteFilter(tt.queries)
+			require.Error(t, err, "unsafe filter must be rejected before client dispatch")
 			require.Error(t, store.DeleteByFilter(context.Background(), "retention", tt.queries))
 		})
+	}
+	for _, bound := range []float64{-float64(1 << 63), math.Nextafter(float64(1<<63), 0), 2_000_000_000.5} {
+		filter, err := buildQdrantDeleteFilter([]Query{guard, {Field: "expiry", Operator: QueryOperatorGreaterThanOrEqual, Value: bound}})
+		require.NoError(t, err, "valid integer-domain and Unix-second bounds must remain usable")
+		require.Equal(t, bound, filter.Must[1].GetField().GetRange().GetGte())
 	}
 	require.Error(t, store.DeleteByFilter(context.Background(), "", []Query{guard}))
 	ctx, cancel := context.WithCancel(context.Background())

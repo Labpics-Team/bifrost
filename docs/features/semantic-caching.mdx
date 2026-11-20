@@ -367,9 +367,19 @@ bifrostConfig := schemas.BifrostConfig{
 
 Direct matching follows the upstream cache contract: text is lowercased and leading and trailing whitespace is trimmed before hashing. `Hello`, `hello`, and ` hello ` therefore share a direct entry when the other cache dimensions match. Internal whitespace is preserved. The upstream [normalization change](https://github.com/maximhq/bifrost/commit/ef07c60e3666523c468fb6ec9e40bf876bcbcb14) states its purpose as “for better cache hit rates”. Direct-only mode keeps this normalization; it does not select byte-for-byte text comparison.
 
-Parameters use the native per-request metadata extractors and deterministic hashing. Fields treated as sets, including tools, stop sequences, modalities and include flags, are sorted before hashing. [PR #3210](https://github.com/maximhq/bifrost/pull/3210) introduced this handling so order changes, including MCP map iteration, do not cause avoidable misses. This is a response-cache matching rule; it does not reorder the request sent to the provider or change [provider prompt caching](/features/prompt-caching).
+Parameters use the native per-request metadata extractors and deterministic hashing. Fields treated as sets, including tools, stop sequences, modalities and include flags, are sorted before hashing; tools are sorted by name. [PR #3210](https://github.com/maximhq/bifrost/pull/3210) introduced this handling to reduce avoidable misses from order changes, including MCP map iteration. This is a response-cache matching rule; it does not reorder the request sent to the provider or change [provider prompt caching](/features/prompt-caching).
 
 The fork adds no separate HTTP-header, query or raw-body identity to this contract. Response decoding is a separate concern: cached opaque `raw_response` JSON preserves its numbers, including integers larger than `2^53`, when replayed.
+
+### Inherited matching limitations
+
+The matching behavior retained from the [pinned upstream extractors](https://github.com/maximhq/bifrost/blob/7cb75fb2f8276ca48d0792c857fecb67b8879e2f/plugins/semanticcache/utils.go) has these Responses limitations:
+
+- Structured `tool_choice` contributes only `name`. An `allowed_tools` choice without a name does not add its mode or allowed-tool list to the key.
+- `text.format` contributes only `type`; its JSON schema and `strict` flag do not participate in the key. Requests differing only in these omitted constraints can share a cache entry.
+- Tools with the same or missing names retain their input order during sorting. Reordering them can cause an additional cache miss.
+
+These are candidates for upstream fixes, separate from the fork's retained availability, conditional expiration cleanup, and lossless replay corrections.
 
 ### Direct-only setup
 
