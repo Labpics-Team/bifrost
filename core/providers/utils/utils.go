@@ -460,7 +460,6 @@ func makeRequestWithDoFunc(ctx context.Context, do func() error) (time.Duration,
 // path it blocks until the background client.Do goroutine finishes, preventing a data race
 // between the still-running goroutine and the caller's release of req/resp.
 func MakeRequestWithContext(ctx context.Context, client *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response) (time.Duration, *schemas.BifrostError, func()) {
-	ctx = providerRequestContext(ctx)
 	// Bound to the goroutine that runs client.Do: the binding must outlive a
 	// ctx-cancelled return of makeRequestWithDoFunc and be gone before the
 	// caller's wait() returns, since req is pooled.
@@ -475,7 +474,6 @@ func MakeRequestWithContext(ctx context.Context, client *fasthttp.Client, req *f
 // MakeRequestWithContextFollowRedirects is like MakeRequestWithContext but follows up to
 // maxRedirects HTTP redirects automatically (equivalent to curl's -L flag).
 func MakeRequestWithContextFollowRedirects(ctx context.Context, client *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response, maxRedirects int) (time.Duration, *schemas.BifrostError, func()) {
-	ctx = providerRequestContext(ctx)
 	unbind := bindRequestContext(req, ctx)
 	latency, bifrostErr, wait := makeRequestWithDoFunc(ctx, func() error {
 		defer unbind()
@@ -504,7 +502,6 @@ func MakeRequestWithContextFollowRedirects(ctx context.Context, client *fasthttp
 // Returns client.Do's error untouched so callers keep their own error
 // classification and latency bookkeeping.
 func DoStreamingRequest(ctx context.Context, client *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response) error {
-	ctx = providerRequestContext(ctx)
 	unbind := bindRequestContext(req, ctx)
 	startTime := time.Now()
 	err := client.Do(req, resp)
@@ -563,21 +560,13 @@ func DoHTTPRequest(client *http.Client, req *http.Request) (*http.Response, erro
 		}()
 		req = req.WithContext(attemptCtx)
 	}
-	req, outcome := trackHTTPRequest(req)
 	startTime := time.Now()
 	resp, err := client.Do(req)
 	schemas.AddUpstreamLatency(req.Context(), time.Since(startTime))
 	if err == nil && resp != nil && resp.Body != nil {
-		if !requestMethodIsIdempotent([]byte(req.Method)) {
-			state := requestOutcomeFromContext(req.Context())
-			if resp.ContentLength == 0 {
-				state.acknowledge(resp.StatusCode)
-			}
-			resp.Body = &requestOutcomeBody{ReadCloser: resp.Body, outcome: state, status: resp.StatusCode, remaining: resp.ContentLength}
-		}
 		resp.Body = &upstreamTimingBody{inner: resp.Body, ctx: req.Context()}
 	}
-	return resp, outcome(err)
+	return resp, err
 }
 
 // Deprecated: ConfigureRetry is now handled internally by ConfigureDialer.
@@ -3373,13 +3362,13 @@ func NewConfigurationError(message string) *schemas.BifrostError {
 // NewBifrostOperationError creates a standardized error for bifrost operation errors.
 // This helper reduces code duplication across providers that have bifrost operation errors.
 func NewBifrostOperationError(message string, err error) *schemas.BifrostError {
-	return preserveRequestOutcome(&schemas.BifrostError{
+	return &schemas.BifrostError{
 		IsBifrostError: true,
 		Error: &schemas.ErrorField{
 			Message: message,
 			Error:   err,
 		},
-	}, err)
+	}
 }
 
 // NewBifrostTimeoutError creates a standardized error for provider request timeout errors.
@@ -3388,7 +3377,7 @@ func NewBifrostOperationError(message string, err error) *schemas.BifrostError {
 func NewBifrostTimeoutError(message string, err error) *schemas.BifrostError {
 	statusCode := 504
 	errorType := schemas.RequestTimedOut
-	return preserveRequestOutcome(&schemas.BifrostError{
+	return &schemas.BifrostError{
 		IsBifrostError: true,
 		StatusCode:     &statusCode,
 		Error: &schemas.ErrorField{
@@ -3396,7 +3385,7 @@ func NewBifrostTimeoutError(message string, err error) *schemas.BifrostError {
 			Type:    &errorType,
 			Error:   err,
 		},
-	}, err)
+	}
 }
 
 // NewBifrostBadRequestError creates a standardized error for client-input validation
@@ -3470,7 +3459,7 @@ func IsInvalidRequestError(err error) bool {
 func NewBifrostUpstreamConnectionError(message string, err error) *schemas.BifrostError {
 	statusCode := 502
 	errorType := schemas.ProviderConnectionFailed
-	return preserveRequestOutcome(&schemas.BifrostError{
+	return &schemas.BifrostError{
 		IsBifrostError: false,
 		StatusCode:     &statusCode,
 		Error: &schemas.ErrorField{
@@ -3478,7 +3467,7 @@ func NewBifrostUpstreamConnectionError(message string, err error) *schemas.Bifro
 			Type:    &errorType,
 			Error:   err,
 		},
-	}, err)
+	}
 }
 
 // NewProviderAPIError creates a standardized error for provider API errors.
@@ -4461,13 +4450,13 @@ func ProcessAndSendError(
 		}
 	}
 	// Send scanner error through channel
-	bifrostError := preserveRequestOutcome(&schemas.BifrostError{
+	bifrostError := &schemas.BifrostError{
 		IsBifrostError: true,
 		Error: &schemas.ErrorField{
 			Message: fmt.Sprintf("Error reading stream: %v", err),
 			Error:   err,
 		},
-	}, err)
+	}
 	processedResponse, processedError := postHookRunner(ctx, nil, bifrostError)
 
 	if HandleStreamControlSkip(processedError) {
@@ -4500,9 +4489,11 @@ func ProcessAndSendError(
 // layer from a properly terminated body — so truncation can only be detected
 // semantically, by the absence of a terminal marker.
 //
-// Even before a content chunk reaches the caller, the provider may already have
-// generated billable output. Preserve that unknown outcome through the first
-// chunk check so neither retries nor fallbacks replay the inference.
+// The error is deliberately built as a retryable upstream connection failure
+// (502, IsBifrostError=false): when nothing has been forwarded yet this becomes
+// the stream's first chunk, so CheckFirstStreamChunkForError converts it into a
+// synchronous error and executeRequestWithRetries can retry or fall back. An
+// IsBifrostError=true error would break that retry loop instead (see #4496).
 func SendStreamTruncatedError(
 	ctx *schemas.BifrostContext,
 	postHookRunner schemas.PostHookRunner,
@@ -4515,8 +4506,7 @@ func SendStreamTruncatedError(
 		logger.Warn("Stream ended without a terminal marker; treating as truncated upstream stream")
 	}
 
-	truncatedErr := NewBifrostUpstreamConnectionError(schemas.ErrProviderStreamTruncated,
-		&requestOutcomeUnknownError{cause: io.ErrUnexpectedEOF})
+	truncatedErr := NewBifrostUpstreamConnectionError(schemas.ErrProviderStreamTruncated, io.ErrUnexpectedEOF)
 
 	if ShouldSendBackRawRequest(ctx, false) && len(jsonBody) > 0 {
 		truncatedErr.ExtraFields.RawRequest = compactRawJSON(jsonBody)

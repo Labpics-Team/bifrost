@@ -28,10 +28,25 @@ func TestRoutingModelsHTTPAdmission(t *testing.T) {
 		return tables.TableVirtualKey{ID: id, Name: id, Value: *schemas.NewSecretVar("sk-bf-" + id), IsActive: bifrost.Ptr(true), ProviderConfigs: []tables.TableVirtualKeyProviderConfig{{Provider: "openai", AllowedModels: schemas.WhiteList{"*"}, AllowAllKeys: true}}}
 	}
 	active, inactive, expired := newKey("active"), newKey("inactive"), newKey("expired")
+	rateLimited, budgetExhausted := newKey("rate-limited"), newKey("budget-exhausted")
+	now := time.Now()
+	rate := tables.TableRateLimit{
+		ID: "spent-rate", CreatedAt: now, RequestLastReset: now,
+		RequestMaxLimit: bifrost.Ptr(int64(1)), RequestCurrentUsage: 1, RequestResetDuration: bifrost.Ptr("1h"),
+	}
+	rateLimited.RateLimitID, rateLimited.RateLimit = &rate.ID, &rate
+	budget := tables.TableBudget{
+		ID: "spent-budget", VirtualKeyID: &budgetExhausted.ID, CreatedAt: now, LastReset: now,
+		MaxLimit: 1, CurrentUsage: 1, ResetDuration: "1h",
+	}
+	budgetExhausted.Budgets = []tables.TableBudget{budget}
 	inactive.IsActive = bifrost.Ptr(false)
 	expired.ExpiresAt = bifrost.Ptr(time.Now().Add(-time.Hour))
 	mandatory, headers := true, []string{"x-catalog-client"}
-	gov, err := governance.Init(context.Background(), &governance.Config{IsVkMandatory: &mandatory, RequiredHeaders: &headers}, log, nil, &configstore.GovernanceConfig{VirtualKeys: []tables.TableVirtualKey{active, inactive, expired}}, nil, nil, nil)
+	gov, err := governance.Init(context.Background(), &governance.Config{IsVkMandatory: &mandatory, RequiredHeaders: &headers}, log, nil, &configstore.GovernanceConfig{
+		VirtualKeys: []tables.TableVirtualKey{active, inactive, expired, rateLimited, budgetExhausted},
+		RateLimits:  []tables.TableRateLimit{rate}, Budgets: []tables.TableBudget{budget},
+	}, nil, nil, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, gov.Cleanup()) })
 	routes, err := routing.Init(context.Background(), nil, log, nil, gov)
@@ -77,6 +92,39 @@ func TestRoutingModelsHTTPAdmission(t *testing.T) {
 		status, body := read(tc.key, "", tc.header)
 		require.Equal(t, tc.status, status, string(body))
 	}
+	for _, tc := range []struct {
+		key             string
+		inferenceStatus int
+	}{{"sk-bf-rate-limited", 429}, {"sk-bf-budget-exhausted", 402}} {
+		t.Run(tc.key, func(t *testing.T) {
+			status, body := read(tc.key, "", true)
+			require.Equal(t, 200, status, string(body))
+			var catalog schemas.BifrostListModelsResponse
+			require.NoError(t, json.Unmarshal(body, &catalog))
+			require.Equal(t, []schemas.Model{{ID: "A"}, {ID: "B"}}, catalog.Data)
+
+			// Reusing the caller context after catalog discovery must still enforce
+			// inference spending limits; metadata cannot grant an exemption to it.
+			httpCtx := &fasthttp.RequestCtx{}
+			httpCtx.Request.Header.Set("x-bf-vk", tc.key)
+			httpCtx.Request.Header.Set("x-catalog-client", "test")
+			caller, cancel := lib.ConvertToBifrostContext(httpCtx, config)
+			defer cancel()
+			_, catalogErr := s.ListRoutingModels(caller, &schemas.BifrostListModelsRequest{})
+			require.Nil(t, catalogErr)
+			_, short, hookErr := gov.PreLLMHook(caller, &schemas.BifrostRequest{
+				RequestType: schemas.ChatCompletionRequest,
+				ChatRequest: &schemas.BifrostChatRequest{Provider: schemas.OpenAI, Model: "physical"},
+			})
+			require.NoError(t, hookErr)
+			require.NotNil(t, short)
+			require.NotNil(t, short.Error)
+			require.NotNil(t, short.Error.StatusCode)
+			require.Equal(t, tc.inferenceStatus, *short.Error.StatusCode)
+		})
+	}
+	require.Equal(t, int64(1), gov.GetGovernanceStore().LoadRateLimit(context.Background(), rate.ID).RequestCurrentUsage)
+	require.Equal(t, float64(1), gov.GetGovernanceStore().LoadBudget(context.Background(), budget.ID).CurrentUsage)
 	gov.GetGovernanceStore().DeleteVirtualKeyInMemory(context.Background(), active.ID)
 	status, body = read("sk-bf-active", "", true)
 	require.Equal(t, 401, status, string(body))

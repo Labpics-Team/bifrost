@@ -1,7 +1,8 @@
 # Bifrost AI Gateway
 
-> **Labpics fork:** the maintained branch is `labpics`. Production fixes live in
-> the source tree. See [fork contracts, development and releases](FORK.md).
+> **Labpics fork:** the maintained branch is `labpics`. The existing Labpics fixes
+> are integrated into the source tree. Production still uses Infra's upstream
+> and patch build. See [fork contracts, development and delivery](FORK.md).
 > The upstream project and its Apache 2.0 license are preserved below.
 
 <a href="https://trendshift.io/repositories/14529?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-14529" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/14529" alt="maximhq%2Fbifrost | Trendshift" width="250" height="55"/></a>

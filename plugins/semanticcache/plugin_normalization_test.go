@@ -6,24 +6,25 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
-// TestTextNormalizationDirectCache tests that text normalization works correctly
-// for direct cache (hash-based) matching across all input types
-func TestTextNormalizationDirectCache(t *testing.T) {
+// TestDirectCachePreservesExactText keeps case and whitespace significant for
+// direct replay, while identical requests still hit the cache.
+func TestDirectCachePreservesExactText(t *testing.T) {
 	t.Parallel()
 	setup := NewTestSetup(t)
 	defer setup.Cleanup()
 
 	t.Run("ChatCompletion", func(t *testing.T) {
-		testChatCompletionNormalization(t, setup)
+		testChatCompletionExactInput(t, setup)
 	})
 
 	t.Run("Speech", func(t *testing.T) {
-		testSpeechNormalization(t, setup)
+		testSpeechExactInput(t, setup)
 	})
 }
 
-func testChatCompletionNormalization(t *testing.T, setup *TestSetup) {
-	ctx := CreateContextWithCacheKey(t, "test-chat-normalization")
+func testChatCompletionExactInput(t *testing.T, setup *TestSetup) {
+	ctx := CreateContextWithCacheKeyAndType(t, "test-chat-exact-input", CacheTypeDirect)
+	defer ctx.Cancel()
 
 	// Test cases with different case and whitespace variations
 	testCases := []struct {
@@ -107,7 +108,7 @@ func testChatCompletionNormalization(t *testing.T, setup *TestSetup) {
 	AssertNoCacheHit(t, &schemas.BifrostResponse{ChatResponse: response1})
 	WaitForCache(setup.Plugin)
 
-	// Test all other variations should hit cache due to normalization
+	// Each changed input must miss the direct cache, then replay under its own ID.
 	for i := 1; i < len(testCases); i++ {
 		tc := testCases[i]
 		t.Logf("Testing variation '%s' with user: '%s', system: '%s'", tc.name, tc.userMsg, tc.systemMsg)
@@ -121,14 +122,19 @@ func testChatCompletionNormalization(t *testing.T, setup *TestSetup) {
 			t.Fatalf("Response for case '%s' is invalid", tc.name)
 		}
 
-		// Should be cache hit due to normalization
-		AssertCacheHit(t, &schemas.BifrostResponse{ChatResponse: response}, "direct")
-		t.Logf("✓ Cache hit for '%s' variation", tc.name)
+		AssertNoCacheHit(t, &schemas.BifrostResponse{ChatResponse: response})
+		WaitForCache(setup.Plugin)
+		replay, replayErr := setup.Client.ChatCompletionRequest(ctx, requests[i])
+		if replayErr != nil || replay == nil || len(replay.Choices) == 0 {
+			t.Fatalf("Exact replay for case %q failed: %v", tc.name, replayErr)
+		}
+		AssertCacheHit(t, &schemas.BifrostResponse{ChatResponse: replay}, "direct")
 	}
 }
 
-func testSpeechNormalization(t *testing.T, setup *TestSetup) {
-	ctx := CreateContextWithCacheKey(t, "test-speech-normalization")
+func testSpeechExactInput(t *testing.T, setup *TestSetup) {
+	ctx := CreateContextWithCacheKeyAndType(t, "test-speech-exact-input", CacheTypeDirect)
+	defer ctx.Cancel()
 
 	// Test cases with different case and whitespace variations for speech input
 	testCases := []struct {
@@ -168,7 +174,7 @@ func testSpeechNormalization(t *testing.T, setup *TestSetup) {
 	AssertNoCacheHit(t, &schemas.BifrostResponse{SpeechResponse: response1})
 	WaitForCache(setup.Plugin)
 
-	// Test all other variations should hit cache due to normalization
+	// Each changed input must miss the direct cache, then replay under its own ID.
 	for i := 1; i < len(testCases); i++ {
 		tc := testCases[i]
 		t.Logf("Testing variation '%s' with input: '%s'", tc.name, tc.input)
@@ -182,21 +188,27 @@ func testSpeechNormalization(t *testing.T, setup *TestSetup) {
 			t.Fatalf("Response for case '%s' is invalid", tc.name)
 		}
 
-		// Should be cache hit due to normalization
-		AssertCacheHit(t, &schemas.BifrostResponse{SpeechResponse: response}, "direct")
-		t.Logf("✓ Cache hit for '%s' variation", tc.name)
+		AssertNoCacheHit(t, &schemas.BifrostResponse{SpeechResponse: response})
+		WaitForCache(setup.Plugin)
+		replay, replayErr := setup.Client.SpeechRequest(ctx, requests[i])
+		if replayErr != nil || replay == nil {
+			t.Fatalf("Exact replay for case %q failed: %v", tc.name, replayErr)
+		}
+		AssertCacheHit(t, &schemas.BifrostResponse{SpeechResponse: replay}, "direct")
 	}
 }
 
-// TestChatCompletionContentBlocksNormalization tests normalization for content blocks
-func TestChatCompletionContentBlocksNormalization(t *testing.T) {
+// TestDirectCachePreservesExactContentBlocks applies the same exact-input
+// contract to text carried in content blocks.
+func TestDirectCachePreservesExactContentBlocks(t *testing.T) {
 	t.Parallel()
 	setup := NewTestSetup(t)
 	defer setup.Cleanup()
 
-	ctx := CreateContextWithCacheKey(t, "test-content-blocks-normalization")
+	ctx := CreateContextWithCacheKeyAndType(t, "test-content-blocks-exact-input", CacheTypeDirect)
+	defer ctx.Cancel()
 
-	// Test cases with content blocks having different text normalization
+	// Test cases with distinct case and whitespace in content blocks.
 	testCases := []struct {
 		name       string
 		textBlocks []string
@@ -266,7 +278,7 @@ func TestChatCompletionContentBlocksNormalization(t *testing.T) {
 	AssertNoCacheHit(t, &schemas.BifrostResponse{ChatResponse: response1})
 	WaitForCache(setup.Plugin)
 
-	// Test all other variations should hit cache due to normalization
+	// Each changed input must miss the direct cache, then replay under its own ID.
 	for i := 1; i < len(testCases); i++ {
 		tc := testCases[i]
 		t.Logf("Testing variation '%s' with content blocks: %v", tc.name, tc.textBlocks)
@@ -280,9 +292,13 @@ func TestChatCompletionContentBlocksNormalization(t *testing.T) {
 			t.Fatalf("Response for case '%s' is invalid", tc.name)
 		}
 
-		// Should be cache hit due to normalization
-		AssertCacheHit(t, &schemas.BifrostResponse{ChatResponse: response}, "direct")
-		t.Logf("✓ Cache hit for '%s' variation", tc.name)
+		AssertNoCacheHit(t, &schemas.BifrostResponse{ChatResponse: response})
+		WaitForCache(setup.Plugin)
+		replay, replayErr := setup.Client.ChatCompletionRequest(ctx, requests[i])
+		if replayErr != nil || replay == nil || len(replay.Choices) == 0 {
+			t.Fatalf("Exact replay for case %q failed: %v", tc.name, replayErr)
+		}
+		AssertCacheHit(t, &schemas.BifrostResponse{ChatResponse: replay}, "direct")
 	}
 }
 
@@ -292,7 +308,8 @@ func TestNormalizationWithSemanticCache(t *testing.T) {
 	setup := NewTestSetup(t)
 	defer setup.Cleanup()
 
-	ctx := CreateContextWithCacheKey(t, "test-normalization-semantic")
+	ctx := CreateContextWithCacheKeyAndType(t, "test-normalization-semantic", CacheTypeSemantic)
+	defer ctx.Cancel()
 
 	// Make first request with original text
 	originalRequest := CreateBasicChatRequest("What is Machine Learning?", 0.5, 50)
@@ -320,9 +337,9 @@ func TestNormalizationWithSemanticCache(t *testing.T) {
 		}
 	}
 
-	// This should be a direct cache hit since the normalized text is identical
-	AssertCacheHit(t, &schemas.BifrostResponse{ChatResponse: response2}, "direct")
-	t.Log("✓ Direct cache hit with normalized text")
+	// Normalization belongs to the semantic path; it must not be a direct hit.
+	AssertCacheHit(t, &schemas.BifrostResponse{ChatResponse: response2}, "semantic")
+	t.Log("✓ Semantic cache hit with normalized text")
 
 	// Test with semantically similar but different text
 	semanticRequest := CreateBasicChatRequest("can you explain machine learning concepts?", 0.5, 50)

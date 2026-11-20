@@ -80,14 +80,72 @@ func TestCacheReplayPreservesNativeContent(t *testing.T) {
 	}
 }
 
+// Lowercasing changes the Python string literal and therefore the correct answer.
+// Exercise cache replay with a deterministic provider, including identical replays,
+// so a difference in hashes alone cannot make this regression pass.
+func TestDirectCacheKeepsCaseSensitiveCodeDistinct(t *testing.T) {
+	const upper = "What does Python print for print('US'.isupper())? Reply with the output only."
+	const lower = "What does Python print for print('us'.isupper())? Reply with the output only."
+	answers := map[string]string{upper: "True", lower: "False"}
+	plugin := identityScopeTestPlugin(t, newObservableStore(), "")
+	defer plugin.Cleanup()
+	providerCalls := 0
+	for _, tc := range []struct {
+		prompt string
+		cached bool
+		calls  int
+	}{
+		{upper, false, 1},
+		{upper, true, 1},
+		{lower, false, 2},
+		{lower, true, 2},
+	} {
+		ctx := identityContext(t, "case-sensitive-code", identityRef{vk: "tenant"})
+		ctx.SetValue(CacheTypeKey, CacheTypeDirect)
+		defer ctx.Cancel()
+		_, cached, err := plugin.PreLLMHook(ctx, identityTestChatRequest(tc.prompt, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var response *schemas.BifrostResponse
+		if cached != nil {
+			response = cached.Response
+		} else {
+			providerCalls++
+			response = identityTestChatResponse(answers[tc.prompt])
+			if _, _, err := plugin.PostLLMHook(ctx, response, nil); err != nil {
+				t.Fatal(err)
+			}
+			plugin.WaitForPendingOperations()
+		}
+		if response == nil || response.ChatResponse == nil || len(response.ChatResponse.Choices) != 1 {
+			t.Fatalf("missing response for %q: %+v", tc.prompt, response)
+		}
+		got := *response.ChatResponse.Choices[0].Message.Content.ContentStr
+		if got != answers[tc.prompt] {
+			t.Fatalf("case-sensitive code received another prompt's answer: %q => %q, want %q (cached=%v, provider calls=%d)", tc.prompt, got, answers[tc.prompt], cached != nil, providerCalls)
+		}
+		if (cached != nil) != tc.cached || providerCalls != tc.calls {
+			t.Fatalf("%q: cached=%v, provider calls=%d; want cached=%v, calls=%d", tc.prompt, cached != nil, providerCalls, tc.cached, tc.calls)
+		}
+	}
+}
+
 func TestCacheIdentityExactInput(t *testing.T) {
 	p := identityScopeTestPlugin(t, newObservableStore(), "")
-	for _, operation := range []string{"chat", "embedding"} {
+	for _, operation := range []string{"chat", "chat content blocks", "speech", "embedding"} {
 		t.Run(operation, func(t *testing.T) {
 			seen := map[string]string{}
 			for _, text := range []string{"US", "us", " US", "US "} {
 				req := identityTestChatRequest(text, nil)
-				if operation == "embedding" {
+				switch operation {
+				case "chat content blocks":
+					req.ChatRequest.Input[0].Content = &schemas.ChatMessageContent{
+						ContentBlocks: []schemas.ChatContentBlock{{Type: schemas.ChatContentBlockTypeText, Text: schemas.Ptr(text)}},
+					}
+				case "speech":
+					req = &schemas.BifrostRequest{RequestType: schemas.SpeechRequest, SpeechRequest: CreateSpeechRequest(text, "alloy")}
+				case "embedding":
 					req = &schemas.BifrostRequest{RequestType: schemas.EmbeddingRequest, EmbeddingRequest: &schemas.BifrostEmbeddingRequest{
 						Input: []schemas.EmbeddingInputItem{{Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeText, Text: schemas.Ptr(text)}}}},
 					}}

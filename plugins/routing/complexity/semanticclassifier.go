@@ -1214,7 +1214,7 @@ func semanticFingerprint(config *AnalyzerConfig, exemplars []semanticExemplar, d
 	})
 
 	hash := sha256.New()
-	_, _ = fmt.Fprintf(hash, "semantic-router-v1\x00%s\x00%s\x00%d\x00", config.Semantic.Provider, config.Semantic.EmbeddingModel, dimension)
+	_, _ = fmt.Fprintf(hash, "semantic-router-v2\x00%s\x00%s\x00%d\x00", config.Semantic.Provider, config.Semantic.EmbeddingModel, dimension)
 	for _, exemplar := range canonical {
 		_, _ = fmt.Fprintf(hash, "%s\x00%s\x00", exemplar.Tier, exemplar.Phrase)
 	}
@@ -1296,6 +1296,7 @@ var semanticVectorStoreProperties = map[string]vectorstore.VectorStoreProperties
 	semanticMetadataKind: {
 		DataType:    vectorstore.VectorStorePropertyTypeString,
 		Description: "Semantic routing record kind: example or marker",
+		Filterable:  true,
 	},
 	semanticMetadataFingerprint: {
 		DataType:    vectorstore.VectorStorePropertyTypeString,

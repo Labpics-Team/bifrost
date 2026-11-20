@@ -8,6 +8,12 @@ import (
 // ListRoutingModels admits a catalog read through the same governance hook as
 // native list-models. It never invokes a provider or charges inference usage.
 func (s *BifrostHTTPServer) ListRoutingModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
+	// Like native list-models, this metadata read spends no inference quota.
+	// Keep the exemption local; identity and target permissions still apply.
+	ctx = schemas.NewBifrostContext(ctx, schemas.NoDeadline)
+	defer ctx.Cancel()
+	ctx.SetValue(schemas.BifrostContextKeySkipBudgetAndRateLimits, true)
+
 	unavailable := func() (*schemas.BifrostListModelsResponse, *schemas.BifrostError) {
 		return nil, &schemas.BifrostError{StatusCode: bifrost.Ptr(503), Error: &schemas.ErrorField{Message: "Routing model catalog unavailable"}}
 	}

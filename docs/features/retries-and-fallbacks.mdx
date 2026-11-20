@@ -135,6 +135,12 @@ With the defaults of `retry_backoff_initial = 500ms` and `retry_backoff_max = 50
 | Plugin-enforced block | No | - | - |
 | Cancelled request | No | - | - |
 
+### Transport recovery
+
+On a reused connection, the fasthttp transport may recover a failed request internally only when the method is idempotent or no request bytes were written. Once it has written a non-idempotent request, it returns the transport error to the normal retry loop instead of silently transmitting the request again. `net/http` keeps its standard transport and redirect behavior.
+
+This transport boundary does not disable configured retries or fallbacks. After a lost response or a timeout, a provider may already have processed the request; a configured retry can repeat generation and its cost. Client SDKs may also retry independently of Bifrost. These mechanisms do not guarantee a single execution.
+
 ### Configuring retries
 
 Retries are configured per-provider in `network_config`. The defaults are `max_retries: 0` (no retries), `retry_backoff_initial: 500` ms, and `retry_backoff_max: 5000` ms.

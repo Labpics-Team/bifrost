@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -4176,7 +4175,7 @@ func TestShouldContinueWithFallbacksHandlesIncompleteBifrostError(t *testing.T) 
 	fallback := schemas.Fallback{Provider: schemas.Anthropic}
 	fallbackErr := &schemas.BifrostError{StatusCode: &statusCode}
 
-	if !bifrost.shouldContinueWithFallbacks(nil, fallback, fallbackErr) {
+	if !bifrost.shouldContinueWithFallbacks(fallback, fallbackErr) {
 		t.Fatal("incomplete plugin error should allow the next fallback")
 	}
 }
@@ -4184,7 +4183,7 @@ func TestShouldContinueWithFallbacksHandlesIncompleteBifrostError(t *testing.T) 
 func TestShouldContinueWithFallbacksStopsOnNilError(t *testing.T) {
 	bifrost := &Bifrost{logger: NewDefaultLogger(schemas.LogLevelError)}
 	fallback := schemas.Fallback{Provider: schemas.Anthropic}
-	if bifrost.shouldContinueWithFallbacks(nil, fallback, nil) {
+	if bifrost.shouldContinueWithFallbacks(fallback, nil) {
 		t.Fatal("nil error should stop fallback processing")
 	}
 }
@@ -7904,9 +7903,6 @@ func TestScenarioEveryKeyRefusedIsTriedOnce(t *testing.T) {
 			}
 			_, err := scenarioChat(client, sessionCtx("s"), provA, "m")
 			requireStatus(t, err, tc.status, tc.errType)
-			if providerUtils.RequestOutcomeUnknown(err.Error.Error) {
-				t.Fatalf("all keys explicitly refused; exhaustion is a known failure: %v", err)
-			}
 			requireHits(t, u, map[string]int{"sk-a1": 1, "sk-a2": 1, "sk-a3": 1})
 			if keys := trailKeys(router.takeAttempts()[0].trail); len(keys) != 3 {
 				t.Fatalf("attempt trail %v, want each of the three keys once", keys)
@@ -9440,229 +9436,99 @@ func TestVideo_ListResumesFromNativeCursor(t *testing.T) {
 	}
 }
 
-// A missing reply is not proof that the accepted inference did not execute.
-func TestInferenceAcceptedRequestIsNotRepeated(t *testing.T) {
-	for _, mode := range []string{"unary-before-headers", "unary-partial-body", "unary-408", "unary-424", "unary-502", "unary-504", "stream-before-headers", "stream-headers-empty", "stream-preamble", "stream-after-prefix", "stream-read-error", "stream-read-error-post-hook"} {
-		t.Run(mode, func(t *testing.T) {
-			var accepted atomic.Int32
-			releaseStream := make(chan struct{})
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				body, err := io.ReadAll(r.Body)
-				if err != nil || len(body) == 0 {
-					t.Errorf("request was not completely accepted: %v", err)
-					return
-				}
-				accepted.Add(1)
-				if mode == "unary-502" || mode == "unary-504" || mode == "unary-408" || mode == "unary-424" {
-					status := http.StatusBadGateway
-					if mode == "unary-504" {
-						status = http.StatusGatewayTimeout
+func writeChatCompletionTestResponse(w http.ResponseWriter, stream bool) {
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"id\":\"done\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"useful\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+		return
+	}
+	fmt.Fprint(w, "{\"id\":\"done\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"useful\"},\"finish_reason\":\"stop\"}]}")
+}
+
+// A lost response may follow an accepted request. Retrying it is a configured
+// application decision; the transport must not add attempts outside that budget.
+func TestProviderRetryBudgetAfterLostResponse(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		for _, maxRetries := range []int{0, 1} {
+			t.Run(fmt.Sprintf("stream=%v/max_retries=%d", streaming, maxRetries), func(t *testing.T) {
+				var sends atomic.Int32
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					if err != nil || r.Method != http.MethodPost || len(body) == 0 {
+						t.Errorf("expected a complete POST body: method=%s length=%d error=%v", r.Method, len(body), err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
 					}
-					if mode == "unary-408" {
-						status = http.StatusRequestTimeout
+					if sends.Add(1) == 1 {
+						conn, _, err := w.(http.Hijacker).Hijack()
+						if err != nil {
+							t.Error(err)
+							return
+						}
+						conn.Close()
+						return
 					}
-					if mode == "unary-424" {
-						status = http.StatusFailedDependency
-					}
-					w.WriteHeader(status)
-					fmt.Fprint(w, `{"error":{"message":"upstream reply lost","type":"server_error"}}`)
-					return
-				}
-				if mode == "stream-headers-empty" || mode == "stream-preamble" {
-					w.Header().Set("Content-Type", "text/event-stream")
-					if mode == "stream-preamble" {
-						fmt.Fprint(w, "data: {\"id\":\"chatcmpl_fixture\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n")
-					}
-					w.(http.Flusher).Flush()
-				}
-				if mode == "unary-partial-body" {
-					w.Header().Set("Content-Type", "application/json")
-					w.Header().Set("Content-Length", "1000")
-					fmt.Fprint(w, `{"id":"part`)
-					w.(http.Flusher).Flush()
-				}
-				if mode == "stream-after-prefix" || strings.HasPrefix(mode, "stream-read-error") {
-					w.Header().Set("Content-Type", "text/event-stream")
-					if strings.HasPrefix(mode, "stream-read-error") {
-						w.Header().Set("Content-Length", "10000")
-					}
-					fmt.Fprint(w, "data: {\"id\":\"chatcmpl_fixture\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n")
-					w.(http.Flusher).Flush()
-					if strings.HasPrefix(mode, "stream-read-error") {
-						select {
-						case <-releaseStream:
-						case <-r.Context().Done():
+					writeChatCompletionTestResponse(w, streaming)
+				}))
+				defer upstream.Close()
+				account := NewMockAccount()
+				account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, upstream.URL)
+				account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = maxRetries
+				account.configs[schemas.OpenAI].NetworkConfig.RetryBackoffInitial = time.Millisecond
+				account.configs[schemas.OpenAI].NetworkConfig.RetryBackoffMax = time.Millisecond
+				account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{{ID: "fixture", Value: *schemas.NewSecretVar("fixture"), Models: schemas.WhiteList{"*"}, Weight: 100}})
+				client := newStreamTestClient(t, account)
+				ctx := ttftContext(0)
+				defer ctx.Cancel()
+				var requestErr *schemas.BifrostError
+				var content string
+				if streaming {
+					var stream chan *schemas.BifrostStreamChunk
+					stream, requestErr = client.ChatCompletionStreamRequest(ctx, ttftChatRequest())
+					if stream != nil {
+						var streamErrors []string
+						content, streamErrors = drainChatStream(stream)
+						if len(streamErrors) != 0 {
+							t.Fatalf("stream errors: %v", streamErrors)
 						}
 					}
-				}
-				conn, _, err := w.(http.Hijacker).Hijack()
-				if err == nil {
-					conn.Close()
-				}
-			}))
-			defer upstream.Close()
-			account := NewMockAccount()
-			account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, upstream.URL)
-			account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = 3
-			account.configs[schemas.OpenAI].NetworkConfig.RetryBackoffInitial = time.Millisecond
-			account.configs[schemas.OpenAI].NetworkConfig.RetryBackoffMax = time.Millisecond
-			account.configs[schemas.OpenAI].NetworkConfig.DefaultRequestTimeoutInSeconds = 3
-			account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{{ID: "synthetic", Value: *schemas.NewSecretVar("synthetic"), Models: schemas.WhiteList{"*"}, Weight: 100}})
-			var plugins []schemas.LLMPlugin
-			if mode == "stream-read-error-post-hook" {
-				plugins = append(plugins, &retryingPostHook{fakeRoutingPlugin: fakeRoutingPlugin{name: "post-hook-fallback"}, status: 429})
-			}
-			client := newStreamTestClient(t, account, plugins...)
-			ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(10*time.Second))
-			req := &schemas.BifrostChatRequest{Provider: schemas.OpenAI, Model: "gpt-4o-mini", Input: []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("execute once")}}}}
-			req.Fallbacks = []schemas.Fallback{{Provider: schemas.OpenAI, Model: "gpt-4.1-mini"}}
-			if strings.HasPrefix(mode, "stream-") {
-				stream, err := client.ChatCompletionStreamRequest(ctx, req)
-				close(releaseStream)
-				if stream != nil {
-					var streamErrors []*schemas.BifrostError
-					for chunk := range stream {
-						if chunk.BifrostError != nil {
-							streamErrors = append(streamErrors, chunk.BifrostError)
-						}
+				} else {
+					var response *schemas.BifrostChatResponse
+					response, requestErr = client.ChatCompletionRequest(ctx, ttftChatRequest())
+					if response != nil && len(response.Choices) != 0 && response.Choices[0].Message.Content != nil && response.Choices[0].Message.Content.ContentStr != nil {
+						content = *response.Choices[0].Message.Content.ContentStr
 					}
-					if err == nil && len(streamErrors) == 0 {
-						t.Error("truncated stream became success")
-					}
-					for _, streamErr := range streamErrors {
-						if streamErr.Error == nil || streamErr.Error.Code == nil || *streamErr.Error.Code != providerUtils.RequestOutcomeUnknownErrorCode {
-							t.Errorf("lost stream outcome is not public: %v", streamErr)
-						}
-					}
-				} else if err == nil {
-					t.Error("missing stream became success")
 				}
-			} else if _, err := client.ChatCompletionRequest(ctx, req); err == nil {
-				t.Error("unknown inference outcome became success")
-			}
-			if got := accepted.Load(); got != 1 {
-				t.Fatalf("upstream completely accepted %d inference bodies; want 1 despite max_retries=3", got)
-			}
-		})
+				if got := sends.Load(); got != int32(maxRetries+1) {
+					t.Fatalf("accepted POSTs=%d, want %d for max_retries=%d", got, maxRetries+1, maxRetries)
+				}
+				if maxRetries == 0 {
+					if requestErr == nil || content != "" {
+						t.Fatalf("lost response with no retries: content=%q error=%v", content, requestErr)
+					}
+				} else if requestErr != nil || content != "useful" {
+					t.Fatalf("configured retry: content=%q error=%v", content, requestErr)
+				}
+			})
+		}
 	}
 }
 
-type nilOutcomeJSON struct{ run func() }
-
-func (v nilOutcomeJSON) MarshalJSON() ([]byte, error) {
-	v.run()
-	return []byte("true"), nil
-}
-
-func TestConcurrentNilContextPreservesRequestOutcome(t *testing.T) {
-	for _, useNil := range []bool{true, false} {
-		t.Run(fmt.Sprintf("nil=%v", useNil), func(t *testing.T) {
-			aEntered, bEntered, releaseB := make(chan struct{}), make(chan struct{}), make(chan struct{})
-			var releaseOnce, onceA, onceB sync.Once
-			release := func() { releaseOnce.Do(func() { close(releaseB) }) }
-			defer release()
-			wait := func(ch <-chan struct{}) {
-				select {
-				case <-ch:
-				case <-time.After(5 * time.Second):
-					panic("request serialization did not finish")
-				}
-			}
-			var aMarshalCalls atomic.Int32
-			barrier := func(model string) {
-				switch model {
-				case "request-a":
-					if aMarshalCalls.Add(1) == 1 {
-						onceA.Do(func() { close(aEntered) })
-						wait(bEntered)
-					}
-				case "request-b":
-					onceB.Do(func() { close(bEntered) })
-					wait(releaseB)
-				}
-			}
-			var sentA atomic.Int32
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				var request struct {
-					Model string `json:"model"`
-				}
-				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-					t.Error(err)
-					return
-				}
-				if request.Model == "request-a" && sentA.Add(1) == 1 {
-					w.WriteHeader(http.StatusBadGateway)
-					fmt.Fprint(w, `{"error":{"message":"inference accepted; model reply lost","type":"server_error"}}`)
-					return
-				}
-				fmt.Fprint(w, `{"id":"done","choices":[{"index":0,"message":{"role":"assistant","content":"answer"},"finish_reason":"stop"}]}`)
-			}))
-			defer upstream.Close()
-			account := NewMockAccount()
-			account.AddProviderWithBaseURL(schemas.OpenAI, 2, 4, upstream.URL)
-			account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = 1
-			account.configs[schemas.OpenAI].NetworkConfig.RetryBackoffInitial = time.Millisecond
-			account.configs[schemas.OpenAI].NetworkConfig.RetryBackoffMax = time.Millisecond
-			account.configs[schemas.OpenAI].NetworkConfig.DefaultRequestTimeoutInSeconds = 3
-			account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{{ID: "fixture", Value: *schemas.NewSecretVar("fixture"), Models: schemas.WhiteList{"*"}, Weight: 100}})
-			client := newStreamTestClient(t, account)
-			client.ctx.SetValue(schemas.BifrostContextKeyPassthroughExtraParams, true)
-			request := func(model string) *schemas.BifrostChatRequest {
-				return &schemas.BifrostChatRequest{Provider: schemas.OpenAI, Model: model,
-					Params: &schemas.ChatParameters{ExtraParams: map[string]interface{}{"schedule": nilOutcomeJSON{run: func() { barrier(model) }}}},
-					Input:  []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("execute once")}}}}
-			}
-			var inputA, inputB *schemas.BifrostContext
-			if !useNil {
-				inputA = schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
-				inputB = schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
-				inputA.SetValue(schemas.BifrostContextKeyPassthroughExtraParams, true)
-				inputB.SetValue(schemas.BifrostContextKeyPassthroughExtraParams, true)
-				defer inputA.Cancel()
-				defer inputB.Cancel()
-			}
-			aDone, bDone := make(chan *schemas.BifrostError, 1), make(chan *schemas.BifrostError, 1)
-			go func() { _, err := client.ChatCompletionRequest(inputA, request("request-a")); aDone <- err }()
-			select {
-			case <-aEntered:
-			case early := <-aDone:
-				t.Fatalf("first request exited before serialization: %v", early)
-			case <-time.After(5 * time.Second):
-				t.Fatal("first request did not start serialization")
-			}
-			go func() { _, err := client.ChatCompletionRequest(inputB, request("request-b")); bDone <- err }()
-			var resultA *schemas.BifrostError
-			select {
-			case resultA = <-aDone:
-			case <-time.After(5 * time.Second):
-				t.Fatal("first request did not finish")
-			}
-			release()
-			select {
-			case err := <-bDone:
-				if err != nil {
-					t.Errorf("second request failed: %v", err)
-				}
-			case <-time.After(5 * time.Second):
-				t.Fatal("second request did not finish")
-			}
-			if sentA.Load() != 1 {
-				t.Errorf("accepted inference sent %d times; want one", sentA.Load())
-			}
-			if resultA == nil || resultA.AllowFallbacks == nil || *resultA.AllowFallbacks || resultA.Error == nil || resultA.Error.Code == nil || *resultA.Error.Code != providerUtils.RequestOutcomeUnknownErrorCode {
-				t.Errorf("first request lost its no-replay outcome: %v", resultA)
-			}
-		})
-	}
-}
+type requestContextTestKey struct{}
 
 type requestContextRecorder struct {
 	fakeRoutingPlugin
 	contexts chan *schemas.BifrostContext
+	barrier  <-chan struct{}
 }
 
-func (p *requestContextRecorder) PreRequestHook(ctx *schemas.BifrostContext, _ *schemas.BifrostRequest) error {
+func (p *requestContextRecorder) PreRequestHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) error {
+	_, model, _ := req.GetRequestFields()
+	ctx.SetValue(requestContextTestKey{}, model)
 	p.contexts <- ctx
+	if p.barrier != nil {
+		<-p.barrier
+	}
 	return nil
 }
 
@@ -9701,172 +9567,68 @@ func TestNilContextFiniteStreamCompletesBeforeRead(t *testing.T) {
 	}
 }
 
-type retryingPostHook struct {
-	fakeRoutingPlugin
-	status int
-}
-
-func (p *retryingPostHook) PostLLMHook(_ *schemas.BifrostContext, response *schemas.BifrostResponse, failure *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError, error) {
-	if failure != nil || response != nil && response.ChatResponse != nil && response.ChatResponse.Model == "primary" {
-		return nil, &schemas.BifrostError{StatusCode: schemas.Ptr(p.status), AllowFallbacks: schemas.Ptr(true),
-			Error: &schemas.ErrorField{Message: "configured post-hook requested a fallback"}}, nil
-	}
-	return response, nil, nil
-}
-
-func TestPostHookFallbackRequiresKnownRequestOutcome(t *testing.T) {
-	for _, status := range []int{400, 429, 503} {
-		for _, complete := range []bool{true, false} {
-			t.Run(fmt.Sprintf("status=%d/complete=%v", status, complete), func(t *testing.T) {
-				var primary, fallback atomic.Int32
-				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					var request struct{ Model string }
-					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-						t.Error(err)
-						return
-					}
-					if request.Model == "primary" {
-						primary.Add(1)
-						if !complete {
-							conn, _, err := w.(http.Hijacker).Hijack()
-							if err != nil {
-								t.Error(err)
-								return
-							}
-							conn.Close()
-							return
-						}
-					} else {
-						fallback.Add(1)
-					}
-					fmt.Fprintf(w, `{"model":%q,"choices":[{"index":0,"message":{"role":"assistant","content":"answer"},"finish_reason":"stop"}]}`, request.Model)
-				}))
-				defer upstream.Close()
-				account := NewMockAccount()
-				account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, upstream.URL)
-				account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = 0
-				account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{{ID: "fixture", Value: *schemas.NewSecretVar("fixture"), Models: schemas.WhiteList{"*"}, Weight: 100}})
-				client := newStreamTestClient(t, account, &retryingPostHook{fakeRoutingPlugin: fakeRoutingPlugin{name: "post-hook-fallback"}, status: status})
-				request := ttftChatRequest()
-				request.Model = "primary"
-				request.Fallbacks = []schemas.Fallback{{Provider: schemas.OpenAI, Model: "fallback"}}
-				response, err := client.ChatCompletionRequest(nil, request)
-				if complete {
-					if err != nil || response == nil || response.Model != "fallback" || fallback.Load() != 1 {
-						t.Fatalf("known response lost configured fallback: response=%v error=%v fallback=%d", response, err, fallback.Load())
-					}
-				} else if err == nil || err.Error == nil || err.Error.Code == nil || *err.Error.Code != providerUtils.RequestOutcomeUnknownErrorCode || fallback.Load() != 0 {
-					t.Fatalf("post-hook erased unknown outcome: response=%v error=%v fallback=%d", response, err, fallback.Load())
-				}
-				if primary.Load() != 1 {
-					t.Fatalf("primary executed %d times", primary.Load())
-				}
-			})
-		}
-	}
-}
-
-func TestInferenceExplicitRejectionCanRetry(t *testing.T) {
-	var accepted atomic.Int32
+func TestConcurrentNilContextRequestsHaveIsolatedState(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
-		if accepted.Add(1) == 1 {
-			w.WriteHeader(http.StatusTooManyRequests)
-			fmt.Fprint(w, `{"error":{"message":"rate limited","type":"rate_limit_error"}}`)
-			return
-		}
-		fmt.Fprint(w, `{"id":"done","choices":[{"index":0,"message":{"role":"assistant","content":"useful"},"finish_reason":"stop"}]}`)
+		writeChatCompletionTestResponse(w, false)
 	}))
 	defer upstream.Close()
 	account := NewMockAccount()
-	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, upstream.URL)
-	account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = 2
-	account.configs[schemas.OpenAI].NetworkConfig.RetryBackoffInitial = time.Millisecond
-	account.configs[schemas.OpenAI].NetworkConfig.RetryBackoffMax = time.Millisecond
+	account.AddProviderWithBaseURL(schemas.OpenAI, 2, 4, upstream.URL)
+	account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = 0
 	account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{{ID: "fixture", Value: *schemas.NewSecretVar("fixture"), Models: schemas.WhiteList{"*"}, Weight: 100}})
-	client := newStreamTestClient(t, account)
-	response, err := client.ChatCompletionRequest(ttftContext(0), ttftChatRequest())
-	if err != nil || response == nil || *response.Choices[0].Message.Content.ContentStr != "useful" || accepted.Load() != 2 {
-		t.Fatalf("explicit rejection must permit a useful retry: response=%v error=%v sends=%d", response, err, accepted.Load())
+	barrier := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(barrier) }) }
+	defer release()
+	recorder := &requestContextRecorder{fakeRoutingPlugin: fakeRoutingPlugin{name: "request-context"}, contexts: make(chan *schemas.BifrostContext, 2), barrier: barrier}
+	client := newStreamTestClient(t, account, recorder)
+	client.ctx.SetValue(requestContextTestKey{}, "client")
+	done := make(chan *schemas.BifrostError, 2)
+	for _, model := range []string{"request-a", "request-b"} {
+		go func() {
+			request := ttftChatRequest()
+			request.Model = model
+			_, err := client.ChatCompletionRequest(nil, request)
+			done <- err
+		}()
 	}
-}
-
-func TestInferencePreSendFailureCanFallback(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	unreachable := "http://" + ln.Addr().String()
-	ln.Close()
-	fallback := newTTFTUpstream()
-	upstream := httptest.NewServer(fallback.slowAnthropicHandler(0))
-	defer upstream.Close()
-	account := NewMockAccount()
-	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, unreachable)
-	account.AddProviderWithBaseURL(schemas.Anthropic, 1, 1, upstream.URL)
-	for _, p := range []schemas.ModelProvider{schemas.OpenAI, schemas.Anthropic} {
-		account.configs[p].NetworkConfig.MaxRetries = 1
-		account.configs[p].NetworkConfig.RetryBackoffInitial = time.Millisecond
-		account.configs[p].NetworkConfig.RetryBackoffMax = time.Millisecond
-		account.SetKeysForProvider(p, []schemas.Key{{ID: string(p), Value: *schemas.NewSecretVar("fixture"), Models: schemas.WhiteList{"*"}, Weight: 100}})
-	}
-	client := newStreamTestClient(t, account)
-	stream, bifrostErr := client.ChatCompletionStreamRequest(ttftContext(0), ttftChatRequest(anthropicFallback))
-	if bifrostErr != nil {
-		t.Fatal(bifrostErr)
-	}
-	content, errs := drainChatStream(stream)
-	if content != "hello" || len(errs) != 0 || fallback.hits.Load() != 1 {
-		t.Fatalf("pre-send failure must allow a useful fallback: content=%q errors=%v sends=%d", content, errs, fallback.hits.Load())
-	}
-}
-
-func TestInferenceLostFallbackReplyStopsTheChain(t *testing.T) {
-	var mu sync.Mutex
-	hits := map[string]int{}
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var request struct {
-			Model string `json:"model"`
+	var contexts []*schemas.BifrostContext
+	for range 2 {
+		select {
+		case ctx := <-recorder.contexts:
+			contexts = append(contexts, ctx)
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent requests did not reach the hook")
 		}
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			t.Error(err)
-			return
-		}
-		mu.Lock()
-		hits[request.Model]++
-		mu.Unlock()
-		switch request.Model {
-		case "primary":
-			w.WriteHeader(404)
-			fmt.Fprint(w, `{"error":{"message":"model unavailable","code":"model_not_found"}}`)
-		case "fallback-1":
-			conn, _, err := w.(http.Hijacker).Hijack()
+	}
+	if contexts[0] == contexts[1] || contexts[0] == client.ctx || contexts[1] == client.ctx {
+		t.Error("nil-context requests shared mutable context")
+	}
+	models := map[any]bool{}
+	for _, ctx := range contexts {
+		models[ctx.Value(requestContextTestKey{})] = true
+	}
+	if !models["request-a"] || !models["request-b"] || client.ctx.Value(requestContextTestKey{}) != "client" {
+		t.Error("request-local state leaked between concurrent requests or into the client")
+	}
+	release()
+	for range 2 {
+		select {
+		case err := <-done:
 			if err != nil {
-				t.Error(err)
-				return
+				t.Errorf("request failed: %v", err)
 			}
-			conn.Close()
-		default:
-			fmt.Fprint(w, `{"choices":[{"message":{"role":"assistant","content":"unexpected replay"},"finish_reason":"stop"}]}`)
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent requests did not complete")
 		}
-	}))
-	defer upstream.Close()
-	account := NewMockAccount()
-	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, upstream.URL)
-	account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = 3
-	account.configs[schemas.OpenAI].NetworkConfig.RetryBackoffInitial = time.Millisecond
-	account.configs[schemas.OpenAI].NetworkConfig.RetryBackoffMax = time.Millisecond
-	account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{{ID: "fixture", Value: *schemas.NewSecretVar("fixture"), Models: schemas.WhiteList{"*"}, Weight: 100}})
-	client := newStreamTestClient(t, account)
-	req := ttftChatRequest(schemas.Fallback{Provider: schemas.OpenAI, Model: "fallback-1"}, schemas.Fallback{Provider: schemas.OpenAI, Model: "fallback-2"})
-	req.Model = "primary"
-	_, err := client.ChatCompletionRequest(ttftContext(0), req)
-	if err == nil {
-		t.Fatal("unknown outcome became success")
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if hits["primary"] != 1 || hits["fallback-1"] != 1 || hits["fallback-2"] != 0 {
-		t.Fatalf("physical sends=%v, want primary=1 fallback-1=1 fallback-2=0", hits)
+	for _, ctx := range contexts {
+		if ctx.Err() != context.Canceled {
+			t.Error("completed request retained its owned context")
+		}
+	}
+	if client.ctx.Err() != nil {
+		t.Error("request completion cancelled the client")
 	}
 }

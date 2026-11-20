@@ -846,42 +846,48 @@ func TestDirect(t *testing.T) {
 		assertDifferentCacheID(t, lc, 7, idA, idB)
 	})
 
-	// 1.26 normalization_case — getNormalizedInputForCaching lowercases + trims
-	// (utils.go:122). "Hello" and "hello " hash identically.
-	t.Run("1.26_normalization_case", func(t *testing.T) {
+	// 1.26 exact_case — direct identity preserves case; identical replays still hit.
+	t.Run("1.26_exact_case", func(t *testing.T) {
 		t.Parallel()
-		lc := newLogCtx("direct", "1.26_normalization_case")
+		lc := newLogCtx("direct", "1.26_exact_case")
 		key := "phase1-k26"
+		headers := cacheHeaders{Key: key, Type: "direct"}
 
-		reqA := simpleChat(cfg.OpenAIModel, "Hello, who wrote 1984?")
-		reqB := simpleChat(cfg.OpenAIModel, "hello, who wrote 1984? ")
+		reqA := simpleChat(cfg.OpenAIModel, "What does Python print for print('US'.isupper())?")
+		reqB := simpleChat(cfg.OpenAIModel, "What does Python print for print('us'.isupper())?")
 
-		respA := postChat(t, lc, 1, reqA, cacheHeaders{Key: key})
+		respA := postChat(t, lc, 1, reqA, headers)
 		idA := assertMiss(t, lc, 2, respA)
 		waitForCacheWrite(t, lc, 3)
 
-		respB := postChat(t, lc, 4, reqB, cacheHeaders{Key: key})
-		idB := assertHit(t, lc, 5, respB, "direct")
-		assertSameCacheID(t, lc, 6, idB, idA)
+		respB := postChat(t, lc, 4, reqB, headers)
+		idB := assertMiss(t, lc, 5, respB)
+		assertDifferentCacheID(t, lc, 6, idA, idB)
+		waitForCacheWrite(t, lc, 7)
+		idReplay := assertHit(t, lc, 9, postChat(t, lc, 8, reqB, headers), "direct")
+		assertSameCacheID(t, lc, 10, idReplay, idB)
 	})
 
-	// 1.27 normalization_whitespace — leading/trailing whitespace trimmed; inner
-	// whitespace preserved verbatim.
-	t.Run("1.27_normalization_whitespace", func(t *testing.T) {
+	// 1.27 exact_whitespace — leading/trailing whitespace remains part of the input.
+	t.Run("1.27_exact_whitespace", func(t *testing.T) {
 		t.Parallel()
-		lc := newLogCtx("direct", "1.27_normalization_whitespace")
+		lc := newLogCtx("direct", "1.27_exact_whitespace")
 		key := "phase1-k27"
+		headers := cacheHeaders{Key: key, Type: "direct"}
 
 		reqA := simpleChat(cfg.OpenAIModel, "  Name one type of pasta.  ")
 		reqB := simpleChat(cfg.OpenAIModel, "Name one type of pasta.")
 
-		respA := postChat(t, lc, 1, reqA, cacheHeaders{Key: key})
+		respA := postChat(t, lc, 1, reqA, headers)
 		idA := assertMiss(t, lc, 2, respA)
 		waitForCacheWrite(t, lc, 3)
 
-		respB := postChat(t, lc, 4, reqB, cacheHeaders{Key: key})
-		idB := assertHit(t, lc, 5, respB, "direct")
-		assertSameCacheID(t, lc, 6, idB, idA)
+		respB := postChat(t, lc, 4, reqB, headers)
+		idB := assertMiss(t, lc, 5, respB)
+		assertDifferentCacheID(t, lc, 6, idA, idB)
+		waitForCacheWrite(t, lc, 7)
+		idReplay := assertHit(t, lc, 9, postChat(t, lc, 8, reqB, headers), "direct")
+		assertSameCacheID(t, lc, 10, idReplay, idB)
 	})
 
 	// 1.28 unicode_prompt — non-ASCII + emoji round-trips through hash + cache.
@@ -1186,13 +1192,14 @@ func TestDirect(t *testing.T) {
 		assertDifferentCacheID(t, lc, 5, idA, idB)
 	})
 
-	// 1.48 tools_order_independent — Tools is hashed as a sorted set (utils.go:801-813),
-	// so reordering identical tool definitions must NOT change the cache_id.
-	// This catches the MCP-randomized-map regression the docstring calls out.
-	t.Run("1.48_tools_order_independent", func(t *testing.T) {
+	// 1.48 tools_order_preserved — cache identity follows the supplied list order.
+	// Native MCP already sorts tools in core/mcp/utils.go:resolveCallerDiscovery
+	// and clients in core/mcp/toolmanager.go:availableTools, before inference.
+	t.Run("1.48_tools_order_preserved", func(t *testing.T) {
 		t.Parallel()
-		lc := newLogCtx("direct", "1.48_tools_order_independent")
+		lc := newLogCtx("direct", "1.48_tools_order_preserved")
 		key := "phase1-k48"
+		headers := cacheHeaders{Key: key, Type: "direct"}
 		body := "Look up the current weather in Tokyo."
 
 		toolA := chatTool{Type: "function", Function: &toolFunction{
@@ -1206,16 +1213,22 @@ func TestDirect(t *testing.T) {
 
 		reqA := simpleChat(cfg.OpenAIModel, body)
 		reqA.Tools = []chatTool{toolA, toolB}
+		// Keep the response cacheable under the default tool-call response policy.
+		reqA.ToolChoice = "none"
 		reqB := simpleChat(cfg.OpenAIModel, body)
 		reqB.Tools = []chatTool{toolB, toolA} // swapped order
+		reqB.ToolChoice = "none"
 
-		respA := postChat(t, lc, 1, reqA, cacheHeaders{Key: key})
+		respA := postChat(t, lc, 1, reqA, headers)
 		idA := assertMiss(t, lc, 2, respA)
 		waitForCacheWrite(t, lc, 3)
 
-		respB := postChat(t, lc, 4, reqB, cacheHeaders{Key: key})
-		idB := assertHit(t, lc, 5, respB, "direct")
-		assertSameCacheID(t, lc, 6, idB, idA)
+		respB := postChat(t, lc, 4, reqB, headers)
+		idB := assertMiss(t, lc, 5, respB)
+		assertDifferentCacheID(t, lc, 6, idA, idB)
+		waitForCacheWrite(t, lc, 7)
+		idReplay := assertHit(t, lc, 9, postChat(t, lc, 8, reqB, headers), "direct")
+		assertSameCacheID(t, lc, 10, idReplay, idB)
 	})
 
 	// 1.49 tools_function_name_change — different tool names → distinct params hash → miss.

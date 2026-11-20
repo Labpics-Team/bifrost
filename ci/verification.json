@@ -35,6 +35,7 @@
     ],
     "github.com/maximhq/bifrost/plugins/semanticcache": [
       "TestCacheIdentityExactInput",
+      "TestDirectCacheKeepsCaseSensitiveCodeDistinct",
       "TestCacheIdentityFullParameters",
       "TestCacheIdentityHTTPContext",
       "TestCacheIdentityRawReplay",
@@ -89,13 +90,12 @@
       "TestPassthroughStreamTeardownPanicIsRecovered"
     ],
     "github.com/maximhq/bifrost/core": [
-      "TestConcurrentNilContextPreservesRequestOutcome",
+      "TestConcurrentNilContextRequestsHaveIsolatedState",
       "TestNilContextFiniteStreamCompletesBeforeRead",
-      "TestInferenceAcceptedRequestIsNotRepeated",
-      "TestInferenceExplicitRejectionCanRetry",
-      "TestInferencePreSendFailureCanFallback",
-      "TestInferenceLostFallbackReplyStopsTheChain",
-      "TestStreamSilentPrimaryHeaderTimeoutDoesNotFallback",
+      "TestProviderRetryBudgetAfterLostResponse",
+      "TestFixedKeyRetriesTheSameKeyAfterATransientFailure",
+      "TestScenarioFailureClassLadder",
+      "TestStreamFallbackAfterSilentPrimaryHeaderTimeout",
       "TestStreamRetryBudgetWhenUpstreamClosesBeforeHeaders",
       "TestStreamTTFTCutsOffStartupOnlyPrimary",
       "TestStreamTTFTCutsOffSilentPrimaryHeaderWait",
@@ -103,22 +103,12 @@
       "TestStreamTTFTLeavesTimelyOrUnconfiguredPrimaryAlone",
       "TestRetryBackoffStopsWhenRequestCancelled",
       "TestRetryBackoffStopsWhenRequestDeadlineExpires",
-      "TestPostHookFallbackRequiresKnownRequestOutcome",
-      "TestScenarioEveryKeyRefusedIsTriedOnce",
-      "TestProviderRetryAfterWaitsForHint",
-      "TestProviderRetryAfterCancellationReleasesWorker",
-      "TestProviderRetryAfterBackoffBounds"
+      "TestScenarioEveryKeyRefusedIsTriedOnce"
     ],
     "github.com/maximhq/bifrost/core/providers/utils": [
       "TestContextTransport_TruncatedContentLengthStreamReportsUnexpectedEOFAndDiscardsConn",
-      "TestHTTPRequestOutcomePreservesAcceptedAndUnsent",
-      "TestHTTPRequestStreamEOFDoesNotAcknowledgeInference",
-      "TestRequestOutcomeAuxiliaryIsolation",
-      "TestRequestOutcomePreservesTransportEvidence",
       "TestContextTransportAcceptedPooledRequestIsNotRepeated",
       "TestContextTransport_PooledStaleConnStillRetried",
-      "TestRequestOutcomeRetainsKnownRejection",
-      "TestRequestOutcomeConcurrentUnknownCannotBeRetracted",
       "TestRetryAfterHint",
       "TestHandleProviderAPIError_RetryAfter",
       "TestApplyRetryAfter_KeepsParserHint",
@@ -146,11 +136,16 @@
       "TestRoutingModelsFirstDeclarationAndSortedNames",
       "TestRoutingModelsFollowsNativeProviderNamespace"
     ],
+    "github.com/maximhq/bifrost/plugins/routing/complexity": [
+      "TestSemanticClassifierDeclaresItsQueryFilterIndexes"
+    ],
+    "github.com/maximhq/bifrost/framework/warp": [
+      "TestWarpSearchDeclaresItsQueryFilterIndexes"
+    ],
     "github.com/maximhq/bifrost/transports/v2/bifrost-http/server": [
       "TestRoutingModelsHTTPAdmission"
     ],
     "github.com/maximhq/bifrost/core/providers/anthropic": [
-      "TestAnthropicRequestOutcomeEvidence",
       "TestToAnthropicChatCompletionError",
       "TestToAnthropicChatCompletionErrorNeverEmitsEmptyMessage"
     ]

@@ -5838,7 +5838,6 @@ func (bifrost *Bifrost) getProviderByKey(providerKey schemas.ModelProvider) sche
 // succeed. Chains the caller or a routing config named keep falling back on any error.
 // The extra cost is one bool load on the first fallback, and classification only on that path.
 func (bifrost *Bifrost) shouldTryFallbacks(ctx *schemas.BifrostContext, req *schemas.BifrostRequest, primaryErr *schemas.BifrostError) bool {
-	primaryErr = providerUtils.PreserveRequestOutcome(ctx, primaryErr)
 	// If no primary error, we succeeded
 	if primaryErr == nil {
 		bifrost.logger.Debug("no primary error, we should not try fallbacks")
@@ -6012,8 +6011,7 @@ func (bifrost *Bifrost) prepareFallbackRequest(req *schemas.BifrostRequest, fall
 
 // shouldContinueWithFallbacks processes errors from fallback attempts
 // Returns true if we should continue with more fallbacks, false if we should stop
-func (bifrost *Bifrost) shouldContinueWithFallbacks(ctx *schemas.BifrostContext, fallback schemas.Fallback, fallbackErr *schemas.BifrostError) bool {
-	fallbackErr = providerUtils.PreserveRequestOutcome(ctx, fallbackErr)
+func (bifrost *Bifrost) shouldContinueWithFallbacks(fallback schemas.Fallback, fallbackErr *schemas.BifrostError) bool {
 	if fallbackErr == nil {
 		return false
 	}
@@ -6097,7 +6095,6 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 	if owned {
 		defer ctx.Cancel()
 	}
-	providerUtils.ClearRequestOutcome(ctx)
 
 	// What the caller asked for, before any hook rewrites it: the name under which a session
 	// remembers where these requests were served. Reported back with how the request ended.
@@ -6276,7 +6273,7 @@ func (bifrost *Bifrost) handleRequest(ctx *schemas.BifrostContext, req *schemas.
 		tracer.EndSpan(handle, schemas.SpanStatusError, "fallback failed")
 
 		// Check if we should continue with more fallbacks
-		if !bifrost.shouldContinueWithFallbacks(ctx, fallback, fallbackErr) {
+		if !bifrost.shouldContinueWithFallbacks(fallback, fallbackErr) {
 			ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelError, fmt.Sprintf("Fallback %s/%s failed (%s); halting further fallbacks", fallback.Provider, fallback.Model, routingErrorSummary(fallbackErr)))
 			return nil, fallbackErr
 		}
@@ -6359,7 +6356,6 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 			stream = finishOwnedRequestStream(ctx, stream)
 		}()
 	}
-	providerUtils.ClearRequestOutcome(ctx)
 
 	// What the caller asked for, before any hook rewrites it: the name under which a session
 	// remembers where these requests were served. Reported back with how the request ended.
@@ -6526,7 +6522,7 @@ func (bifrost *Bifrost) handleStreamRequest(ctx *schemas.BifrostContext, req *sc
 		tracer.EndSpan(handle, schemas.SpanStatusError, "fallback failed")
 
 		// Check if we should continue with more fallbacks
-		if !bifrost.shouldContinueWithFallbacks(ctx, fallback, fallbackErr) {
+		if !bifrost.shouldContinueWithFallbacks(fallback, fallbackErr) {
 			ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelError, fmt.Sprintf("Fallback %s/%s failed (%s); halting further fallbacks", fallback.Provider, fallback.Model, routingErrorSummary(fallbackErr)))
 			return nil, fallbackErr
 		}
@@ -7217,7 +7213,7 @@ func (bifrost *Bifrost) pickFromRotatingPool(ctx *schemas.BifrostContext, pool [
 // A header wait the deadline cut short surfaces from the provider as whatever
 // its client made of the closed socket (a network error, or a cancellation on
 // net/http). It is relabelled as the TTFT miss it is, so the retry loop stops
-// and a fallback is allowed only if the request was never dispatched. The handle is cleared only now: the first-chunk
+// and the next fallback runs. The handle is cleared only now: the first-chunk
 // check has waited for a cut-off stream to drain, so no provider goroutine of
 // this attempt can still be looking for it.
 func settleAttemptAbort(ctx *schemas.BifrostContext, abort *providerUtils.AttemptAbort, bifrostError *schemas.BifrostError, providerKey schemas.ModelProvider, model string) *schemas.BifrostError {
@@ -7599,9 +7595,7 @@ func executeRequestWithRetries[T any](
 			ctxEnded := false
 			stage := "before retry dispatch"
 			if !((lastWasPermanentKeyFailure && keyChanged) || lastWasEncryptedContentStrip) {
-				// The provider hint is a lower bound, including after a 429 key rotation.
-				// The configured cap bounds exponential backoff, not a provider refusal.
-				backoff := max(calculateBackoff(attempts-1, config), retryAfterDuration(bifrostError))
+				backoff := calculateBackoff(attempts-1, config)
 				logger.Debug("sleeping for %s before retry", backoff)
 				ctxEnded = waitRetryBackoff(ctx, backoff)
 				stage = "during retry backoff"
@@ -7746,7 +7740,6 @@ func executeRequestWithRetries[T any](
 			}
 		}
 
-		outcome := providerUtils.BeginRequestOutcome(ctx, isStreamRequest)
 		result, bifrostError = requestHandler(currentKey)
 
 		// Detect errors carried inside HTTP 200 streams before returning success.
@@ -7802,7 +7795,6 @@ func executeRequestWithRetries[T any](
 		if attemptAbort != nil {
 			bifrostError = settleAttemptAbort(ctx, attemptAbort, bifrostError, providerKey, model)
 		}
-		bifrostError = outcome.Preserve(bifrostError)
 
 		// A live stream's span is ended by its provider goroutine when the stream
 		// completes. Everything else ends it here: non-stream responses, failed stream
@@ -10005,8 +9997,6 @@ func (p *PluginPipeline) callPostLLMHook(plugin schemas.LLMPlugin, pluginName st
 }
 
 func (p *PluginPipeline) RunPostLLMHooks(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bifrostErr *schemas.BifrostError, runFrom int) (*schemas.BifrostResponse, *schemas.BifrostError) {
-	// Preserve late stream failures before a hook can replace their evidence.
-	bifrostErr = providerUtils.PreserveRequestOutcome(ctx, bifrostErr)
 	// If the skip plugin pipeline flag is set, skip the plugin pipeline
 	if skipPluginPipeline, ok := ctx.Value(schemas.BifrostContextKeySkipPluginPipeline).(bool); ok && skipPluginPipeline {
 		return resp, bifrostErr
@@ -10090,7 +10080,7 @@ func (p *PluginPipeline) RunPostLLMHooks(ctx *schemas.BifrostContext, resp *sche
 			// Defensive: treat as recovery if error is empty
 			return resp, nil
 		}
-		return resp, providerUtils.PreserveRequestOutcome(ctx, bifrostErr)
+		return resp, bifrostErr
 	}
 	return resp, nil
 }

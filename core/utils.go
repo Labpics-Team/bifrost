@@ -16,7 +16,6 @@ import (
 
 	"github.com/maximhq/bifrost/core/mcp"
 	"github.com/maximhq/bifrost/core/network"
-	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
@@ -101,21 +100,6 @@ func calculateBackoff(attempt int, config *schemas.ProviderConfig) time.Duration
 	result := time.Duration(jitter)
 	// Ensure we never exceed the configured maximum
 	return min(result, config.NetworkConfig.RetryBackoffMax)
-}
-
-// retryAfterDuration converts the native millisecond hint without overflowing
-// time.Duration. Even an extreme hint must wait for cancellation, not wrap into
-// a negative duration and dispatch an immediate retry.
-func retryAfterDuration(bifrostError *schemas.BifrostError) time.Duration {
-	if bifrostError == nil || bifrostError.ExtraFields.RetryAfter <= 0 {
-		return 0
-	}
-	const maxDuration = time.Duration(1<<63 - 1)
-	milliseconds := bifrostError.ExtraFields.RetryAfter
-	if milliseconds > maxDuration.Milliseconds() {
-		return maxDuration
-	}
-	return time.Duration(milliseconds) * time.Millisecond
 }
 
 // waitRetryBackoff sleeps for backoff unless ctx ends first. It reports true when
@@ -464,7 +448,6 @@ func layerFallbackIdentity(ctx *schemas.BifrostContext, info *schemas.RoutingInf
 
 // clearCtxForFallback clears the ctx values which are not applicable for fallback requests.
 func clearCtxForFallback(ctx *schemas.BifrostContext) {
-	providerUtils.ClearRequestOutcome(ctx)
 	ctx.ClearValue(schemas.BifrostContextKeyAPIKeyID)
 	ctx.ClearValue(schemas.BifrostContextKeyAPIKeyName)
 	ctx.ClearValue(schemas.BifrostContextKeyDirectKey)

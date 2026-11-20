@@ -2,7 +2,6 @@ package utils
 
 import (
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -23,19 +22,16 @@ func TestRetryAfterHint(t *testing.T) {
 		{name: "azure retry-after-ms", headers: map[string]string{"retry-after-ms": "2000"}, want: 2 * time.Second},
 		{name: "retry-after seconds", headers: map[string]string{"Retry-After": "56"}, want: 56 * time.Second},
 		{name: "retry-after fractional seconds", headers: map[string]string{"retry-after": "1.5"}, want: 1500 * time.Millisecond},
-		{name: "fractional millisecond rounds up", headers: map[string]string{"Retry-After": "1.000001"}, want: 1001 * time.Millisecond},
-		{name: "fractional nanosecond is not lost before rounding", headers: map[string]string{"Retry-After": "1.0000000001"}, want: 1001 * time.Millisecond},
 		{name: "retry-after http date", headers: map[string]string{"Retry-After": now.Add(90 * time.Second).Format(http.TimeFormat)}, want: 90 * time.Second},
 		{name: "milliseconds beat seconds", headers: map[string]string{"retry-after-ms": "3000", "Retry-After": "60"}, want: 3 * time.Second},
 		{name: "zero clamps to the floor", headers: map[string]string{"Retry-After": "0"}, want: time.Second},
 		{name: "past date clamps to the floor", headers: map[string]string{"Retry-After": now.Add(-time.Minute).Format(http.TimeFormat)}, want: time.Second},
-		{name: "a day is preserved", headers: map[string]string{"Retry-After": "86400"}, want: 24 * time.Hour},
+		{name: "a day clamps to the ceiling", headers: map[string]string{"Retry-After": "86400"}, want: 5 * time.Minute},
 		{name: "unparsable retry-after gives no hint", headers: map[string]string{"Retry-After": "soon"}},
 		{name: "nan gives no hint", headers: map[string]string{"Retry-After": "NaN"}},
-		{name: "out-of-range seconds saturate at the duration limit", headers: map[string]string{"Retry-After": "10000000000"}, want: maxRetryAfter},
-		{name: "infinite seconds saturate at the duration limit", headers: map[string]string{"Retry-After": "inf"}, want: maxRetryAfter},
-		{name: "integer beyond float range saturates", headers: map[string]string{"Retry-After": "1" + strings.Repeat("0", 309)}, want: maxRetryAfter},
-		{name: "out-of-range milliseconds saturate at the duration limit", headers: map[string]string{"retry-after-ms": "1e300"}, want: maxRetryAfter},
+		{name: "out-of-range seconds clamp to the ceiling", headers: map[string]string{"Retry-After": "10000000000"}, want: 5 * time.Minute},
+		{name: "infinite seconds clamp to the ceiling", headers: map[string]string{"Retry-After": "inf"}, want: 5 * time.Minute},
+		{name: "out-of-range milliseconds clamp to the ceiling", headers: map[string]string{"retry-after-ms": "1e300"}, want: 5 * time.Minute},
 		{name: "negative infinity clamps to the floor", headers: map[string]string{"Retry-After": "-inf"}, want: time.Second},
 		{name: "openai reset headers are not a hint", headers: map[string]string{
 			"x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "1s",
@@ -61,12 +57,8 @@ func TestRetryAfterHint(t *testing.T) {
 			if hint, ok := retryAfterHint(header, now); ok {
 				SetRetryAfter(bifrostErr, hint)
 			}
-			wantMS := tc.want.Milliseconds()
-			if tc.want%time.Millisecond != 0 {
-				wantMS++
-			}
-			if got := bifrostErr.ExtraFields.RetryAfter; got != wantMS {
-				t.Errorf("RetryAfter = %d, want %d", got, wantMS)
+			if got := bifrostErr.ExtraFields.RetryAfter; got != tc.want.Milliseconds() {
+				t.Errorf("RetryAfter = %d, want %d", got, tc.want.Milliseconds())
 			}
 		})
 	}

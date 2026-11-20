@@ -2352,7 +2352,6 @@ type AnthropicMessageError struct {
 type AnthropicMessageErrorStruct struct {
 	Type    string                        `json:"type"`              // Error type
 	Message string                        `json:"message"`           // Error message
-	Code    string                        `json:"code,omitempty"`    // Bifrost request outcome evidence, when known
 	Details *AnthropicMessageErrorDetails `json:"details,omitempty"` // Machine-readable details some errors carry (e.g. thread error codes)
 }
 
