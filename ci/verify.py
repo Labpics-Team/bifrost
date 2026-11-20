@@ -109,9 +109,12 @@ def changed_go_files(root, manifest):
 
 def check_format(root, manifest):
     paths = [path for path in changed_go_files(root, manifest) if (root / path).is_file()]
+    # Automatic Go toolchain selection does not change the gofmt found on PATH.
+    go_root = Path(run(["go", "env", "GOROOT"], root).strip())
+    gofmt = str(go_root / "bin" / ("gofmt.exe" if os.name == "nt" else "gofmt"))
     unformatted = []
     for offset in range(0, len(paths), 100):
-        output = run(["gofmt", "-l", "--", *paths[offset:offset + 100]], root)
+        output = run([gofmt, "-l", "--", *paths[offset:offset + 100]], root)
         if output:
             unformatted.append(output.rstrip())
     if unformatted:
