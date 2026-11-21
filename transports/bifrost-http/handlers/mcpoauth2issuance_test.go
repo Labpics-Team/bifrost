@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -25,18 +26,47 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-// newRealOAuth2Store builds a real sqlite-backed ConfigStore (full migrations,
-// including the OAuth2 issuance tables) so issuance handlers exercise the actual
-// atomic store semantics rather than a hand-rolled mock.
-func newRealOAuth2Store(t *testing.T) configstore.ConfigStore {
-	t.Helper()
-	cs, err := configstore.NewConfigStore(context.Background(), &configstore.Config{
+func openOAuth2TestStore(path string) (configstore.ConfigStore, error) {
+	return configstore.NewConfigStore(context.Background(), &configstore.Config{
 		Enabled: true,
 		Type:    configstore.ConfigStoreTypeSQLite,
-		Config:  &configstore.SQLiteConfig{Path: filepath.Join(t.TempDir(), "oauth2.db")},
+		Config:  &configstore.SQLiteConfig{Path: path},
 	}, &mockLogger{})
+}
+
+// Handler tests need independent real databases, but need not repeat every DDL
+// migration from an empty file. Build the template with the native constructor,
+// then close its only connection before reading it so committed WAL data is in
+// the database file. Each copy still opens through the native constructor.
+var oauth2TestStoreTemplate = sync.OnceValues(func() ([]byte, error) {
+	dir, err := os.MkdirTemp("", "bifrost-oauth2-template-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "oauth2.db")
+	store, err := openOAuth2TestStore(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.Close(context.Background()); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(path)
+})
+
+// newRealOAuth2Store retains native SQLite transactions and durability, while
+// every caller gets its own file and a connection closed before test cleanup.
+func newRealOAuth2Store(t *testing.T) configstore.ConfigStore {
+	t.Helper()
+	template, err := oauth2TestStoreTemplate()
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "oauth2.db")
+	require.NoError(t, os.WriteFile(path, template, 0o600))
+	cs, err := openOAuth2TestStore(path)
 	require.NoError(t, err)
 	require.NotNil(t, cs)
+	t.Cleanup(func() { assert.NoError(t, cs.Close(context.Background())) })
 	return cs
 }
 
