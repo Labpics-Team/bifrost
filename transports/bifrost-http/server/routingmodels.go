@@ -2,6 +2,7 @@ package server
 
 import (
 	"sort"
+	"strings"
 
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
@@ -38,7 +39,7 @@ func (s *BifrostHTTPServer) ListAllModels(ctx *schemas.BifrostContext, req *sche
 	if err != nil {
 		// A provider's discovery failure does not invalidate an authorized
 		// name from routing. Keep request-level validation and cancellation.
-		if len(aliases.Data) == 0 || err.ExtraFields.Provider == "" || ctx.Err() != nil {
+		if len(aliases.Data) == 0 || !isProviderDiscoveryFailure(err) || ctx.Err() != nil {
 			return nil, err
 		}
 		aliases.KeyStatuses = err.ExtraFields.KeyStatuses
@@ -56,6 +57,13 @@ func (s *BifrostHTTPServer) ListAllModels(ctx *schemas.BifrostContext, req *sche
 	}
 	sort.Slice(response.Data, func(i, j int) bool { return response.Data[i].ID < response.Data[j].ID })
 	return response.ApplyPagination(req.PageSize, req.PageToken), nil
+}
+
+// Native list-model helpers declare fault attribution where the provider poll
+// fails. Provider metadata alone is not evidence: core also adds it to policy
+// short-circuits. Do not infer provenance from a status code here.
+func isProviderDiscoveryFailure(err *schemas.BifrostError) bool {
+	return strings.HasPrefix(string(err.ExtraFields.ErrorType), "provider_")
 }
 
 // ListRoutingModels admits a catalog read through the same governance hook as

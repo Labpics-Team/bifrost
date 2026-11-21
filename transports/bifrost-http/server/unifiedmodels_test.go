@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -142,6 +143,58 @@ func TestUnifiedModelCatalogProviderFailure(t *testing.T) {
 	_, err = s.ListAllModels(ctx, nil)
 	require.NotNil(t, err, "a direct key must still name its provider")
 	require.Equal(t, http.StatusBadRequest, *err.StatusCode)
+}
+
+type catalogPolicyPlugin struct {
+	status int
+	post   bool
+}
+
+func (p *catalogPolicyPlugin) GetName() string { return "catalog-policy" }
+func (p *catalogPolicyPlugin) Cleanup() error  { return nil }
+func (p *catalogPolicyPlugin) PreRequestHook(*schemas.BifrostContext, *schemas.BifrostRequest) error {
+	return nil
+}
+func (p *catalogPolicyPlugin) refusal() *schemas.BifrostError {
+	return &schemas.BifrostError{StatusCode: bifrost.Ptr(p.status), Error: &schemas.ErrorField{Message: "catalog policy refuses this caller"}}
+}
+func (p *catalogPolicyPlugin) PreLLMHook(_ *schemas.BifrostContext, request *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
+	if p.post {
+		return request, nil, nil
+	}
+	return request, &schemas.LLMPluginShortCircuit{Error: p.refusal()}, nil
+}
+func (p *catalogPolicyPlugin) PostLLMHook(_ *schemas.BifrostContext, response *schemas.BifrostResponse, err *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError, error) {
+	if p.post {
+		refusal := p.refusal()
+		if err != nil {
+			// A post-hook can retain discovery diagnostics while rejecting the
+			// request itself. The returned error is still the policy refusal.
+			refusal.ExtraFields.KeyStatuses = err.ExtraFields.KeyStatuses
+		}
+		return nil, refusal, nil
+	}
+	return response, err, nil
+}
+
+func TestUnifiedModelCatalogPreservesPolicyFailure(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusServiceUnavailable} {
+		for _, post := range []bool{false, true} {
+			t.Run(strconv.Itoa(status)+"/post="+strconv.FormatBool(post), func(t *testing.T) {
+				s, _, r := newUnifiedModelCatalog(t, http.StatusServiceUnavailable)
+				require.NoError(t, s.Client.ReloadPlugin(&catalogPolicyPlugin{status: status, post: post}, []schemas.PluginType{schemas.PluginTypeLLM}))
+				for _, path := range []string{"/v1/models", "/openai/v1/models"} {
+					ctx := &fasthttp.RequestCtx{}
+					ctx.Request.Header.SetMethod("GET")
+					ctx.Request.SetRequestURI(path)
+					ctx.Request.Header.Set("x-bf-vk", "sk-bf-reader")
+					r.Handler(ctx)
+					require.Equal(t, status, ctx.Response.StatusCode(), string(ctx.Response.Body()))
+					require.Contains(t, string(ctx.Response.Body()), "catalog policy refuses this caller")
+				}
+			})
+		}
+	}
 }
 
 // nativeModelCatalog preserves the pre-change dispatch for the benchmark.
