@@ -1409,6 +1409,9 @@ func (m *MockConfigStore) GetAuthConfig(ctx context.Context) (*configstore.AuthC
 }
 
 func (m *MockConfigStore) UpdateAuthConfig(ctx context.Context, config *configstore.AuthConfig) error {
+	if !m.authConfig.Equals(config) {
+		m.flushSessionsCalled = true
+	}
 	m.authConfig = config
 	return nil
 }
@@ -1549,6 +1552,13 @@ func (m *MockConfigStore) GetSession(ctx context.Context, token string) (*tables
 
 func (m *MockConfigStore) CreateSession(ctx context.Context, session *tables.SessionsTable) error {
 	return nil
+}
+
+func (m *MockConfigStore) CreateSessionIfAuthMatches(ctx context.Context, session *tables.SessionsTable, expectedAuth *configstore.AuthConfig) error {
+	if expectedAuth == nil || !expectedAuth.IsEnabled || !m.authConfig.Equals(expectedAuth) {
+		return configstore.ErrAuthConfigChanged
+	}
+	return m.CreateSession(ctx, session)
 }
 
 func (m *MockConfigStore) DeleteSession(ctx context.Context, token string) error {
@@ -27144,5 +27154,22 @@ func TestAgentGrantsFromConfigFile_NewKeyUnknownAgent(t *testing.T) {
 		vk, err := config.ConfigStore.GetVirtualKey(ctx, id)
 		require.NoError(t, err, "virtual key %s is stored", id)
 		assert.Empty(t, vk.AgentGrants)
+	}
+}
+
+func TestConfigDataAdaptiveRoutingIsOptIn(t *testing.T) {
+	var config ConfigData
+	if err := json.Unmarshal([]byte(`{}`), &config); err != nil {
+		t.Fatal(err)
+	}
+	if config.LoadBalancerConfig != nil {
+		t.Fatal("absent section enabled adaptive routing")
+	}
+	if err := json.Unmarshal([]byte(`{"load_balancer_config":{"append_fallbacks_to_pinned":true,"history_retention_days":100,"snapshot_persist_interval_seconds":1}}`), &config); err != nil {
+		t.Fatal(err)
+	}
+	c := config.LoadBalancerConfig
+	if c == nil || !c.DirectionSelectionEnabled || !c.RouteSelectionEnabled || !c.AppendFallbacksToPinned || c.HistoryRetentionDays != 30 || c.SnapshotIntervalSeconds != 5 {
+		t.Fatalf("wrong partial native settings: %+v", c)
 	}
 }

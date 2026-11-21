@@ -69,6 +69,7 @@
                 "pages": [
                   "quickstart/gateway/setting-up",
                   "quickstart/gateway/setting-up-auth",
+                  "quickstart/gateway/oidc",
                   "quickstart/gateway/provider-configuration",
                   "quickstart/gateway/streaming",
                   "quickstart/gateway/tool-calling",

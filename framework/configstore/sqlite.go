@@ -30,7 +30,10 @@ func newSqliteConfigStore(ctx context.Context, config *SQLiteConfig, logger sche
 	// that reads and then writes has to upgrade its lock, and SQLite refuses that upgrade at once
 	// ("database is locked") when another connection is writing, without waiting out the busy
 	// timeout; taken at BEGIN, the lock is waited for like any other.
-	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=10000&_busy_timeout=60000&_wal_autocheckpoint=1000&_foreign_keys=1&_txlock=immediate", config.Path)
+	// A successful configuration/lifecycle commit must survive an OS crash,
+	// not just a process restart. WAL NORMAL can lose acknowledged commits on
+	// power loss; FULL syncs the WAL at commit. Request logs use a separate DB.
+	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_synchronous=FULL&_cache_size=10000&_busy_timeout=60000&_wal_autocheckpoint=1000&_foreign_keys=1&_txlock=immediate", config.Path)
 	logger.Debug("opening DB with dsn: %s", dsn)
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
 		Logger: newGormLogger(logger),

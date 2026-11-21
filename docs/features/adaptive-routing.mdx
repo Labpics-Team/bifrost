@@ -1,0 +1,202 @@
+---
+title: "Adaptive routing in the Labpics fork"
+description: "Choose providers and managed keys from real traffic without another gateway."
+---
+
+The fork implements adaptive routing in the existing routing plugin and key
+selector. It follows Bifrost's [documented routing order and settings](https://docs.getbifrost.ai/enterprise/adaptive-routing/overview).
+The Enterprise scoring formula is not public; this fork uses its own small
+error, first-response latency and in-flight-load calculation. It does not load
+Enterprise binaries or reproduce a hidden implementation.
+
+## Enable and operate
+
+Open **Adaptive Routing > Settings** and save the settings. Saving creates the
+profile and applies it immediately. On an existing installation with neither a
+saved profile nor a `load_balancer_config` section, requests continue through the
+original provider and weighted-key selection. Opening the settings page alone
+does not enable anything.
+
+For the first boot, `config.json` can supply the same native settings:
+
+```json
+{
+  "load_balancer_config": {
+    "direction_selection_enabled": true,
+    "route_selection_enabled": true,
+    "append_fallbacks_to_pinned": false,
+    "reroute_failed_directions": false,
+    "reroute_target": "pool",
+    "prune_failed_fallbacks": false,
+    "history_enabled": true,
+    "history_retention_days": 7,
+    "snapshot_persist_interval_seconds": 300
+  }
+}
+```
+
+Only listed file settings override defaults. A profile saved in the dashboard or
+API takes precedence over the file, as in the upstream adaptive routing API.
+`GET /api/adaptive-routing/config` reads the complete settings;
+`PUT /api/adaptive-routing/config` replaces them. Always send the full object:
+missing switches become false, and missing retention/interval values are invalid.
+
+The dashboard shows observed provider/model/key health, first-response latency,
+in-flight attempts and held credentials. The health score excludes the relative
+latency adjustment made when selecting from an eligible pool. **Incidents** shows durable problems and their lifecycle: opening, holds, real
+checks, recovery, confirmed resolution and configuration changes. Each event
+can link to the native request log that supplied the observation. The existing LLM request logs
+retain provider decisions through Bifrost's normal logging policy.
+
+`POST /api/adaptive-routing/conditions/clear` releases holds. Supply `provider`
+and `key_id` to release the whole key, add `model` for one model, or send `{}` to
+release all. A credential or billing refusal holds the whole key and therefore
+requires a release without `model`. Native provider/key edits also discard the
+old measurements and holds.
+
+## Request behavior
+
+CEL rules and virtual-key provider selection run first. A bare model name can
+then choose a healthy provider from the live model catalog and governance
+allowlist. Healthy alternatives follow the request's own fallbacks. Aliases use
+the same catalog as real model names; per-key alias resolution stays in core.
+
+A provider already named by the caller, a rule or a virtual key remains selected
+by default. The optional append, redirect and prune settings adjust this policy.
+For a named provider, pruning applies only when appending alternatives is enabled
+or the request was actually redirected, following the native settings contract.
+A due check of a named provider keeps healthy fallbacks even when appending
+alternatives to ordinary named traffic is off. If every explicitly configured
+fallback is failing, redirecting can use the healthy compatible, allowed global
+pool. A managed provider without an eligible key is excluded; native keyless
+providers remain supported.
+Explicit caller/rule key pins and direct credentials retain their native
+precedence. Adaptive routing does not change core's retry loop or session
+affinity. A session binding can still name its existing provider/key; native
+failure handling decides when that binding moves.
+
+With adaptive key selection on, errors have the strongest influence, then
+first-response latency relative to eligible peers and current load. Static key
+weights apply when adaptive key selection is off. Both modes skip held managed
+keys; an all-held pool still sends a real request rather than manufacturing a
+gateway failure. Cancellation and caller faults do not reduce key health. Long
+successful streams measure the first response, not the duration of generation.
+
+Usable providers receive traffic weighted by observed health. An expired failure
+cooldown also gets a single real checking request, so a successful alternative
+cannot leave the recovered provider permanently stuck on its last bad score.
+
+Holds use core's existing `FailureClass`, with the
+[documented scopes and wait ladder](https://docs.getbifrost.ai/enterprise/adaptive-routing/how-it-works#held-keys).
+Credential and quota refusals hold the whole key; model access, retired models,
+region refusals and rate limits hold one model. A due key receives a single real
+checking request. Successful checks release it into recovery; no synthetic probe
+traffic is sent. Transient failures and timeouts affect health but do not create
+credential holds. A stream failure is observed per attempt, including failed
+startup attempts that core retries before response plugins see them.
+An explicit key pin is explained by core in the same routing log; it is not
+reported as an adaptive selection.
+
+## State and maintenance
+
+The native `config.db` holds conditions, lifecycle incidents and their events.
+A condition's next-check time is an admission time, never an expiry time. Due
+conditions survive restart, telemetry eviction and idle cleanup until a real
+check, an operator action or a configuration change resolves them. Reading
+`/api/adaptive-routing/status` does not mutate any routing state.
+
+Each attempt captures the actual selected key's configuration fingerprint, the
+provider worker's configuration revision and its condition/probe generations.
+A late answer cannot release a newer refusal, clear another check's reservation
+or affect a replacement credential or endpoint. Provider identity is computed
+when core builds its workers, including the resolved network and proxy settings.
+The fingerprint includes resolved secrets as a digest; credential values,
+prompts and response bodies are not stored in the adaptive database. The controller
+keeps one frozen native configuration snapshot per credential revision;
+unchanged requests compare that snapshot without rebuilding its digest.
+Omitted key flags and their explicit native defaults have the same identity,
+so reading a file-supplied key back from SQLite does not release its hold.
+
+One lifecycle writer commits a condition and its incident events atomically,
+then publishes that state to routing. It releases the shared reader mutex during
+SQLite IO. The existing configuration database uses WAL with `synchronous=FULL`;
+normal health samples do not write to the database. Observation-only updates,
+including a new healthy model or a previously unused key, skip the writer queue.
+A failed manual release
+returns an error and leaves the committed hold in force. Storage errors are
+visible in the status response and native routing logs. Startup fails if durable
+state cannot be read instead of silently starting with empty restrictions.
+Provider/key edits and removal finish their native operation even if adaptive
+cleanup fails. Maintenance retries that cleanup, and startup compares persisted
+incident/condition identity against the live configuration. An endpoint edit
+followed by process loss therefore closes the old observations as **No longer
+observed**, without claiming recovery or applying the old endpoint's hold.
+
+The routing telemetry cache retains at most 8,192 key/model records. Maintenance
+removes idle telemetry after 24 hours; it never deletes unresolved conditions.
+The configured snapshot interval saves the most recent telemetry, at most 2,048
+records and 1 MiB. The snapshot carries the lifecycle revision and cannot cross
+a later key rotation or state transition. In-flight attempts and probe leases
+are not restored: after restart a due condition can receive a fresh real check.
+Probe admission only reserves an in-memory lease; it never writes SQLite. While
+a lifecycle writer is busy, optional checks yield to healthy alternatives.
+**Completed checks** counts checks whose outcomes were durably recorded. The
+actual start time and result are committed together when the attempt finishes.
+Cancellation frees the lease without reducing health or counting a completed
+check. A process lost mid-check leaves the existing durable hold unchanged.
+
+Incidents use server-side filters, ordering and cursor pagination through
+`GET /api/adaptive-routing/incidents` and `GET /api/adaptive-routing/incidents/{id}`.
+A one-hour gap in recovery traffic is **Waiting for traffic**, not a recovery.
+Key/provider removal ends the old observation as **No longer observed**;
+`closed_at` records that end, while `resolved_at` is set only for confirmed
+recovery. Maintenance deletes closed incidents and their events after the
+configured retention, in batches of at most 1,000. Open incidents are retained.
+The incident retains its recorded refusal cause after recovery; showing that
+cause does not depend on retaining the request log or loading a particular event page.
+If a model refusal changes into a whole-key refusal, or the reverse, successful
+requests advance all related open incidents together. A configuration edit
+still ends the old observation without claiming recovery.
+
+**Record Routing History** controls optional health diagnostics. Required
+condition lifecycle records remain durable while it is off, and native request
+log explanations remain available. A timer is not evidence of recovery.
+
+This implementation has one active process and one local SQLite writer. The
+Labpics deployment uses one replica, `Recreate`, a ReadWriteOnce data volume and
+a 120-second termination allowance. Its existing `config.db` backup covers the
+adaptive lifecycle. It does not implement Enterprise cluster replication or
+leader election; independently active replicas must not share this runtime.
+
+A local Linux measurement on an i9-12900K measured a condition/incident/event
+transaction at 3.29 ms with FULL durability (0.38 ms with NORMAL). This is the
+cost of a lifecycle transition, not a per-request write. With two providers and
+four managed keys, local runs measured 3.78–5.17 microseconds and
+2,296 bytes per request; key selection measured 2.21–2.94 microseconds and attempt
+observation 1.08–1.48 microseconds. Timing varies with other work on this host;
+allocation counts remained 22, 11 and 3 respectively. Explicit-provider and unconfigured paths retain
+zero allocations. The contention test
+checks warmed and first-use healthy requests while a release is waiting for
+SQLite's writer lock.
+
+The integration consists of the routing plugin, existing `KeySelector`, a small
+optional core attempt-observation hook and the existing HTTP administration
+routes. No separate engine, gateway or process is required. When upstream ships
+this behavior in the open-source path, remove the local controller while keeping
+the externally observable routing and streaming regression tests.
+
+Focused checks after preparing the local Go workspace:
+
+```sh
+go test ./plugins/routing/adaptive ./core -run 'TestAdaptive|TestProviderAttempt'
+go test ./transports/bifrost-http/lib ./transports/bifrost-http/handlers ./transports/bifrost-http/server -run 'TestAdaptive|TestConfigDataAdaptive'
+go test -race ./plugins/routing/adaptive ./core -run 'TestAdaptive|TestProviderAttempt'
+go test ./plugins/routing/adaptive ./core -run '^$' -bench 'BenchmarkAdaptive|BenchmarkProviderAttempt' -benchmem
+```
+
+The real HTTP/SSE and browser fixture is
+`tests/e2e/features/adaptive-routing/runtime-fixture.py --binary tmp/bifrost-http`.
+Run its companion `adaptive-routing-runtime.spec.ts` with
+`ADAPTIVE_RUNTIME_FIXTURE_URL=http://127.0.0.1:18862`. It uses an isolated native
+SQLite database and a controlled provider to check refusal, incident/request-log
+links, crash/restart, recovery and streaming fallbacks without mocked APIs.

@@ -1,4 +1,6 @@
 {
+	"oidcSignIn": "Mit OpenID Connect fortfahren",
+	"oidcError": "Anmeldung fehlgeschlagen oder Zugriff verweigert. Versuchen Sie es erneut oder kontaktieren Sie Ihren Administrator.",
 	"title": "Anmelden",
 	"subtitle": "Bei Bifrost anmelden",
 	"welcomeBack": "Willkommen zurück",

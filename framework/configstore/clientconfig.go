@@ -2747,6 +2747,7 @@ type AuthConfig struct {
 	AdminUserName *schemas.SecretVar `json:"admin_username"`
 	AdminPassword *schemas.SecretVar `json:"admin_password"`
 	IsEnabled     bool               `json:"is_enabled"`
+	OIDC          *OIDCConfig        `json:"oidc,omitempty"`
 }
 
 // ConfigMap maps provider names to their configurations.

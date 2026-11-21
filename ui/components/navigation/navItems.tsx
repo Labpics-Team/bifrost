@@ -674,7 +674,6 @@ export function useNavItems(): NavItem[] {
 				id: "adaptive-routing",
 				title: t("nav.adaptiveRouting"),
 				url: "/workspace/adaptive-routing",
-				enterpriseOnly: true,
 				icon: Shuffle,
 				hasAccess: isAdaptiveRoutingAllowed,
 				subItems: [

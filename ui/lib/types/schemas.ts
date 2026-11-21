@@ -5,6 +5,18 @@ import { msg } from "@/lib/i18n/validationMessage";
 import { isRedacted } from "@/lib/utils/validation";
 import { z } from "zod";
 
+export const adaptiveRoutingConfigSchema = z.object({
+	direction_selection_enabled: z.boolean(),
+	route_selection_enabled: z.boolean(),
+	append_fallbacks_to_pinned: z.boolean(),
+	reroute_failed_directions: z.boolean(),
+	reroute_target: z.enum(["pool", "fallbacks"]),
+	prune_failed_fallbacks: z.boolean(),
+	history_enabled: z.boolean(),
+	history_retention_days: z.number().int(msg("validation.validNumber")).min(1).max(30),
+	snapshot_persist_interval_seconds: z.number().int(msg("validation.validNumber")).min(5).max(86400),
+});
+
 // Global error map - turns Zod's default messages into readable, human-friendly ones.
 // Individual schemas can still override by passing their own message.
 z.config({
@@ -522,6 +534,42 @@ export const isHTTPSOrLoopbackURL = (raw: string): boolean => {
 	}
 	return hasHTTPSOrLoopbackScheme(raw);
 };
+
+// Keep the form permissive; Go net/mail is authoritative for stored addresses.
+const oidcEmailSchema = z.email({ pattern: z.regexes.unicodeEmail });
+
+export const oidcConfigSchema = z
+	.object({
+		enabled: z.boolean(),
+		issuer_url: z.string(),
+		client_id: z.string(),
+		client_secret: secretVarSchema.optional(),
+		redirect_url: z.string(),
+		allowed_subjects: z.array(z.string()).optional(),
+		allowed_emails: z.array(z.string()).optional(),
+	})
+	.superRefine((config, ctx) => {
+		if (!config.enabled) return;
+		for (const field of ["issuer_url", "redirect_url"] as const) {
+			if (!isHTTPSOrLoopbackURL(config[field]) || new URL(config[field]).search !== "") {
+				ctx.addIssue({ code: "custom", path: [field], message: i18n.t("validation.validUrl") });
+			} else if (field === "redirect_url" && !new URL(config[field]).pathname.endsWith("/api/session/oidc/callback")) {
+				ctx.addIssue({ code: "custom", path: [field], message: i18n.t("security.oidc.redirectHelp", { ns: "config" }) });
+			}
+		}
+		if (!config.client_id.trim()) {
+			ctx.addIssue({ code: "custom", path: ["client_id"], message: i18n.t("validation.fieldRequired") });
+		}
+		if (!config.allowed_subjects?.length && !config.allowed_emails?.length) {
+			ctx.addIssue({ code: "custom", path: ["allowed_subjects"], message: i18n.t("security.oidc.allowHelp", { ns: "config" }) });
+		}
+		if (config.allowed_subjects?.some((subject) => !subject.trim())) {
+			ctx.addIssue({ code: "custom", path: ["allowed_subjects"], message: i18n.t("validation.fieldRequired") });
+		}
+		if (config.allowed_emails?.some((email) => !oidcEmailSchema.safeParse(email).success)) {
+			ctx.addIssue({ code: "custom", path: ["allowed_emails"], message: i18n.t("validation.validEmail") });
+		}
+	});
 
 // isLiteralHTTPSOrLoopbackURL checks only the scheme: the OAuth token URL's credentials, query and
 // fragment are reported separately, pointing at extra_params.

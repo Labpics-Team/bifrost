@@ -1,4 +1,6 @@
 {
+	"oidcSignIn": "OpenID Connect로 계속",
+	"oidcError": "로그인에 실패했거나 접근이 허용되지 않았습니다. 다시 시도하거나 관리자에게 문의하세요.",
 	"title": "로그인",
 	"subtitle": "Bifrost에 로그인",
 	"welcomeBack": "다시 오신 것을 환영해요",

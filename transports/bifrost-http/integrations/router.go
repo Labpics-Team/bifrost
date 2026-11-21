@@ -444,6 +444,7 @@ type ShortCircuit func(ctx *fasthttp.RequestCtx, bifrostCtx *schemas.BifrostCont
 // manager, because both answer the same question about the same request.
 type AccessResolver interface {
 	NarrowListModelsProviders(bifrostCtx *schemas.BifrostContext)
+	ListAllModels(ctx *schemas.BifrostContext, req *schemas.BifrostListModelsRequest) (*schemas.BifrostListModelsResponse, *schemas.BifrostError)
 }
 
 // StreamConfig defines streaming-specific configuration for an integration
@@ -1072,8 +1073,10 @@ func (g *GenericRouter) handleNonStreamingRequest(ctx *fasthttp.RequestCtx, conf
 			// dropped from the answer anyway.
 			if g.accessResolver != nil {
 				g.accessResolver.NarrowListModelsProviders(bifrostCtx)
+				listModelsResponse, bifrostErr = g.accessResolver.ListAllModels(bifrostCtx, bifrostReq.ListModelsRequest)
+			} else {
+				listModelsResponse, bifrostErr = g.client.ListAllModels(bifrostCtx, bifrostReq.ListModelsRequest)
 			}
-			listModelsResponse, bifrostErr = g.client.ListAllModels(bifrostCtx, bifrostReq.ListModelsRequest)
 		}
 
 		if bifrostErr != nil {
