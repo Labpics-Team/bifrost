@@ -110,7 +110,8 @@
       "TestOwnedStreamCancellationDoesNotWaitForReader",
       "TestOwnedStreamCancellationIsNotCleanEOF",
       "TestProviderAttemptObserverSeesEachRetryAndStreamingTeardown",
-      "TestProviderAttemptObserverSeesTTFTFailureBeforeHealthyFallback"
+      "TestProviderAttemptObserverSeesTTFTFailureBeforeHealthyFallback",
+      "TestExplicitKeySelectionExplainsNativePin"
     ],
     "github.com/maximhq/bifrost/core/providers/utils": [
       "TestContextTransport_TruncatedContentLengthStreamReportsUnexpectedEOFAndDiscardsConn",
@@ -184,6 +185,10 @@
       "TestAdaptiveDurableIncidentLifecycle",
       "TestAdaptiveFailedReleaseKeepsCommittedHold",
       "TestAdaptiveSQLiteWaitDoesNotBlockHealthyTraffic",
+      "TestAdaptiveDueKeyCheckDoesNotBlockHealthyTraffic",
+      "TestAdaptiveDueProviderCheckDoesNotBlockHealthyTraffic",
+      "TestAdaptiveScopeChangeResolvesAllRecoveredIncidents",
+      "TestAdaptiveProbeAdmissionIsVolatileUntilCompletion",
       "TestAdaptiveFrozenRevisionDetectsNestedSecretRotation",
       "TestAdaptiveHistoryOffKeepsDurableConditions",
       "TestAdaptiveDeletedHealthyProviderDoesNotPoisonRestart",

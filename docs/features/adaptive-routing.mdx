@@ -94,6 +94,8 @@ checking request. Successful checks release it into recovery; no synthetic probe
 traffic is sent. Transient failures and timeouts affect health but do not create
 credential holds. A stream failure is observed per attempt, including failed
 startup attempts that core retries before response plugins see them.
+An explicit key pin is explained by core in the same routing log; it is not
+reported as an adaptive selection.
 
 ## State and maintenance
 
@@ -136,6 +138,12 @@ The configured snapshot interval saves the most recent telemetry, at most 2,048
 records and 1 MiB. The snapshot carries the lifecycle revision and cannot cross
 a later key rotation or state transition. In-flight attempts and probe leases
 are not restored: after restart a due condition can receive a fresh real check.
+Probe admission only reserves an in-memory lease; it never writes SQLite. While
+a lifecycle writer is busy, optional checks yield to healthy alternatives.
+**Completed checks** counts checks whose outcomes were durably recorded. The
+actual start time and result are committed together when the attempt finishes.
+Cancellation frees the lease without reducing health or counting a completed
+check. A process lost mid-check leaves the existing durable hold unchanged.
 
 Incidents use server-side filters, ordering and cursor pagination through
 `GET /api/adaptive-routing/incidents` and `GET /api/adaptive-routing/incidents/{id}`.
@@ -144,6 +152,9 @@ Key/provider removal ends the old observation as **No longer observed**;
 `closed_at` records that end, while `resolved_at` is set only for confirmed
 recovery. Maintenance deletes closed incidents and their events after the
 configured retention, in batches of at most 1,000. Open incidents are retained.
+If a model refusal changes into a whole-key refusal, or the reverse, successful
+requests advance all related open incidents together. A configuration edit
+still ends the old observation without claiming recovery.
 
 **Record Routing History** controls optional health diagnostics. Required
 condition lifecycle records remain durable while it is off, and native request
@@ -158,9 +169,10 @@ leader election; independently active replicas must not share this runtime.
 A local Linux measurement on an i9-12900K measured a condition/incident/event
 transaction at 3.29 ms with FULL durability (0.38 ms with NORMAL). This is the
 cost of a lifecycle transition, not a per-request write. With two providers and
-four managed keys, the current selection path measured 3.78 microseconds and
-2,296 bytes per request; key selection measured 2.21 microseconds and attempt
-observation 1.08 microseconds. Explicit-provider and unconfigured paths retain
+four managed keys, local runs measured 3.78–5.17 microseconds and
+2,296 bytes per request; key selection measured 2.21–2.94 microseconds and attempt
+observation 1.08–1.48 microseconds. Timing varies with other work on this host;
+allocation counts remained 22, 11 and 3 respectively. Explicit-provider and unconfigured paths retain
 zero allocations. The contention test
 checks warmed and first-use healthy requests while a release is waiting for
 SQLite's writer lock.

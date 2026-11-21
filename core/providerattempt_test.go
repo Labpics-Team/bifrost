@@ -3,6 +3,7 @@ package bifrost
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -144,5 +145,41 @@ func BenchmarkProviderAttemptObserverDisabled(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		client.beginProviderAttempt(ctx, schemas.OpenAI, "model", key, nil, "")
+	}
+}
+
+func TestExplicitKeySelectionExplainsNativePin(t *testing.T) {
+	keys := []schemas.Key{{ID: "first", Name: "First", Value: *schemas.NewSecretVar("sk-first"), Models: []string{"*"}}, {ID: "chosen", Name: "Chosen", Value: *schemas.NewSecretVar("sk-chosen"), Models: []string{"*"}}}
+	account := NewMockAccount()
+	account.AddProvider(schemas.OpenAI, 1, 10)
+	account.SetKeysForProvider(schemas.OpenAI, keys)
+	client := &Bifrost{account: account, logger: NewDefaultLogger(schemas.LogLevelError)}
+	for _, byName := range []bool{false, true} {
+		for _, multi := range []bool{false, true} {
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			if byName {
+				ctx.SetValue(schemas.BifrostContextKeyAPIKeyName, "Chosen")
+			} else {
+				ctx.SetValue(schemas.BifrostContextKeyAPIKeyID, "chosen")
+			}
+			var selected []schemas.Key
+			var err error
+			if multi {
+				selected, err = pinKeys(ctx, keys, schemas.OpenAI)
+			} else {
+				var canRotate bool
+				selected, canRotate, err = client.selectKeyFromProviderForModelWithPool(ctx, schemas.ChatCompletionRequest, schemas.OpenAI, "model", schemas.OpenAI)
+				if canRotate {
+					t.Fatal("explicit pin became a rotating pool")
+				}
+			}
+			if err != nil || len(selected) != 1 || selected[0].ID != "chosen" {
+				t.Fatalf("pin changed: %+v %v", selected, err)
+			}
+			logs := ctx.GetRoutingEngineLogs()
+			if len(logs) != 1 || logs[0].Engine != schemas.RoutingEngineCore || !strings.Contains(strings.ToLower(logs[0].Message), "explicit") || !strings.Contains(logs[0].Message, "Chosen") {
+				t.Fatalf("native pin lost its explanation: %+v", logs)
+			}
+		}
 	}
 }

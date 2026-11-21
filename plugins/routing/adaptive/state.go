@@ -231,38 +231,27 @@ func setIncidentState(i *Incident, state string, now time.Time, request string) 
 }
 
 func (c *Controller) reserveCondition(ctx *schemas.BifrostContext, id routeID, force bool) bool {
-	reserved := false
-	writeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	err := c.transition(writeCtx, func() transition {
-		h := c.holdLocked(id, c.now())
-		now := c.now()
-		if h == nil || h.ProbeUntil.After(now) || (!force && h.HoldUntil.After(now)) {
-			return transition{}
-		}
-		copy := *h
-		c.probeSequence++
-		copy.ProbeID = c.probeSequence
-		copy.ProbeUntil = now.Add(5 * time.Minute)
-		i := c.incidentLocked(h.routeID)
-		t := transition{}
-		if i != nil {
-			i.Checks++
-			i.UpdatedAt = now
-			t.incidents = []*Incident{i}
-			t.events = []IncidentEvent{incidentEvent(i, "check_started", requestID(ctx), "A real request is checking the held key.", now)}
-		}
-		t.publish = func() {
-			c.conditions[h.routeID] = &copy
-			ctx.SetValue(probeContextKey{}, probeReservation{routeID: id, conditionID: h.ID, token: copy.ProbeID})
-			reserved = true
-		}
-		return t
-	})
-	if err != nil {
-		ctx.AppendRoutingEngineLog(schemas.RoutingEngineLoadbalancing, schemas.LogLevelWarn, "Adaptive routing could not record a held-key check; the existing hold is retained.")
+	// A lease is disposable admission state, not a durable lifecycle transition.
+	// Skip an optional check while a transition is in progress; healthy traffic
+	// never queues behind that writer. Persist the actual check with its outcome.
+	if !c.lifeMu.TryLock() {
+		return false
 	}
-	return reserved
+	defer c.lifeMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.now()
+	h := c.holdLocked(id, now)
+	if h == nil || h.ProbeUntil.After(now) || (!force && h.HoldUntil.After(now)) {
+		return false
+	}
+	copy := *h
+	c.probeSequence++
+	copy.ProbeID = c.probeSequence
+	copy.ProbeUntil = now.Add(5 * time.Minute)
+	c.conditions[h.routeID] = &copy
+	ctx.SetValue(probeContextKey{}, probeReservation{routeID: id, conditionID: h.ID, token: copy.ProbeID})
+	return true
 }
 
 func requestID(ctx *schemas.BifrostContext) string {
@@ -301,6 +290,8 @@ func (c *Controller) completeConditions(a *attempt, failure schemas.FailureClass
 			if i == nil {
 				return transition{}
 			}
+			i.Checks++
+			t.events = append(t.events, incidentEvent(i, "check_started", request, "A real request checked the held key; its outcome is recorded in this transition.", a.start))
 			if failure == "" || failure.IsPerKey() && failure != h.HoldClass {
 				t.remove = append(t.remove, h)
 				setIncidentState(i, "recovering", now, request)
@@ -360,28 +351,34 @@ func (c *Controller) updateHealthIncident(r *route, request string, now time.Tim
 			return transition{}
 		}
 		state := c.stateLocked(r, now)
-		i := c.incidentLocked(routeID{Provider: r.Provider, KeyID: r.KeyID})
-		if i == nil {
-			i = c.incidentLocked(r.routeID)
+		// A model refusal can turn into a whole-key refusal (or vice versa).
+		// The same real recovery evidence then advances both open observations.
+		incidents := make([]*Incident, 0, 2)
+		for _, scope := range []routeID{{Provider: r.Provider, KeyID: r.KeyID}, r.routeID} {
+			if i := c.incidentLocked(scope); i != nil {
+				incidents = append(incidents, i)
+			}
 		}
-		if !c.config.load().HistoryEnabled && i == nil {
-			return transition{}
+		if len(incidents) == 0 {
+			if !c.config.load().HistoryEnabled || state == "unknown" || state == "healthy" {
+				return transition{}
+			}
+			incidents = append(incidents, c.newIncidentLocked(r.routeID, r.KeyName, now, request))
 		}
-		if i == nil && (state == "unknown" || state == "healthy") {
-			return transition{}
+		t := transition{}
+		for _, i := range incidents {
+			if i.State == state && i.Status != "waiting_for_traffic" {
+				i.LastSeen = now
+				i.LastRequestID = request
+				c.incidents[incidentRoute(i)] = i
+				continue
+			}
+			i.FailureClass = string(r.FailureClass)
+			setIncidentState(i, state, now, request)
+			t.incidents = append(t.incidents, i)
+			t.events = append(t.events, incidentEvent(i, "state_changed", request, fmt.Sprintf("Observed route state changed to %s.", state), now))
 		}
-		if i != nil && i.State == state && i.Status != "waiting_for_traffic" {
-			i.LastSeen = now
-			i.LastRequestID = request
-			c.incidents[incidentRoute(i)] = i
-			return transition{}
-		}
-		if i == nil {
-			i = c.newIncidentLocked(r.routeID, r.KeyName, now, request)
-		}
-		i.FailureClass = string(r.FailureClass)
-		setIncidentState(i, state, now, request)
-		return transition{incidents: []*Incident{i}, events: []IncidentEvent{incidentEvent(i, "state_changed", request, fmt.Sprintf("Observed route state changed to %s.", state), now)}}
+		return t
 	})
 }
 

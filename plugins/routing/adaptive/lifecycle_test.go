@@ -262,11 +262,35 @@ func TestAdaptiveFailedReleaseKeepsCommittedHold(t *testing.T) {
 }
 
 func TestAdaptiveSQLiteWaitDoesNotBlockHealthyTraffic(t *testing.T) {
-	c, _ := providerController()
+	adaptiveHealthyTrafficDuringSQLiteWait(t, false, false)
+}
+
+func TestAdaptiveDueKeyCheckDoesNotBlockHealthyTraffic(t *testing.T) {
+	adaptiveHealthyTrafficDuringSQLiteWait(t, true, false)
+}
+
+func TestAdaptiveDueProviderCheckDoesNotBlockHealthyTraffic(t *testing.T) {
+	adaptiveHealthyTrafficDuringSQLiteWait(t, true, true)
+}
+
+func adaptiveHealthyTrafficDuringSQLiteWait(t *testing.T, due, routeProvider bool) {
+	t.Helper()
+	c, now := providerController()
 	s := newSettingsStore(t)
 	attachStore(t, c, s)
 	observe(c, "p1", "m", "a", responseError(401))
-	observe(c, "p1", "m", "b", nil)
+	if routeProvider {
+		observe(c, "p1", "m", "b", responseError(401))
+		observe(c, "p2", "m", "b", nil)
+		cfg := c.Config()
+		cfg.RerouteFailedDirections = true
+		c.Apply(cfg)
+	} else {
+		observe(c, "p1", "m", "b", nil)
+	}
+	if due {
+		*now = now.Add(time.Minute)
+	}
 	locked := make(chan struct{})
 	unlock := make(chan struct{})
 	writerDone := make(chan error, 1)
@@ -293,21 +317,40 @@ func TestAdaptiveSQLiteWaitDoesNotBlockHealthyTraffic(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	served := make(chan struct{})
+	served := make(chan error, 1)
 	go func() {
+		if routeProvider {
+			for _, provider := range []schemas.ModelProvider{"", "p1"} {
+				ctx, req := testContext(), routeRequest(provider)
+				if err := c.Route(ctx, req); err != nil {
+					served <- err
+					return
+				}
+				if chosen, _, _ := req.GetRequestFields(); chosen != "p2" {
+					served <- fmt.Errorf("expected healthy provider p2, got %s", chosen)
+					return
+				}
+				observeWithContext(c, ctx, "p2", "m", "b", nil)
+			}
+			served <- nil
+			return
+		}
 		for _, model := range []string{"m", "new-model"} {
 			ctx := testContext()
 			key, err := c.SelectKey(ctx, testKeys, "p1", model)
-			if err == nil && key.ID == "b" {
-				observeWithContext(c, ctx, "p1", model, "b", nil)
+			if err != nil || key.ID != "b" {
+				served <- fmt.Errorf("expected healthy key b, got %s: %v", key.ID, err)
+				return
 			}
+			observeWithContext(c, ctx, "p1", model, "b", nil)
 		}
 		// First use of a different configured key also needs no durable write.
 		observe(c, "p2", "fresh", "b", nil)
-		close(served)
+		served <- nil
 	}()
+	var servingErr error
 	select {
-	case <-served:
+	case servingErr = <-served:
 	case <-time.After(200 * time.Millisecond):
 		close(unlock)
 		<-writerDone
@@ -320,6 +363,117 @@ func TestAdaptiveSQLiteWaitDoesNotBlockHealthyTraffic(t *testing.T) {
 	}
 	if err := <-releaseDone; err != nil {
 		t.Fatal(err)
+	}
+	if servingErr != nil {
+		t.Fatal(servingErr)
+	}
+}
+
+func TestAdaptiveScopeChangeResolvesAllRecoveredIncidents(t *testing.T) {
+	for _, codes := range [][2]int{{429, 401}, {401, 429}} {
+		t.Run(fmt.Sprint(codes), func(t *testing.T) {
+			c, now := providerController()
+			s := newSettingsStore(t)
+			attachStore(t, c, s)
+			observe(c, "p1", "m", "a", responseError(codes[0]))
+			*now = now.Add(time.Minute)
+			observe(c, "p1", "m", "a", responseError(codes[1]))
+			if err := c.Release(context.Background(), "p1", "a", ""); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 30; i++ {
+				observe(c, "p1", "m", "a", nil)
+			}
+			page, err := c.ListIncidents(context.Background(), IncidentQuery{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			seen := map[string]bool{}
+			for _, incident := range page.Incidents {
+				if incident.KeyID != "a" {
+					continue
+				}
+				seen[incident.Scope] = true
+				if incident.Status != "resolved" || incident.ClosedAt == nil || incident.ResolvedAt == nil {
+					t.Fatalf("recovered scope remained open: %+v", incident)
+				}
+			}
+			if !seen["key"] || !seen["key_model"] {
+				t.Fatalf("lost a related incident: %+v", seen)
+			}
+		})
+	}
+}
+
+func TestAdaptiveProbeAdmissionIsVolatileUntilCompletion(t *testing.T) {
+	c, now := providerController()
+	s := newSettingsStore(t)
+	attachStore(t, c, s)
+	observe(c, "p1", "m", "a", responseError(401))
+	*now = now.Add(time.Minute)
+	if err := s.DB().Exec("CREATE TRIGGER fail_adaptive_commit BEFORE UPDATE ON adaptive_routing_state BEGIN SELECT RAISE(ABORT, 'write unavailable'); END").Error; err != nil {
+		t.Fatal(err)
+	}
+	ctx := testContext()
+	key, err := c.SelectKey(ctx, testKeys, "p1", "m")
+	if err != nil || key.ID != "a" {
+		t.Fatalf("probe admission depended on SQLite write: %s %v", key.ID, err)
+	}
+	a := c.BeginProviderAttempt(ctx, schemas.ProviderAttemptInfo{Provider: "p1", Model: "m", KeyID: key.ID})
+	a.End() // caller cancellation produces no completed check or failure sample
+	ctx = testContext()
+	key, err = c.SelectKey(ctx, testKeys, "p1", "m")
+	if err != nil || key.ID != "a" {
+		t.Fatal("cancelled attempt retained its lease")
+	}
+	state, err := c.stateStore.Load(context.Background())
+	if err != nil || len(state.Conditions) != 1 {
+		t.Fatalf("lease changed the durable hold: %+v %v", state, err)
+	}
+	for _, i := range state.OpenIncidents {
+		if i.Checks != 0 {
+			t.Fatal("unfinished attempt counted as a completed check")
+		}
+	}
+	// A new runtime sees the same hold and can acquire a fresh lease immediately.
+	loaded, loadedNow := providerController()
+	*loadedNow = *now
+	attachStore(t, loaded, s)
+	if err := loaded.Restore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx = testContext()
+	key, err = loaded.SelectKey(ctx, testKeys, "p1", "m")
+	if err != nil || key.ID != "a" {
+		t.Fatal("restart restored a stale lease")
+	}
+	if err := s.DB().Exec("DROP TRIGGER fail_adaptive_commit").Error; err != nil {
+		t.Fatal(err)
+	}
+	started := *loadedNow
+	a = loaded.BeginProviderAttempt(ctx, schemas.ProviderAttemptInfo{Provider: "p1", Model: "m", KeyID: key.ID})
+	*loadedNow = loadedNow.Add(time.Second)
+	a.Observe(nil, responseError(401))
+	a.End()
+	page, err := loaded.ListIncidents(context.Background(), IncidentQuery{Scope: "key"})
+	if err != nil || len(page.Incidents) != 1 || page.Incidents[0].Checks != 1 {
+		t.Fatalf("completed check was not recorded once: %+v %v", page, err)
+	}
+	detail, err := loaded.GetIncident(context.Background(), page.Incidents[0].ID, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range detail.Events {
+		if event.Kind == "check_started" {
+			found = true
+			if !event.Timestamp.Equal(started) {
+				t.Fatal("check start lost its actual timestamp")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("completed check lost its start event")
 	}
 }
 

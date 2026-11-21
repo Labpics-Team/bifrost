@@ -11323,6 +11323,7 @@ func pinKeys(ctx *schemas.BifrostContext, keys []schemas.Key, providerKey schema
 		if keyID = strings.TrimSpace(keyID); keyID != "" {
 			for _, key := range keys {
 				if key.ID == keyID {
+					logExplicitKeySelection(ctx, key, providerKey)
 					return []schemas.Key{key}, nil
 				}
 			}
@@ -11333,6 +11334,7 @@ func pinKeys(ctx *schemas.BifrostContext, keys []schemas.Key, providerKey schema
 		if keyName = strings.TrimSpace(keyName); keyName != "" {
 			for _, key := range keys {
 				if key.Name == keyName {
+					logExplicitKeySelection(ctx, key, providerKey)
 					return []schemas.Key{key}, nil
 				}
 			}
@@ -11340,6 +11342,10 @@ func pinKeys(ctx *schemas.BifrostContext, keys []schemas.Key, providerKey schema
 		}
 	}
 	return keys, nil
+}
+
+func logExplicitKeySelection(ctx *schemas.BifrostContext, key schemas.Key, provider schemas.ModelProvider) {
+	ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelInfo, fmt.Sprintf("Explicit key pin selected %s (%s) for provider %s.", key.Name, key.ID, provider))
 }
 
 // applyKeyAlias points the request's model at this key's alias, as the per-attempt closure does for a selected key.
@@ -11537,6 +11543,7 @@ func (bifrost *Bifrost) selectKeyFromProviderForModelWithPool(ctx *schemas.Bifro
 			if keyID = strings.TrimSpace(keyID); keyID != "" {
 				for _, key := range supportedKeys {
 					if key.ID == keyID {
+						logExplicitKeySelection(ctx, key, providerKey)
 						return []schemas.Key{key}, false, nil
 					}
 				}
@@ -11547,6 +11554,7 @@ func (bifrost *Bifrost) selectKeyFromProviderForModelWithPool(ctx *schemas.Bifro
 			if keyName = strings.TrimSpace(keyName); keyName != "" {
 				for _, key := range supportedKeys {
 					if key.Name == keyName {
+						logExplicitKeySelection(ctx, key, providerKey)
 						return []schemas.Key{key}, false, nil
 					}
 				}
