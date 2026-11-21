@@ -231,6 +231,43 @@ for (const view of ['list', 'events'] as const) {
   })
 }
 
+test('cached event pages cannot restore older incident metadata after recovery', async ({ page }) => {
+  const held: AdaptiveRoutingIncident = {
+    ...heldIncident, updated_at: '2026-11-21T10:00:01.000000001Z', first_request_id: 'first-request', last_request_id: 'first-request',
+  }
+  // Both updates are in the same millisecond; Go timestamps retain nanoseconds.
+  const recovered: AdaptiveRoutingIncident = {
+    ...held, state: 'healthy', status: 'resolved', updated_at: '2026-11-21T10:00:01.00000001Z',
+    closed_at: '2026-11-21T10:00:01.00000001Z', resolved_at: '2026-11-21T10:00:01.00000001Z',
+    checks: 3, last_request_id: 'recovery-request',
+  }
+  const requestedCursors: string[] = []
+  await page.route('**/api/adaptive-routing/incidents?*', route => route.fulfill({ json: { incidents: [held], total: 1 } }))
+  await page.route('**/api/adaptive-routing/incidents/held-incident?*', route => {
+    const cursor = new URL(route.request().url()).searchParams.get('cursor') ?? ''
+    requestedCursors.push(cursor)
+    return route.fulfill({ json: {
+      incident: cursor ? recovered : held,
+      events: [{ id: cursor || 'first', kind: 'provider_note', timestamp: held.opened_at, message: cursor ? 'Second event page' : 'First event page' }],
+      next_cursor: cursor ? undefined : 'page-two',
+    } })
+  })
+  await page.goto('/workspace/adaptive-routing/incidents?live=false')
+  await page.getByTestId('adaptive-incident-open').click()
+  const detail = page.getByTestId('adaptive-incident-detail')
+  await expect(detail.getByTestId('adaptive-routing-release')).toBeVisible()
+  await detail.getByRole('button', { name: 'Next page', exact: true }).click()
+  await expect(detail).toContainText('The route serves normally again.')
+  await expect(detail.getByTestId('adaptive-routing-release')).toHaveCount(0)
+  await detail.getByRole('button', { name: 'Previous page', exact: true }).click()
+  await expect(detail.getByTestId('adaptive-incident-events')).toContainText('First event page')
+  expect(requestedCursors).toEqual(['', 'page-two'])
+  await expect(detail).toContainText('The route serves normally again.')
+  await expect(detail.getByText('Completed checks', { exact: true }).locator('..')).toContainText('3')
+  await expect(detail.getByTestId('adaptive-incident-request').last()).toHaveAttribute('href', /selected_log=recovery-request/)
+  await expect(detail.getByTestId('adaptive-routing-release')).toHaveCount(0)
+})
+
 test('Russian incident text follows system codes and preserves provider text and request links', async ({ page }, testInfo) => {
   await page.addInitScript(() => localStorage.setItem('bifrost.locale', 'ru'))
   const incident: AdaptiveRoutingIncident = {

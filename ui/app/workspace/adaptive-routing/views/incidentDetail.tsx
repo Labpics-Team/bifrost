@@ -18,6 +18,14 @@ import {
 import { RoutingQueryState } from "./routingQueryState";
 import { ReleaseHoldButton } from "./releaseHoldButton";
 
+function isLaterUpdate(next: string, previous: string) {
+	const milliseconds = Date.parse(next) - Date.parse(previous);
+	if (milliseconds !== 0) return milliseconds > 0;
+	// Go emits RFC3339Nano; Date.parse alone loses updates within one millisecond.
+	const fraction = (value: string) => (value.match(/\.(\d+)(?:Z|[+-]\d{2}:\d{2})$/)?.[1] ?? "").padEnd(9, "0");
+	return fraction(next) > fraction(previous);
+}
+
 export function IncidentDetail({ id, live, close }: { id: string; live: boolean; close: () => void }) {
 	const { t } = useTranslation("observability");
 	const locale = useLocale();
@@ -31,8 +39,18 @@ export function IncidentDetail({ id, live, close }: { id: string; live: boolean;
 		},
 	);
 	const detail = query.currentData;
-	// The incident is independent of the event page. Retain it during navigation.
-	const incident = query.data?.incident;
+	const observedIncident = query.data?.incident;
+	const [latestIncident, setLatestIncident] = useState(observedIncident);
+	// Cached event pages may contain older metadata. Retain the newest observation
+	// for this incident before rendering actions, counters and request evidence.
+	if (
+		observedIncident?.id === id &&
+		observedIncident !== latestIncident &&
+		(!latestIncident || latestIncident.id !== id || isLaterUpdate(observedIncident.updated_at, latestIncident.updated_at))
+	) {
+		setLatestIncident(observedIncident);
+	}
+	const incident = latestIncident?.id === id ? latestIncident : undefined;
 	const date = (value: string) => new Date(value).toLocaleString(locale);
 	const requestLinks = incident
 		? [
