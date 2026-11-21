@@ -18,6 +18,7 @@ import { parseArrayFromText } from "@/lib/utils/array";
 import { formatCooldown } from "@/lib/utils/duration";
 import { getApiBaseUrl } from "@/lib/utils/port";
 import { isSecretVarSet } from "@/lib/utils/secretVarForm";
+import { oidcConfigSchema } from "@/lib/types/schemas";
 import { getPasswordPolicyFailures, type PasswordRequirementKey, validateOrigins } from "@/lib/utils/validation";
 import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
 import { useGetAuthTypeQuery } from "@enterprise/lib/store/apis/scimApi";
@@ -26,6 +27,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { withBasePath } from "@/lib/utils/basePath";
+import OIDCSettings from "./oidcSettings";
 
 // Go duration string: one or more <number><unit> segments, e.g. "5m", "1h30m".
 const COOLDOWN_PATTERN = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
@@ -46,6 +48,7 @@ export default function SecurityView() {
 	const passwordInputRef = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
 	const passwordUnchangedRef = useRef(true);
 	const inferenceAuthTouchedRef = useRef(false);
+	const [oidcValidationAttempted, setOIDCValidationAttempted] = useState(false);
 
 	const [localValues, setLocalValues] = useState<{
 		allowed_origins: string;
@@ -126,8 +129,13 @@ export default function SecurityView() {
 			authConfig.admin_password?.value !== bifrostConfig?.auth_config?.admin_password?.value ||
 			authConfig.admin_password?.ref !== bifrostConfig?.auth_config?.admin_password?.ref ||
 			authConfig.admin_password?.type !== bifrostConfig?.auth_config?.admin_password?.type;
-		return usernameChanged || passwordChanged;
+		return usernameChanged || passwordChanged || JSON.stringify(authConfig.oidc) !== JSON.stringify(bifrostConfig?.auth_config?.oidc);
 	}, [authConfig, bifrostConfig]);
+	const oidcValidation = useMemo(
+		() => (authConfig.is_enabled && authConfig.oidc ? oidcConfigSchema.safeParse(authConfig.oidc) : null),
+		[authConfig, t],
+	);
+	const oidcErrors = oidcValidationAttempted && oidcValidation && !oidcValidation.success ? oidcValidation.error.flatten().fieldErrors : {};
 
 	const hasChanges = useMemo(() => {
 		if (!config) return false;
@@ -233,7 +241,10 @@ export default function SecurityView() {
 	const handleVkRotationCooldownChange = useCallback((value: string) => {
 		setLocalValues((prev) => ({ ...prev, vk_rotation_cooldown: value }));
 		// The backend accepts Go duration strings; empty input means 0 (disabled).
-		setLocalConfig((prev) => ({ ...prev, vk_rotation_cooldown: value.trim() === "" ? 0 : value.trim() }));
+		setLocalConfig((prev) => ({
+			...prev,
+			vk_rotation_cooldown: value.trim() === "" ? 0 : value.trim(),
+		}));
 	}, []);
 
 	const handleAuthToggle = useCallback(
@@ -242,7 +253,10 @@ export default function SecurityView() {
 			setProofError("");
 			if (!isFirstTimeSetup || inferenceAuthTouchedRef.current) return;
 			// Untouched preselection follows the dashboard toggle both ways, so canceling setup restores the stored value.
-			setLocalConfig((prev) => ({ ...prev, enforce_auth_on_inference: checked || (config?.enforce_auth_on_inference ?? false) }));
+			setLocalConfig((prev) => ({
+				...prev,
+				enforce_auth_on_inference: checked || (config?.enforce_auth_on_inference ?? false),
+			}));
 		},
 		[isFirstTimeSetup, config?.enforce_auth_on_inference],
 	);
@@ -299,6 +313,15 @@ export default function SecurityView() {
 			}
 			const hasUsername = authConfig.admin_username?.value || authConfig.admin_username?.ref;
 			const hasPassword = authConfig.admin_password?.value || authConfig.admin_password?.ref;
+			if (authConfig.is_enabled && !authConfig.oidc?.enabled && !(hasUsername && hasPassword)) {
+				toast.error(t("security.oidc.authRequired"));
+				return;
+			}
+			setOIDCValidationAttempted(true);
+			if (oidcValidation && !oidcValidation.success) {
+				document.querySelector('[data-testid="oidc-settings"]')?.scrollIntoView({ block: "nearest" });
+				return;
+			}
 			const passwordPolicyFailures =
 				showPasswordSection && authConfig.is_enabled && !authConfig.admin_password?.ref && authConfig.admin_password?.value
 					? getPasswordPolicyFailures(authConfig.admin_password.value, passwordUnchangedRef.current)
@@ -315,7 +338,10 @@ export default function SecurityView() {
 				return;
 			}
 			const proof = requiresProofOfControl
-				? authProofOfControlSchema.safeParse({ current_password: currentPassword, setup_token: setupToken })
+				? authProofOfControlSchema.safeParse({
+						current_password: currentPassword,
+						setup_token: setupToken,
+					})
 				: null;
 			if (proof && !proof.success) {
 				setProofError(t("security.proofRequired"));
@@ -332,7 +358,7 @@ export default function SecurityView() {
 				...(showPasswordSection
 					? {
 							auth_config: {
-								...(authConfig.is_enabled && hasUsername && hasPassword ? authConfig : { ...authConfig, is_enabled: false }),
+								...authConfig,
 								...(isFirstTimeSetup && !authorizedBySetupToken ? { setup_token: setupToken.trim() } : {}),
 								...(proof?.success && proof.data.current_password ? { current_password: proof.data.current_password } : {}),
 								...(proof?.success && proof.data.setup_token ? { setup_token: proof.data.setup_token } : {}),
@@ -346,8 +372,11 @@ export default function SecurityView() {
 			toast.success(t("security.toastSaved"));
 			// Dashboard auth is now on, so the OSS setup lock is lifted. Expire the setup
 			// session cookie (logout clears it) and sign in with the new admin account.
-			if (showPasswordSection && authConfig.is_enabled && hasUsername && hasPassword && authorizedBySetupToken) {
-				await fetch(`${getApiBaseUrl()}/session/logout`, { method: "POST", credentials: "include" }).catch(() => undefined);
+			if (showPasswordSection && authConfig.is_enabled && authorizedBySetupToken) {
+				await fetch(`${getApiBaseUrl()}/session/logout`, {
+					method: "POST",
+					credentials: "include",
+				}).catch(() => undefined);
 				window.location.href = withBasePath("/login");
 			}
 		} catch (error) {
@@ -376,6 +405,9 @@ export default function SecurityView() {
 		currentPassword,
 		requiresProofOfControl,
 		authorizedBySetupToken,
+		t,
+		formatPasswordPolicyError,
+		oidcValidation,
 	]);
 
 	return (
@@ -404,13 +436,20 @@ export default function SecurityView() {
 							<div className="flex items-center justify-between">
 								<div className="space-y-0.5">
 									<Label htmlFor="auth-enabled" className="text-sm font-medium">
-										{t("security.passwordProtect")} <Badge variant="secondary">BETA</Badge>
+										{t("security.oidc.protectDashboard")} <Badge variant="secondary">BETA</Badge>
 									</Label>
-									<p className="text-muted-foreground text-sm">{t("security.passwordProtectHelp")}</p>
+									<p className="text-muted-foreground text-sm">{t("security.oidc.dashboardHelp")}</p>
 								</div>
 								<Switch id="auth-enabled" checked={authConfig.is_enabled} disabled={isConfigLoading} onCheckedChange={handleAuthToggle} />
 							</div>
+							<OIDCSettings
+								value={authConfig.oidc}
+								errors={oidcErrors}
+								disabled={!authConfig.is_enabled || !hasSettingsUpdateAccess}
+								onChange={(oidc) => setAuthConfig((previous) => ({ ...previous, oidc }))}
+							/>
 							<div className="space-y-4">
+								{authConfig.oidc?.enabled && <p className="text-sm font-medium">{t("security.oidc.localPassword")}</p>}
 								<div className="space-y-2">
 									<Label htmlFor="admin-username">{t("security.username")}</Label>
 									<SecretVarInput
@@ -723,7 +762,10 @@ export default function SecurityView() {
 						placeholder={t("mcpSettings.issuerUrlPlaceholder")}
 						value={localConfig.oauth2_server_config?.issuer_url}
 						onChange={(value: SecretVar) =>
-							setLocalConfig((prev) => ({ ...prev, oauth2_server_config: { ...prev.oauth2_server_config, issuer_url: value } }))
+							setLocalConfig((prev) => ({
+								...prev,
+								oauth2_server_config: { ...prev.oauth2_server_config, issuer_url: value },
+							}))
 						}
 						disabled={!hasSettingsUpdateAccess}
 					/>
@@ -731,9 +773,7 @@ export default function SecurityView() {
 						!secretVarEquals(localConfig.oauth2_server_config?.issuer_url, config?.oauth2_server_config?.issuer_url) && (
 							<Alert variant="warning" data-testid="oauth2-issuer-url-change-warning">
 								<AlertTriangle className="size-4" />
-								<AlertDescription>
-									{t("security.issuerChangeWarning")}
-								</AlertDescription>
+								<AlertDescription>{t("security.issuerChangeWarning")}</AlertDescription>
 							</Alert>
 						)}
 				</div>

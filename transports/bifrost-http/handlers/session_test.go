@@ -1,15 +1,102 @@
 package handlers
 
 import (
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/fasthttp/router"
+	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/configstore"
+	"github.com/maximhq/bifrost/framework/configstore/tables"
+	"github.com/maximhq/bifrost/framework/encrypt"
 	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 )
+
+type authChangeDuringSessionStore struct {
+	configstore.ConfigStore
+	beforeCreate   func()
+	attemptedToken string
+}
+
+func (s *authChangeDuringSessionStore) CreateSessionIfAuthMatches(ctx context.Context, session *tables.SessionsTable, expectedAuth *configstore.AuthConfig) error {
+	s.attemptedToken = session.Token
+	if s.beforeCreate != nil {
+		s.beforeCreate()
+		s.beforeCreate = nil
+	}
+	return s.ConfigStore.CreateSessionIfAuthMatches(ctx, session, expectedAuth)
+}
+
+func TestPasswordLoginUsesCurrentAuthPolicy(t *testing.T) {
+	SetLogger(&mockLogger{})
+	oldPassword := "OldPassword123!"
+	newPassword := "NewPassword123!"
+	oldHash, err := encrypt.Hash(oldPassword)
+	require.NoError(t, err)
+	newHash, err := encrypt.Hash(newPassword)
+	require.NoError(t, err)
+	for _, change := range []string{"oidc-only", "password", "unchanged"} {
+		t.Run(change, func(t *testing.T) {
+			store := &authChangeDuringSessionStore{ConfigStore: newRealOAuth2Store(t)}
+			original := &configstore.AuthConfig{IsEnabled: true, AdminUserName: schemas.NewSecretVar("admin"), AdminPassword: schemas.NewSecretVar(oldHash)}
+			require.NoError(t, store.UpdateAuthConfig(context.Background(), original))
+			middleware, err := InitAuthMiddleware(store, nil, nil, "")
+			require.NoError(t, err)
+			routes := router.New()
+			NewSessionHandler(store, nil).RegisterRoutes(routes, middleware.APIMiddleware())
+			routes.GET("/api/protected", middleware.APIMiddleware()(func(ctx *fasthttp.RequestCtx) { ctx.SetStatusCode(fasthttp.StatusOK) }))
+			store.beforeCreate = func() {
+				next := &configstore.AuthConfig{IsEnabled: true, AdminUserName: schemas.NewSecretVar("admin"), AdminPassword: schemas.NewSecretVar(oldHash)}
+				if change == "oidc-only" {
+					next.AdminUserName, next.AdminPassword = nil, nil
+					next.OIDC = &configstore.OIDCConfig{Enabled: true, IssuerURL: "https://id.example", ClientID: "bifrost", RedirectURL: "https://ai.example/api/session/oidc/callback", AllowedSubjects: []string{"admin"}}
+				} else if change == "password" {
+					next.AdminPassword = schemas.NewSecretVar(newHash)
+				}
+				require.NoError(t, store.UpdateAuthConfig(context.Background(), next))
+				middleware.UpdateAuthConfig(next)
+			}
+			login := func(password string) *fasthttp.RequestCtx {
+				ctx := &fasthttp.RequestCtx{}
+				ctx.Init(&fasthttp.Request{}, nil, nil)
+				ctx.Request.Header.SetMethod("POST")
+				ctx.Request.SetRequestURI("/api/session/login")
+				body, err := json.Marshal(map[string]string{"username": "admin", "password": password})
+				require.NoError(t, err)
+				ctx.Request.SetBody(body)
+				routes.Handler(ctx)
+				return ctx
+			}
+			response := login(oldPassword)
+			if change == "unchanged" {
+				require.Equal(t, fasthttp.StatusOK, response.Response.StatusCode(), string(response.Response.Body()))
+			} else {
+				assert.Equal(t, fasthttp.StatusUnauthorized, response.Response.StatusCode(), string(response.Response.Body()))
+				assert.Empty(t, setCookieHeaders(response), "a policy change must not issue a session cookie")
+			}
+			protected := &fasthttp.RequestCtx{}
+			protected.Init(&fasthttp.Request{}, nil, nil)
+			protected.Request.SetRequestURI("/api/protected")
+			protected.Request.Header.SetCookie("token", store.attemptedToken)
+			routes.Handler(protected)
+			if change == "unchanged" {
+				require.Equal(t, fasthttp.StatusOK, protected.Response.StatusCode())
+			} else {
+				assert.Equal(t, fasthttp.StatusUnauthorized, protected.Response.StatusCode(), "the rejected sign-in must leave no usable session")
+			}
+			if change == "password" {
+				response = login(newPassword)
+				require.Equal(t, fasthttp.StatusOK, response.Response.StatusCode(), string(response.Response.Body()))
+			}
+		})
+	}
+}
 
 // setCookieHeaders returns one Set-Cookie line per response cookie. fasthttp's
 // PeekAll(Set-Cookie) joins every cookie into a single value, which would let an

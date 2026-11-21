@@ -169,6 +169,23 @@
 		}
 	},
 	"security": {
+		"oidc": {
+			"localPassword": "ローカル管理者のパスワード（任意）",
+			"protectDashboard": "ダッシュボードを保護",
+			"dashboardHelp": "OpenID Connect またはローカル管理者のパスワードでログインします。",
+			"title": "OpenID Connect",
+			"description": "ID プロバイダーを使用してダッシュボードにログインします。",
+			"issuer": "発行者 URL",
+			"clientId": "クライアント ID",
+			"clientSecret": "クライアントシークレット",
+			"secretHelp": "公開クライアントでは任意です。空欄の場合は保存済みのシークレットを保持します。",
+			"redirect": "リダイレクト URL",
+			"redirectHelp": "この URL を正確にプロバイダーへ登録してください。末尾は /api/session/oidc/callback とし、ベースパスがある場合は含めてください。",
+			"subjects": "許可する subject ID",
+			"emails": "許可する確認済みメールアドレス",
+			"allowHelp": "1 行に 1 件入力します。subject または確認済みメールアドレスが最低 1 件必要です。一致するユーザーには管理者アクセスが付与されます。",
+			"authRequired": "OpenID Connect を設定するか、管理者のユーザー名とパスワードを入力してください。"
+		},
 		"title": "セキュリティ設定",
 		"description": "セキュリティとアクセス制御を構成します。",
 		"loadingAuth": "認証設定を読み込み中",

@@ -1409,6 +1409,9 @@ func (m *MockConfigStore) GetAuthConfig(ctx context.Context) (*configstore.AuthC
 }
 
 func (m *MockConfigStore) UpdateAuthConfig(ctx context.Context, config *configstore.AuthConfig) error {
+	if !m.authConfig.Equals(config) {
+		m.flushSessionsCalled = true
+	}
 	m.authConfig = config
 	return nil
 }
@@ -1549,6 +1552,13 @@ func (m *MockConfigStore) GetSession(ctx context.Context, token string) (*tables
 
 func (m *MockConfigStore) CreateSession(ctx context.Context, session *tables.SessionsTable) error {
 	return nil
+}
+
+func (m *MockConfigStore) CreateSessionIfAuthMatches(ctx context.Context, session *tables.SessionsTable, expectedAuth *configstore.AuthConfig) error {
+	if expectedAuth == nil || !expectedAuth.IsEnabled || !m.authConfig.Equals(expectedAuth) {
+		return configstore.ErrAuthConfigChanged
+	}
+	return m.CreateSession(ctx, session)
 }
 
 func (m *MockConfigStore) DeleteSession(ctx context.Context, token string) error {

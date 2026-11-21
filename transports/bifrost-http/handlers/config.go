@@ -201,6 +201,7 @@ func (h *ConfigHandler) getConfig(ctx *fasthttp.RequestCtx) {
 				"admin_username": authConfig.AdminUserName,
 				"admin_password": passwordSecretVar,
 				"is_enabled":     authConfig.IsEnabled,
+				"oidc":           authConfig.OIDC.Redacted(),
 			}
 		}
 		// When authConfig is nil, no admin account has been created yet: leave
@@ -353,6 +354,7 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 	}
 	var requestFields struct {
 		ClientConfig map[string]json.RawMessage `json:"client_config"`
+		AuthConfig   map[string]json.RawMessage `json:"auth_config"`
 	}
 	if err := json.Unmarshal(ctx.PostBody(), &requestFields); err != nil {
 		SendError(ctx, fasthttp.StatusBadRequest, "Invalid request payload")
@@ -506,23 +508,50 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("failed to get auth config from store: %v", err))
 			return
 		}
+		if existingAuthConfig != nil {
+			if _, present := requestFields.AuthConfig["admin_username"]; !present {
+				payload.AuthConfig.AdminUserName = existingAuthConfig.AdminUserName.Clone()
+			}
+			if _, present := requestFields.AuthConfig["oidc"]; !present {
+				payload.AuthConfig.OIDC = existingAuthConfig.OIDC.Clone()
+			} else if payload.AuthConfig.OIDC != nil && payload.AuthConfig.OIDC.ClientSecret.ShouldPreserveStored() && existingAuthConfig.OIDC != nil {
+				payload.AuthConfig.OIDC.ClientSecret = existingAuthConfig.OIDC.ClientSecret.Clone()
+			}
+		}
+		if err := payload.AuthConfig.OIDC.Validate(); err != nil {
+			SendError(ctx, fasthttp.StatusBadRequest, err.Error())
+			return
+		}
 		if existingAuthConfig == nil && payload.AuthConfig.IsEnabled {
 			if !isSetupTokenAuthenticated(ctx) && !h.configManager.ValidateSetupToken(payload.AuthConfig.SetupToken) {
 				SendError(ctx, fasthttp.StatusForbidden, "a valid setup token is required to create the initial admin account")
 				return
 			}
-			if payload.AuthConfig.AdminUserName == nil || payload.AuthConfig.AdminUserName.GetValue() == "" ||
-				payload.AuthConfig.AdminPassword == nil || payload.AuthConfig.AdminPassword.GetValue() == "" || payload.AuthConfig.AdminPassword.ShouldPreserveStored() {
+			if !payload.AuthConfig.OIDCEnabled() && (payload.AuthConfig.AdminUserName == nil || payload.AuthConfig.AdminUserName.GetValue() == "" ||
+				payload.AuthConfig.AdminPassword == nil || payload.AuthConfig.AdminPassword.GetValue() == "" || payload.AuthConfig.AdminPassword.ShouldPreserveStored()) {
 				SendError(ctx, fasthttp.StatusBadRequest, "auth username and password must be provided")
 				return
 			}
-			if failures := getPasswordPolicyFailures(payload.AuthConfig.AdminPassword.GetValue()); len(failures) > 0 {
+			if failures := getPasswordPolicyFailures(payload.AuthConfig.AdminPassword.GetValue()); payload.AuthConfig.HasPassword() && len(failures) > 0 {
 				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("auth password must include %s", strings.Join(failures, ", ")))
 				return
 			}
-			initialPasswordHash, err = encrypt.Hash(payload.AuthConfig.AdminPassword.GetValue())
-			if err != nil {
-				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("invalid auth password: %v", err))
+			if payload.AuthConfig.HasPassword() {
+				initialPasswordHash, err = encrypt.Hash(payload.AuthConfig.AdminPassword.GetValue())
+				if err != nil {
+					SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("invalid auth password: %v", err))
+					return
+				}
+			}
+		}
+		if payload.AuthConfig.IsEnabled && !payload.AuthConfig.OIDCEnabled() {
+			username := payload.AuthConfig.AdminUserName.GetValue()
+			password := payload.AuthConfig.AdminPassword.GetValue()
+			if existingAuthConfig != nil && payload.AuthConfig.AdminPassword.ShouldPreserveStored() {
+				password = existingAuthConfig.AdminPassword.GetValue()
+			}
+			if username == "" || password == "" {
+				SendError(ctx, fasthttp.StatusBadRequest, "password credentials or OIDC are required when auth is enabled")
 				return
 			}
 		}
@@ -1148,28 +1177,6 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 	if payload.AuthConfig != nil {
 		authConfig := existingAuthConfig
 
-		// Check if auth config has changed
-		authChanged := false
-		if authConfig == nil {
-			// No existing config, any enabled state is a change
-			if payload.AuthConfig.IsEnabled {
-				authChanged = true
-			}
-		} else {
-			// Compare with existing config using value comparison (not pointer comparison)
-			// Password is considered changed when it was intentionally submitted —
-			// ShouldPreserveStored() returns false for both plain values and secret refs.
-			passwordChanged := payload.AuthConfig.AdminPassword != nil &&
-				!payload.AuthConfig.AdminPassword.ShouldPreserveStored()
-			usernameChanged := payload.AuthConfig.AdminUserName != nil &&
-				!payload.AuthConfig.AdminUserName.Equals(authConfig.AdminUserName)
-			if payload.AuthConfig.IsEnabled != authConfig.IsEnabled ||
-				usernameChanged ||
-				passwordChanged {
-				authChanged = true
-			}
-		}
-
 		if payload.AuthConfig.IsEnabled {
 			// Initialize nil pointers to empty SecretVar to prevent nil-pointer dereference
 			if payload.AuthConfig.AdminUserName == nil {
@@ -1189,7 +1196,7 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 				return
 			}
 
-			if authConfig == nil && (payload.AuthConfig.AdminUserName.GetValue() == "" || payload.AuthConfig.AdminPassword.GetValue() == "") {
+			if authConfig == nil && !payload.AuthConfig.OIDCEnabled() && (payload.AuthConfig.AdminUserName.GetValue() == "" || payload.AuthConfig.AdminPassword.GetValue() == "") {
 				SendError(ctx, fasthttp.StatusBadRequest, "auth username and password must be provided")
 				return
 			}
@@ -1231,6 +1238,9 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 					}
 					payload.AuthConfig.AdminPassword = hashed
 				}
+			} else if payload.AuthConfig.OIDCEnabled() {
+				// An OIDC-only configuration has no local password to preserve.
+				payload.AuthConfig.AdminPassword = &schemas.SecretVar{}
 			}
 			// Save auth config - this handles both first-time creation and updates
 			err = h.configManager.UpdateAuthConfig(ctx, &payload.AuthConfig.AuthConfig)
@@ -1251,7 +1261,7 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 			}
 			// Replacing the stored credentials while auth stays off is the same exposure as
 			// re-enabling with new ones, so it needs the same proof of control.
-			credentialsReplaced := passwordReplaced || !payload.AuthConfig.AdminUserName.Equals(authConfig.AdminUserName)
+			credentialsReplaced := passwordReplaced || !payload.AuthConfig.AdminUserName.Equals(authConfig.AdminUserName) || !payload.AuthConfig.OIDC.Equals(authConfig.OIDC)
 			if credentialsReplaced && isAuthBypassed(ctx) && !h.verifyStoredAdminCredential(ctx, authConfig, payload.AuthConfig) {
 				return
 			}
@@ -1270,14 +1280,6 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 			}
 		}
 
-		// Flush all existing sessions if auth details have been changed
-		if authChanged {
-			if err := h.store.ConfigStore.FlushSessions(ctx); err != nil {
-				logger.Warn("updated auth config but failed to flush existing sessions, please restart the server: %v", err)
-				SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("updated auth config but failed to flush existing sessions, please restart the server: %v", err))
-				return
-			}
-		}
 		// Note: AuthMiddleware is updated via ServerCallbacks.UpdateAuthConfig (handled by BifrostHTTPServer)
 	}
 

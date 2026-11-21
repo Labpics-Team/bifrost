@@ -9,6 +9,9 @@ import (
 var ErrNotFound = errors.New("not found")
 var ErrAlreadyExists = errors.New("already exists")
 
+// ErrAuthConfigChanged means the policy used to verify a sign-in no longer applies.
+var ErrAuthConfigChanged = errors.New("authentication settings changed during sign-in")
+
 // ErrRoutingRulePriorityTaken is returned when a routing rule's priority is already used by another
 // rule in the same scope and scope ID. It wraps ErrAlreadyExists and reads the same, so callers that
 // only ask whether something already exists are unaffected; callers that advise changing the

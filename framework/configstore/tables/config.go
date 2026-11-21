@@ -6,6 +6,7 @@ const (
 	ConfigAdminUsernameKey = "admin_username"
 	ConfigAdminPasswordKey = "admin_password"
 	ConfigIsAuthEnabledKey = "is_auth_enabled"
+	ConfigOIDCKey          = "oidc_config"
 	ConfigProxyKey         = "proxy_config"
 	// ConfigComplexityAnalyzerConfigKey stores the persisted analyzer config JSON.
 	//

@@ -169,6 +169,23 @@
 		}
 	},
 	"security": {
+		"oidc": {
+			"localPassword": "로컬 관리자 비밀번호(선택 사항)",
+			"protectDashboard": "대시보드 보호",
+			"dashboardHelp": "OpenID Connect 또는 로컬 관리자 비밀번호로 로그인합니다.",
+			"title": "OpenID Connect",
+			"description": "ID 공급자를 사용하여 대시보드에 로그인합니다.",
+			"issuer": "발급자 URL",
+			"clientId": "클라이언트 ID",
+			"clientSecret": "클라이언트 시크릿",
+			"secretHelp": "공개 클라이언트에서는 선택 사항입니다. 비워 두면 저장된 시크릿이 유지됩니다.",
+			"redirect": "리디렉션 URL",
+			"redirectHelp": "이 URL을 공급자에 정확히 등록하세요. /api/session/oidc/callback으로 끝나야 하며 기본 경로가 있으면 포함해야 합니다.",
+			"subjects": "허용할 subject ID",
+			"emails": "허용할 인증된 이메일",
+			"allowHelp": "한 줄에 하나씩 입력하세요. subject 또는 인증된 이메일이 하나 이상 필요합니다. 일치하는 사용자에게 관리자 권한이 부여됩니다.",
+			"authRequired": "OpenID Connect를 설정하거나 관리자 이름과 비밀번호를 입력하세요."
+		},
 		"title": "보안 설정",
 		"description": "보안 및 액세스 제어 설정을 구성해요.",
 		"loadingAuth": "인증 설정 로드 중",

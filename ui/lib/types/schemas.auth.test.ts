@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { authProofOfControlSchema } from "./schemas";
+import { authProofOfControlSchema, oidcConfigSchema } from "./schemas";
 
 describe("authProofOfControlSchema", () => {
 	// The server verifies current_password against the stored hash byte for byte (and the
@@ -27,4 +27,49 @@ describe("authProofOfControlSchema", () => {
 		const result = authProofOfControlSchema.safeParse({ current_password: "", setup_token: "" });
 		expect(result.success).toBe(false);
 	});
+});
+
+describe("oidcConfigSchema", () => {
+	const config = {
+		enabled: true,
+		issuer_url: "https://id.example",
+		client_id: "bifrost",
+		redirect_url: "https://ai.example/api/session/oidc/callback",
+		allowed_subjects: ["admin"],
+	};
+	it("accepts a configured issuer and loopback development", () => {
+		expect(oidcConfigSchema.safeParse(config).success).toBe(true);
+		expect(oidcConfigSchema.safeParse({ ...config, issuer_url: "http://localhost:9000" }).success).toBe(true);
+	});
+	it.each([
+		["issuer_url", "http://id.example"],
+		["issuer_url", "https://id.example?tenant=a"],
+		["client_id", ""],
+		["redirect_url", "https://ai.example/wrong-callback"],
+		["allowed_subjects", []],
+		["allowed_emails", ["invalid-email"]],
+	])("reports the invalid %s field", (field, value) => {
+		const result = oidcConfigSchema.safeParse({ ...config, [field]: value });
+		expect(result.success).toBe(false);
+		expect(result.error?.issues.map((issue) => issue.path[0])).toContain(field);
+	});
+	it("allows OIDC to be disabled before the form is complete", () => {
+		expect(oidcConfigSchema.safeParse({ enabled: false, issuer_url: "", client_id: "", redirect_url: "" }).success).toBe(true);
+	});
+	it.each(["ops!admin@example.com", "team$ops@example.com", "user@localhost", "почта@пример.рф"])(
+		"allows other settings to change while retaining the server-supported address %s",
+		(email) => {
+			const result = oidcConfigSchema.safeParse({ ...config, client_id: "updated-client", allowed_emails: [email] });
+			expect(result.success).toBe(true);
+			expect(result.data?.allowed_emails).toEqual([email]);
+		},
+	);
+	it.each(["", "invalid-email", "a@@example.com", "Name <user@example.com>", "user@example.com trailing", "user@", "@example.com"])(
+		"reports an inline email error for %s",
+		(email) => {
+			const result = oidcConfigSchema.safeParse({ ...config, allowed_emails: [email] });
+			expect(result.success).toBe(false);
+			expect(result.error?.flatten().fieldErrors.allowed_emails).toHaveLength(1);
+		},
+	);
 });

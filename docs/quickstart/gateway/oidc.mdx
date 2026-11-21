@@ -1,0 +1,117 @@
+---
+title: "OpenID Connect sign-in"
+description: "Sign in to the Bifrost dashboard with your identity provider."
+---
+
+The Labpics fork supports OpenID Connect in the existing dashboard session
+system. Configure it in **Settings → Security → OpenID Connect**. It can be the
+only dashboard sign-in method, or coexist with the local administrator password.
+No authentication proxy or separate user database is needed.
+
+## Configure the identity provider
+
+Create an OpenID Connect client with the authorization-code grant and PKCE S256.
+Register the exact callback URL, for example:
+
+```text
+https://ai.lab.pics/api/session/oidc/callback
+```
+
+If Bifrost uses `server.base_path`, include that path before `/api`. Bifrost
+requests the `openid` and `email` scopes. Confidential clients use a client
+secret; public clients can omit it. Discovery, JWKS, issuer, audience, signature
+and expiry validation use [go-oidc](https://github.com/coreos/go-oidc).
+
+## Allow administrators
+
+Enable dashboard protection and OpenID Connect in Security. Enter the issuer
+URL, client ID, optional secret and callback URL. Add at least one allowed
+subject ID or verified email, one per line. A matching user receives full
+dashboard administrator access. Merely belonging to the identity provider is
+not sufficient. Subject IDs are issuer-specific and matched exactly; email
+matching ignores case and requires the ID token's `email_verified: true` claim.
+
+The form uses Bifrost's existing secret input, including environment/vault
+references and redaction. Submitting a blank or masked secret keeps the stored
+secret. To replace a confidential client with a public client, replace the
+OIDC configuration through the configuration file with `client_secret` omitted.
+
+Initial setup uses the existing setup token. Saving authentication changes
+invalidates existing dashboard sessions in the same database transaction; a
+failed write retains the old policy and sessions, and can be retried. Saving
+unchanged authentication settings preserves sessions. Sign in again after a
+successful change. Password and OIDC sign-ins create a session only while the
+authentication settings used to verify them still match, in the same database
+transaction as session creation. A concurrent policy change either rejects the
+sign-in or revokes its session. A failed sign-in preserves the original workspace or consent
+page for the next attempt once its browser-bound state has been verified.
+If protection is disabled and no local password exists, the setup token is the
+recovery proof for re-enabling it. Keep that operator credential available.
+
+## First release and rollback
+
+Keep a working local administrator username and password during the first OIDC
+release. The previous Labpics build at `b3682eb10` does not understand OIDC. Rolling
+back to it after removing the local credentials leaves no usable dashboard
+sign-in method; an existing browser session is not a recovery plan.
+
+Before enabling OIDC in production, verify local password sign-in in a separate
+browser session. Keep those credentials in both file configuration and the
+stored settings while that older build remains the rollback target. Switch to
+OIDC-only only after the rollback target also supports OIDC and its sign-in has
+been checked. To return to an older build, restore and verify local credentials
+on the OIDC-capable build first.
+
+## Configure with a file
+
+```json
+{
+  "governance": {
+    "auth_config": {
+      "is_enabled": true,
+      "admin_username": "env.BIFROST_ADMIN_USERNAME",
+      "admin_password": "env.BIFROST_ADMIN_PASSWORD",
+      "oidc": {
+        "enabled": true,
+        "issuer_url": "https://identity.example.com",
+        "client_id": "bifrost",
+        "client_secret": "env.BIFROST_OIDC_CLIENT_SECRET",
+        "redirect_url": "https://ai.lab.pics/api/session/oidc/callback",
+        "allowed_subjects": ["your-issuer-subject-id"],
+        "allowed_emails": []
+      }
+    }
+  }
+}
+```
+
+File settings follow the existing auth-config startup behavior: when provided,
+they override stored authentication settings at restart. OIDC is persisted in
+the existing governance configuration store. Literal secrets use Bifrost's
+configured encryption key; environment/vault references remain references.
+HTTPS is required for issuer and callback URLs, except on localhost/loopback
+for development.
+
+## Sessions and inference
+
+The browser follows `/api/session/oidc/login` to the identity provider. The
+callback creates the same HttpOnly `token` cookie used by local sign-in. The
+session lasts until the ID token expires, capped at eight hours. Bifrost stores
+neither access nor refresh tokens. Expired sessions require another sign-in.
+Logging out invalidates the Bifrost session; it does not sign the user out of
+the identity provider or other applications.
+
+Pending sign-ins expire after ten minutes and are held in process memory.
+Restarting Bifrost requires starting sign-in again. For multiple replicas, route
+the login and callback to the same replica using ingress session affinity.
+There are at most 4096 pending sign-ins per process.
+
+OIDC dashboard login does not grant an inference key and does not change
+virtual-key admission, MCP OAuth, budgets or routing. This feature is dashboard
+administrator sign-in, not Enterprise SCIM, organization provisioning or RBAC.
+
+`GET /api/session/is-auth-enabled` exposes `oidc_enabled` and `password_enabled`
+alongside the existing dashboard session status. `GET /api/config` returns
+redacted settings; `PUT /api/config` accepts `auth_config.oidc`. Omitting `oidc`
+in an auth update preserves it. Setting it to `null` removes it, but enabled
+dashboard protection must retain a usable authentication method.

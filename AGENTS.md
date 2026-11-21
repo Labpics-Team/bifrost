@@ -16,6 +16,11 @@ retained differences. Verify behavior changes with the applicable guidance below
 Infra builds a pinned revision of this fork without external patches. Merging
 `labpics` runs the fork verification workflow; image publication and runtime
 activation use Infra's source and immutable image pins.
+For this fork, dashboard authentication and management routes use native Go HTTP
+tests with their registered routes, middleware and local stores. These tests run
+in fork CI without provider credentials. Extend that coverage for OIDC rather
+than duplicating it in the upstream provider-harness collection; reserve that
+collection for provider/SDK interoperability. Check the changed UI in a browser.
 
 > Context for AI agents (Claude Code, Copilot, Cursor, etc.) working on this codebase. Read this fully before making changes.
 
