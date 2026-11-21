@@ -30,11 +30,23 @@ type ProviderAttemptObserver interface {
 	BeginProviderAttempt(*BifrostContext, ProviderAttemptInfo) ProviderAttempt
 }
 
+// ProviderConfigurationObserver optionally identifies the configuration of a
+// newly built provider. Core captures the returned revision in its workers, so
+// an old worker cannot report an observation for a newer endpoint/configuration.
+// This callback must not perform database or network IO.
+type ProviderConfigurationObserver interface {
+	ProviderConfigured(ModelProvider, *ProviderConfig) string
+}
+
 type ProviderAttemptInfo struct {
-	Provider ModelProvider
-	Model    string
-	KeyID    string
-	KeyName  string
+	Provider         ModelProvider
+	ProviderRevision string
+	Model            string
+	KeyID            string
+	KeyName          string
+	// Key is the actual configuration selected for this attempt, before alias
+	// resolution. Observers may fingerprint it, but must not persist credentials.
+	Key Key
 }
 
 type ProviderAttempt interface {

@@ -2,7 +2,10 @@ package adaptive
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	bifrost "github.com/maximhq/bifrost/core"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +23,24 @@ type settingsStore struct {
 	fail bool
 }
 
+func newSettingsStore(t *testing.T) *settingsStore {
+	t.Helper()
+	store, err := configstore.NewConfigStore(context.Background(), &configstore.Config{Enabled: true, Type: configstore.ConfigStoreTypeSQLite, Config: &configstore.SQLiteConfig{Path: filepath.Join(t.TempDir(), "config.db")}}, bifrost.NewDefaultLogger(schemas.LogLevelError))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close(context.Background()) })
+	return &settingsStore{ConfigStore: store, rows: map[string]string{}}
+}
+func attachStore(t *testing.T, c *Controller, s *settingsStore) {
+	t.Helper()
+	c.store = s
+	var err error
+	c.stateStore, err = configstore.NewAdaptiveRoutingStore(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
 func (s *settingsStore) GetConfig(_ context.Context, key string) (*tables.TableGovernanceConfig, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -40,7 +61,7 @@ func (s *settingsStore) UpdateConfig(_ context.Context, row *tables.TableGoverna
 }
 
 func TestAdaptiveSettingsRequireExplicitConfiguration(t *testing.T) {
-	s := &settingsStore{rows: map[string]string{}}
+	s := newSettingsStore(t)
 	c, err := NewFromStore(context.Background(), s, nil)
 	if err != nil || c.Enabled() {
 		t.Fatalf("existing deployment unexpectedly enabled: %v", err)
@@ -66,40 +87,42 @@ func TestAdaptiveSettingsRequireExplicitConfiguration(t *testing.T) {
 }
 
 func TestAdaptiveHoldsSurviveRestartButNotCredentialRotation(t *testing.T) {
-	s := &settingsStore{rows: map[string]string{}}
+	s := newSettingsStore(t)
 	c, _ := providerController()
-	c.store = s
+	attachStore(t, c, s)
 	keys := []schemas.Key{{ID: "a", Name: "A", Value: *schemas.NewSecretVar("secret-value")}}
 	setKeys := func(target *Controller) {
 		target.SetCatalog(nil, func(context.Context, schemas.ModelProvider) ([]schemas.Key, error) { return keys, nil }, nil)
 	}
 	setKeys(c)
 	observe(c, "p1", "m", "a", responseError(401))
-	if err := c.SaveHolds(context.Background()); err != nil {
+	if err := c.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(s.rows[holdsKey], "secret-value") {
+	state, _ := c.stateStore.Load(context.Background())
+	encoded, _ := json.Marshal(state)
+	if strings.Contains(string(encoded), "secret-value") {
 		t.Fatal("snapshot contains credential")
 	}
 	loaded, _ := testController()
-	loaded.store = s
+	attachStore(t, loaded, s)
 	setKeys(loaded)
-	if err := loaded.RestoreHolds(context.Background()); err != nil {
+	if err := loaded.Restore(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.routes) != 1 || loaded.routes[routeID{Provider: "p1", KeyID: "a"}] == nil {
+	if len(loaded.conditions) != 1 || loaded.conditions[routeID{Provider: "p1", KeyID: "a"}] == nil {
 		t.Fatalf("whole-key hold was lost: %+v", loaded.routes)
 	}
 	for _, r := range loaded.routes {
-		if r.Samples != 0 || r.LatencyMS != 0 {
-			t.Fatal("old scores restored")
+		if r.Inflight != 0 {
+			t.Fatal("old in-flight attempts restored")
 		}
 	}
 	keys[0].Value = *schemas.NewSecretVar("rotated-value")
 	fresh, _ := testController()
-	fresh.store = s
+	attachStore(t, fresh, s)
 	setKeys(fresh)
-	fresh.RestoreHolds(context.Background())
+	fresh.Restore(context.Background())
 	if len(fresh.routes) != 0 {
 		t.Fatal("old hold affected rotated key")
 	}

@@ -1147,7 +1147,11 @@ func (s *BifrostHTTPServer) RemoveModelConfig(ctx context.Context, id string) er
 // way, and a server that wraps this one can tell an operator's edit apart by it.
 func (s *BifrostHTTPServer) ReloadProvider(ctx context.Context, provider schemas.ModelProvider, isNew bool) (*tables.TableProvider, error) {
 	if s.Config != nil && s.Config.AdaptiveRouter != nil {
-		s.Config.AdaptiveRouter.ResetProvider(provider)
+		defer func() {
+			if err := s.Config.AdaptiveRouter.ResetProvider(provider); err != nil {
+				logger.Warn("adaptive provider reconciliation will retry: %v", err)
+			}
+		}()
 	}
 	s.syncIgnoreProviderCost(provider)
 	if s.Config == nil || s.Config.ConfigStore == nil {
@@ -1267,7 +1271,11 @@ func (s *BifrostHTTPServer) syncIgnoreProviderCost(provider schemas.ModelProvide
 // RemoveProvider removes a provider from the in-memory store
 func (s *BifrostHTTPServer) RemoveProvider(ctx context.Context, provider schemas.ModelProvider) error {
 	if s.Config != nil && s.Config.AdaptiveRouter != nil {
-		s.Config.AdaptiveRouter.ResetProvider(provider)
+		defer func() {
+			if err := s.Config.AdaptiveRouter.ResetProvider(provider); err != nil {
+				logger.Warn("adaptive provider reconciliation will retry: %v", err)
+			}
+		}()
 	}
 	err := s.Client.RemoveProvider(provider)
 	if err != nil && !strings.Contains(err.Error(), "not found") {
@@ -1327,7 +1335,11 @@ func (s *BifrostHTTPServer) OnKeyAdded(ctx context.Context, provider schemas.Mod
 // for just that key. 2 calls regardless of N keys on the provider.
 func (s *BifrostHTTPServer) OnKeyUpdated(ctx context.Context, provider schemas.ModelProvider, key schemas.Key) error {
 	if s.Config != nil && s.Config.AdaptiveRouter != nil {
-		s.Config.AdaptiveRouter.ResetKey(provider, key.ID)
+		defer func() {
+			if err := s.Config.AdaptiveRouter.ResetKey(provider, key.ID); err != nil {
+				logger.Warn("adaptive key reconciliation will retry: %v", err)
+			}
+		}()
 	}
 	if s.Config == nil || s.Config.ModelCatalog == nil {
 		return fmt.Errorf("model catalog not found")
@@ -1357,7 +1369,11 @@ func (s *BifrostHTTPServer) OnKeyUpdated(ctx context.Context, provider schemas.M
 // entries stay valid.
 func (s *BifrostHTTPServer) OnKeyDeleted(ctx context.Context, provider schemas.ModelProvider, keyID string) error {
 	if s.Config != nil && s.Config.AdaptiveRouter != nil {
-		s.Config.AdaptiveRouter.ResetKey(provider, keyID)
+		defer func() {
+			if err := s.Config.AdaptiveRouter.ResetKey(provider, keyID); err != nil {
+				logger.Warn("adaptive key reconciliation will retry: %v", err)
+			}
+		}()
 	}
 	if s.Config == nil || s.Config.ModelCatalog == nil {
 		return fmt.Errorf("model catalog not found")
@@ -3677,9 +3693,11 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 	}
 	s.Client.SetMCPInProcessServerFactory(openAPIFactory)
 	if c := s.Config.AdaptiveRouter; c != nil && s.Config.ModelCatalog != nil {
-		c.SetCatalog(s.Config.ModelCatalog.GetProvidersForModel, account.GetKeysForProvider, s.Client.KeySupportsModel)
-		if err := c.RestoreHolds(ctx); err != nil {
-			logger.Warn("[Routing] could not restore held keys: %v", err)
+		c.SetCatalog(s.Config.ModelCatalog.GetProvidersForModel, account.GetKeysForProvider, s.Client.KeySupportsModel, func(p schemas.ModelProvider) bool { return isKeylessProvider(p, s.Config) })
+		c.SetProviderExists(func(p schemas.ModelProvider) bool { _, err := s.Config.GetProviderConfigRaw(p); return err == nil })
+		if err := c.Restore(ctx); err != nil {
+			s.Client.Shutdown()
+			return fmt.Errorf("restore adaptive routing state: %w", err)
 		}
 		c.Start(ctx, logger)
 	}

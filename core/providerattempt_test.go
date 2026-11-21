@@ -44,6 +44,10 @@ func (o *recordingProviderObserver) BeginProviderAttempt(_ *schemas.BifrostConte
 	return &recordedProviderAttempt{info: info, done: o.done}
 }
 
+func (o *recordingProviderObserver) ProviderConfigured(provider schemas.ModelProvider, config *schemas.ProviderConfig) string {
+	return string(provider) + ":" + config.NetworkConfig.BaseURL
+}
+
 func TestProviderAttemptObserverSeesEachRetryAndStreamingTeardown(t *testing.T) {
 	for _, streaming := range []bool{false, true} {
 		t.Run(map[bool]string{false: "unary", true: "stream"}[streaming], func(t *testing.T) {
@@ -86,6 +90,11 @@ func TestProviderAttemptObserverSeesEachRetryAndStreamingTeardown(t *testing.T) 
 			}
 			if seen["a"] == nil || seen["a"].failure != schemas.FailureClassCredential || seen["b"] == nil || !seen["b"].success || seen["b"].failure != "" {
 				t.Fatalf("incorrect attempt observations: %+v", seen)
+			}
+			for _, a := range seen {
+				if a.info.ProviderRevision == "" || a.info.Key.ID != a.info.KeyID {
+					t.Fatalf("attempt lost actual provider/key configuration: %+v", a.info)
+				}
 			}
 			requireHits(t, u, map[string]int{"sk-a": 1, "sk-b": 1})
 		})
@@ -134,6 +143,6 @@ func BenchmarkProviderAttemptObserverDisabled(b *testing.B) {
 	key := schemas.Key{ID: "key"}
 	b.ReportAllocs()
 	for b.Loop() {
-		client.beginProviderAttempt(ctx, schemas.OpenAI, "model", key, nil)
+		client.beginProviderAttempt(ctx, schemas.OpenAI, "model", key, nil, "")
 	}
 }

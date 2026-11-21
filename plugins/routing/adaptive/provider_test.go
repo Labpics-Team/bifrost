@@ -56,11 +56,11 @@ func TestAdaptiveProviderRedirectAndFallbackPin(t *testing.T) {
 	cfg.RerouteTarget = "fallbacks"
 	c.Apply(cfg)
 	failProvider(c, "p1")
-	r := routeRequest("p1", schemas.Fallback{Provider: "p2", Model: "other", KeyID: "specific"})
+	r := routeRequest("p1", schemas.Fallback{Provider: "p2", Model: "other", KeyID: "a"})
 	ctx := testContext()
 	c.Route(ctx, r)
 	p, m, f := r.GetRequestFields()
-	if p != "p2" || m != "other" || len(f) != 1 || f[0].Provider != "p1" || ctx.Value(schemas.BifrostContextKeyRoutingPinnedAPIKeyID) != "specific" {
+	if p != "p2" || m != "other" || len(f) != 1 || f[0].Provider != "p1" || ctx.Value(schemas.BifrostContextKeyRoutingPinnedAPIKeyID) != "a" {
 		t.Fatalf("incorrect redirect: %s %s %+v", p, m, f)
 	}
 	ctx = testContext()
@@ -130,7 +130,7 @@ func TestAdaptiveProviderRecoversFromTransientFailureOnRealTraffic(t *testing.T)
 		if err != nil {
 			t.Fatal(err)
 		}
-		observe(c, p, "m", key.ID, nil)
+		observeWithContext(c, ctx, p, "m", key.ID, nil)
 	}
 	for _, r := range c.Status() {
 		if r.Provider == "p1" && (r.Samples != 4 || r.ErrorRate >= 1 || r.State != "recovering") {
@@ -210,4 +210,27 @@ func BenchmarkAdaptiveProviderRouting(b *testing.B) {
 			c.Route(ctx, r)
 		}
 	})
+}
+
+func TestAdaptiveKeylessProviderUsesObservedHealth(t *testing.T) {
+	c, _ := providerController()
+	c.SetCatalog(func(string) []schemas.ModelProvider { return []schemas.ModelProvider{"p1", "p2"} }, func(_ context.Context, p schemas.ModelProvider) ([]schemas.Key, error) {
+		if p == "p1" {
+			return nil, nil
+		}
+		return testKeys, nil
+	}, func(schemas.ModelProvider, schemas.Key, string) bool { return true }, func(p schemas.ModelProvider) bool { return p == "p1" })
+	for i := 0; i < 3; i++ {
+		a := c.BeginProviderAttempt(testContext(), schemas.ProviderAttemptInfo{Provider: "p1", Model: "m"})
+		if a == nil {
+			t.Fatal("keyless provider was not observed")
+		}
+		a.Observe(nil, responseError(503))
+		a.End()
+	}
+	r := routeRequest("")
+	c.Route(testContext(), r)
+	if p, _, _ := r.GetRequestFields(); p != "p2" {
+		t.Fatalf("failing keyless provider ignored observed health: %s", p)
+	}
 }

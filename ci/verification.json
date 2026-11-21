@@ -108,7 +108,9 @@
       "TestRetryBackoffStopsWhenRequestDeadlineExpires",
       "TestScenarioEveryKeyRefusedIsTriedOnce",
       "TestOwnedStreamCancellationDoesNotWaitForReader",
-      "TestOwnedStreamCancellationIsNotCleanEOF"
+      "TestOwnedStreamCancellationIsNotCleanEOF",
+      "TestProviderAttemptObserverSeesEachRetryAndStreamingTeardown",
+      "TestProviderAttemptObserverSeesTTFTFailureBeforeHealthyFallback"
     ],
     "github.com/maximhq/bifrost/core/providers/utils": [
       "TestContextTransport_TruncatedContentLengthStreamReportsUnexpectedEOFAndDiscardsConn",
@@ -152,11 +154,48 @@
       "TestWarpSearchDeclaresItsQueryFilterIndexes"
     ],
     "github.com/maximhq/bifrost/transports/v2/bifrost-http/server": [
-      "TestRoutingModelsHTTPAdmission"
+      "TestRoutingModelsHTTPAdmission",
+      "TestAdaptivePersistenceFailureDoesNotAbortNativeConfiguration"
     ],
     "github.com/maximhq/bifrost/core/providers/anthropic": [
       "TestToAnthropicChatCompletionError",
       "TestToAnthropicChatCompletionErrorNeverEmitsEmptyMessage"
+    ],
+    "github.com/maximhq/bifrost/framework/configstore": [
+      "TestAdaptiveStoreAtomicLifecycleAndCheckpoint",
+      "TestAdaptiveStoreConcurrentMutationHasOneWinner",
+      "TestAdaptiveStoreRecoversCommittedLifecycleAfterCrash",
+      "TestAdaptiveStoreQueriesAndRetention",
+      "TestAdaptiveStoreRejectsBrokenIncidentLinks",
+      "TestAdaptiveStoreClosureWithoutRecovery",
+      "TestAdaptiveNativeConfigDurability"
+    ],
+    "github.com/maximhq/bifrost/plugins/routing/adaptive": [
+      "TestAdaptiveOldSuccessCannotReleaseNewHold",
+      "TestAdaptiveOldCompletionCannotReleaseNewProbe",
+      "TestAdaptiveStatusDoesNotForgetUnresolvedHold",
+      "TestAdaptiveDueHoldSurvivesSnapshotRestart",
+      "TestAdaptiveSnapshotDoesNotRebindRefusalToRotatedKey",
+      "TestAdaptiveProviderNeedsEligibleKey",
+      "TestAdaptiveFallbackRedirectUsesGlobalLastResort",
+      "TestAdaptiveNamedDueProbeKeepsHealthyFallback",
+      "TestAdaptiveEvictionKeepsUnresolvedConditions",
+      "TestAdaptiveManualReleaseFencesOldCompletion",
+      "TestAdaptiveDurableIncidentLifecycle",
+      "TestAdaptiveFailedReleaseKeepsCommittedHold",
+      "TestAdaptiveSQLiteWaitDoesNotBlockHealthyTraffic",
+      "TestAdaptiveFrozenRevisionDetectsNestedSecretRotation",
+      "TestAdaptiveHistoryOffKeepsDurableConditions",
+      "TestAdaptiveDeletedHealthyProviderDoesNotPoisonRestart",
+      "TestAdaptiveProviderEditFailedResetReconcilesAfterReopen",
+      "TestAdaptiveFailedConfigurationResetRetriesDuringMaintenance",
+      "TestAdaptiveNativeKeyRoundTripPreservesHold",
+      "TestAdaptiveProviderChoosesHealthyAndPreservesNamedTraffic",
+      "TestAdaptiveProviderRedirectAndFallbackPin",
+      "TestAdaptiveProviderDueCheckIsReservedAcrossRequests",
+      "TestAdaptiveProviderRecoversFromTransientFailureOnRealTraffic",
+      "TestAdaptivePruningFollowsNativeNamedProviderSettings",
+      "TestAdaptiveKeylessProviderUsesObservedHealth"
     ]
   }
 }

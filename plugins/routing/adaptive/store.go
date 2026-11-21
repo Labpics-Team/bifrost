@@ -2,20 +2,19 @@ package adaptive
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"sort"
 
 	"github.com/maximhq/bifrost/framework/configstore"
 	"github.com/maximhq/bifrost/framework/configstore/tables"
 )
 
 const configKey = "load_balancer_config"
-const holdsKey = "adaptive_routing_holds"
 
 // NewFromStore follows the native settings contract: a saved dashboard/API
 // value wins over the file; the file supplies the initial settings only.
@@ -40,8 +39,18 @@ func NewFromStore(ctx context.Context, store configstore.ConfigStore, file *Conf
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
+	if enabled && store == nil {
+		return nil, fmt.Errorf("adaptive routing requires a config store for durable state")
+	}
 	c := New(config)
 	c.store = store
+	if store != nil {
+		var err error
+		c.stateStore, err = configstore.NewAdaptiveRoutingStore(store)
+		if err != nil {
+			return nil, err
+		}
+	}
 	c.enabled.Store(enabled)
 	return c, nil
 }
@@ -53,8 +62,8 @@ func (c *Controller) Save(ctx context.Context, config Config) error {
 	if c.store == nil {
 		return fmt.Errorf("config store is unavailable")
 	}
-	c.saveMu.Lock()
-	defer c.saveMu.Unlock()
+	c.lifeMu.Lock()
+	defer c.lifeMu.Unlock()
 	data, err := json.Marshal(config)
 	if err != nil {
 		return err
@@ -65,110 +74,206 @@ func (c *Controller) Save(ctx context.Context, config Config) error {
 	return c.Apply(config)
 }
 
-type storedHold struct {
-	routeID
-	KeyHash      string               `json:"key_hash"`
-	HoldUntil    time.Time            `json:"hold_until"`
-	HeldAt       time.Time            `json:"held_at"`
-	Rung         int                  `json:"rung"`
-	FailureClass schemas.FailureClass `json:"failure_class"`
-}
-
-func keyHash(key schemas.Key) string {
-	data, err := json.Marshal(key)
-	if err != nil {
-		return ""
-	}
-	return fmt.Sprintf("%x", sha256.Sum256(data))
-}
-
-// RestoreHolds restores only unexpired refusals, and only for an unchanged
-// configured credential. Scores, latency, load and probes are always fresh.
-func (c *Controller) RestoreHolds(ctx context.Context) error {
-	if !c.Enabled() || c.store == nil || c.keys == nil {
+// Restore restores all unresolved conditions, including ones due for a
+// check. The native configuration validates their captured credential revisions.
+func (c *Controller) Restore(ctx context.Context) error {
+	if !c.Enabled() || c.stateStore == nil {
 		return nil
 	}
-	row, err := c.store.GetConfig(ctx, holdsKey)
-	if errors.Is(err, configstore.ErrNotFound) {
-		return nil
-	}
+	state, err := c.stateStore.Load(ctx)
 	if err != nil {
 		return err
 	}
-	if row == nil {
-		return nil
+	c.mu.Lock()
+	c.revision = state.Revision
+	for _, source := range state.OpenIncidents {
+		i := source
+		c.incidents[incidentRoute(&i)] = &i
 	}
-	var holds []storedHold
-	if err := json.Unmarshal([]byte(row.Value), &holds); err != nil {
-		return err
+	for _, h := range state.Conditions {
+		id := routeID{schemas.ModelProvider(h.Provider), h.Model, h.KeyID}
+		name := ""
+		if i := c.incidents[id]; i != nil {
+			name = i.KeyName
+		}
+		c.conditions[id] = &condition{routeID: id, ID: h.ID, KeyRevision: h.KeyRevision, IncidentID: h.IncidentID, KeyName: name, HoldClass: schemas.FailureClass(h.FailureClass), HoldUntil: h.HoldUntil, HeldAt: h.HeldAt, Rung: h.Rung}
+		c.keyStates[routeID{Provider: id.Provider, KeyID: id.KeyID}] = &keyState{revision: h.KeyRevision}
 	}
-	now := c.now()
-	for i, h := range holds {
-		if i >= maxRoutes {
-			break
+	c.mu.Unlock()
+	// A process can stop after native configuration committed but before its
+	// adaptive cleanup did. Durable incident identity closes that gap even when
+	// no per-key condition or telemetry checkpoint exists.
+	changedProviders := map[schemas.ModelProvider]bool{}
+	for _, i := range state.OpenIncidents {
+		provider := schemas.ModelProvider(i.Provider)
+		if i.ProviderRevision != c.providerRevisions[provider] || c.providerExists != nil && !c.providerExists(provider) {
+			changedProviders[provider] = true
 		}
-		if !h.HoldUntil.After(now) || !h.FailureClass.IsPerKey() {
-			continue
+	}
+	for provider := range changedProviders {
+		if err := c.ResetProvider(provider); err != nil {
+			return err
 		}
-		keys, err := c.keys(ctx, h.Provider)
+	}
+	// Reconcile with one live snapshot per provider. No saved refusal is rebound
+	// to whatever credential happens to exist when a checkpoint is written.
+	providers := map[schemas.ModelProvider]bool{}
+	for _, h := range state.Conditions {
+		providers[schemas.ModelProvider(h.Provider)] = true
+	}
+	for provider := range providers {
+		if c.keys == nil {
+			return fmt.Errorf("adaptive routing catalog unavailable")
+		}
+		keys, err := c.keys(ctx, provider)
 		if err != nil {
-			continue
-		}
-		for _, key := range keys {
-			if key.ID != h.KeyID || h.KeyHash == "" || keyHash(key) != h.KeyHash {
+			if c.providerExists != nil && !c.providerExists(provider) {
+				if err := c.ResetProvider(provider); err != nil {
+					return err
+				}
 				continue
 			}
-			c.mu.Lock()
-			if r := c.routeLocked(h.routeID, key.Name, now); r != nil {
-				r.HoldUntil = h.HoldUntil
-				r.HeldAt = h.HeldAt
-				r.Rung = h.Rung
-				r.FailureClass = h.FailureClass
-				r.HoldClass = h.FailureClass
+			return err
+		}
+		live := map[string]bool{}
+		for _, key := range keys {
+			live[key.ID] = true
+			if !c.syncKey(provider, key) {
+				return fmt.Errorf("could not reconcile adaptive credential state")
 			}
-			c.mu.Unlock()
-			break
+		}
+		for _, h := range state.Conditions {
+			if h.Provider == string(provider) && !live[h.KeyID] {
+				if err := c.ResetKey(provider, h.KeyID); err != nil {
+					return err
+				}
+			}
 		}
 	}
+	if len(state.Checkpoint) > 0 {
+		var rows []route
+		if err := json.Unmarshal(state.Checkpoint, &rows); err != nil {
+			return fmt.Errorf("decode adaptive telemetry: %w", err)
+		}
+		for _, r := range rows {
+			if len(c.routes) >= maxRoutes {
+				break
+			}
+			if c.keys == nil {
+				continue
+			}
+			keys, err := c.keys(ctx, r.Provider)
+			if err != nil {
+				if c.providerExists != nil && !c.providerExists(r.Provider) {
+					continue
+				}
+				return err
+			}
+			valid := false
+			for _, key := range keys {
+				if key.ID == r.KeyID && credentialRevision(key, c.providerRevisions[r.Provider]) == r.KeyRevision {
+					valid = true
+					c.syncKey(r.Provider, key)
+					break
+				}
+			}
+			if !valid {
+				continue
+			}
+			r.Inflight = 0
+			r.ProbeID = 0
+			r.ProbeUntil = time.Time{}
+			r.Epoch = 0
+			c.mu.Lock()
+			c.routes[r.routeID] = &r
+			c.mu.Unlock()
+		}
+	}
+	c.mu.Lock()
+	c.persistenceResultLocked(nil)
+	c.mu.Unlock()
 	return nil
 }
 
-func (c *Controller) SaveHolds(ctx context.Context) error {
-	if !c.Enabled() || c.store == nil || c.keys == nil {
+// Checkpoint saves only bounded telemetry. Conditions are committed atomically
+// with their lifecycle events when they change.
+func (c *Controller) Checkpoint(ctx context.Context) error {
+	if !c.Enabled() || c.stateStore == nil {
 		return nil
 	}
-	c.saveMu.Lock()
-	defer c.saveMu.Unlock()
-	now := c.now()
+	c.lifeMu.Lock()
+	defer c.lifeMu.Unlock()
 	c.mu.Lock()
-	holds := make([]storedHold, 0)
+	revision := c.revision
+	rows := make([]route, 0, len(c.routes))
 	for _, r := range c.routes {
-		if r.HoldUntil.After(now) && r.HoldClass.IsPerKey() {
-			holds = append(holds, storedHold{routeID: r.routeID, HoldUntil: r.HoldUntil, HeldAt: r.HeldAt, Rung: r.Rung, FailureClass: r.HoldClass})
-		}
+		rows = append(rows, *r)
 	}
 	c.mu.Unlock()
-	valid := holds[:0]
-	for _, h := range holds {
-		keys, err := c.keys(ctx, h.Provider)
-		if err != nil {
-			continue
-		}
-		for _, key := range keys {
-			if key.ID == h.KeyID {
-				h.KeyHash = keyHash(key)
-				if h.KeyHash != "" {
-					valid = append(valid, h)
-				}
-				break
-			}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].LastSeen.After(rows[j].LastSeen) })
+	if len(rows) > 2048 {
+		rows = rows[:2048]
+	}
+	data, err := json.Marshal(rows)
+	for err == nil && len(data) > 1<<20 && len(rows) > 0 {
+		rows = rows[:len(rows)/2]
+		data, err = json.Marshal(rows)
+	}
+	if err == nil {
+		err = c.stateStore.Checkpoint(ctx, revision, data)
+	}
+	c.mu.Lock()
+	c.persistenceResultLocked(err)
+	c.mu.Unlock()
+	return err
+}
+
+func (c *Controller) maintain(ctx context.Context) error {
+	c.mu.Lock()
+	pending := make(map[routeID]uint64, len(c.pendingResets))
+	for id, generation := range c.pendingResets {
+		pending[id] = generation
+	}
+	c.mu.Unlock()
+	for id, generation := range pending {
+		if err := c.retryReset(ctx, id, generation); err != nil {
+			return err
 		}
 	}
-	data, err := json.Marshal(valid)
+	now := c.now()
+	err := c.transition(ctx, func() transition {
+		t := transition{}
+		for id, r := range c.routes {
+			if r.Inflight == 0 && now.Sub(r.LastSeen) > idleTTL {
+				delete(c.routes, id)
+			}
+		}
+		for _, source := range c.incidents {
+			i := *source
+			if !c.Config().HistoryEnabled && i.WorstState != "held" {
+				i.Status = "no_longer_observed"
+				i.ClosedAt = &now
+				i.UpdatedAt = now
+				t.incidents = append(t.incidents, &i)
+				t.events = append(t.events, incidentEvent(&i, "history_disabled", "", "Optional health history was disabled before confirmed recovery.", now))
+				continue
+			}
+			if i.Status == "recovering" && now.Sub(i.LastSeen) >= time.Hour {
+				i.Status = "waiting_for_traffic"
+				i.UpdatedAt = now
+				t.events = append(t.events, incidentEvent(&i, "waiting_for_traffic", "", "No real traffic has established recovery for an hour.", now))
+			}
+			t.incidents = append(t.incidents, &i)
+		}
+		return t
+	})
 	if err != nil {
 		return err
 	}
-	return c.store.UpdateConfig(ctx, &tables.TableGovernanceConfig{Key: holdsKey, Value: string(data)})
+	if c.stateStore != nil {
+		_, err = c.stateStore.PruneIncidents(ctx, now.Add(-time.Duration(c.Config().HistoryRetentionDays)*24*time.Hour), 1000)
+	}
+	return err
 }
 
 func (c *Controller) Start(ctx context.Context, logger schemas.Logger) {
@@ -177,19 +282,28 @@ func (c *Controller) Start(ctx context.Context, logger schemas.Logger) {
 		c.wg.Add(1)
 		go func() {
 			defer c.wg.Done()
-			timer := time.NewTimer(time.Duration(c.Config().SnapshotIntervalSeconds) * time.Second)
+			timer := time.NewTimer(time.Second * 5)
 			defer timer.Stop()
+			lastCheckpoint := time.Now()
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-timer.C:
 					writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-					if err := c.SaveHolds(writeCtx); err != nil && logger != nil {
-						logger.Warn("[Routing] could not persist held keys: %v", err)
+					err := c.maintain(writeCtx)
+					interval := time.Duration(c.Config().SnapshotIntervalSeconds) * time.Second
+					if err == nil && time.Since(lastCheckpoint) >= interval {
+						err = c.Checkpoint(writeCtx)
+						if err == nil {
+							lastCheckpoint = time.Now()
+						}
 					}
 					cancel()
-					timer.Reset(time.Duration(c.Config().SnapshotIntervalSeconds) * time.Second)
+					if err != nil && logger != nil {
+						logger.Warn("[Routing] adaptive state maintenance failed: %v", err)
+					}
+					timer.Reset(min(30*time.Second, interval))
 				}
 			}
 		}()
@@ -203,5 +317,8 @@ func (c *Controller) Close() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return c.SaveHolds(ctx)
+	if err := c.maintain(ctx); err != nil {
+		return err
+	}
+	return c.Checkpoint(ctx)
 }

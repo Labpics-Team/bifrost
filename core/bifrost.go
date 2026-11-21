@@ -4462,9 +4462,10 @@ func (bifrost *Bifrost) UpdateProvider(providerKey schemas.ModelProvider) error 
 		providerConfig.ConcurrencyAndBufferSize.Concurrency,
 		providerKey,
 		providerConfig.ConcurrencyAndBufferSize.BufferSize)
+	providerRevision := bifrost.observeProviderConfiguration(providerKey, providerConfig)
 	for range providerConfig.ConcurrencyAndBufferSize.Concurrency {
 		newWaitGroup.Add(1)
-		go bifrost.requestWorker(provider, providerConfig, newPq, newWaitGroup)
+		go bifrost.requestWorker(provider, providerConfig, newPq, newWaitGroup, providerRevision)
 	}
 
 	// Step 5: Transfer buffered requests from the old queue to the new queue BEFORE
@@ -5347,9 +5348,10 @@ func (bifrost *Bifrost) prepareProvider(providerKey schemas.ModelProvider, confi
 
 	schemas.RegisterKnownProvider(providerKey)
 
+	providerRevision := bifrost.observeProviderConfiguration(providerKey, config)
 	for range config.ConcurrencyAndBufferSize.Concurrency {
 		currentWaitGroup.Add(1)
-		go bifrost.requestWorker(provider, config, pq, currentWaitGroup)
+		go bifrost.requestWorker(provider, config, pq, currentWaitGroup, providerRevision)
 	}
 
 	return nil
@@ -8248,7 +8250,7 @@ func applyProviderProxySignal(ctx *schemas.BifrostContext, config *schemas.Provi
 
 // requestWorker handles incoming requests from the queue for a specific provider.
 // It manages retries, error handling, and response processing.
-func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas.ProviderConfig, pq *ProviderQueue, waitGroup *sync.WaitGroup) {
+func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas.ProviderConfig, pq *ProviderQueue, waitGroup *sync.WaitGroup, providerRevision string) {
 	defer waitGroup.Done()
 
 	// Reusable timer for the response/error/stream handoff guard below. One timer per
@@ -8534,7 +8536,7 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 		// returned to the pool via its deferred finalizer.
 		if IsStreamRequestType(req.RequestType) {
 			stream, bifrostError = executeRequestWithRetries(req.Context, config, func(k schemas.Key) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
-				attempt := bifrost.beginProviderAttempt(req.Context, provider.GetProviderKey(), originalModelRequested, k, &req.BifrostRequest)
+				attempt := bifrost.beginProviderAttempt(req.Context, provider.GetProviderKey(), originalModelRequested, k, &req.BifrostRequest, providerRevision)
 				// Arm this attempt's TTFT deadline before the provider dials: it
 				// covers the header wait and the first output chunk. The retry loop
 				// disarms and clears it once the first-chunk check settles.
@@ -8682,7 +8684,7 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 			}, keyProvider, req.RequestType, provider.GetProviderKey(), model, &req.BifrostRequest, bifrost.logger)
 		} else {
 			result, bifrostError = executeRequestWithRetries(req.Context, config, func(k schemas.Key) (response *schemas.BifrostResponse, responseErr *schemas.BifrostError) {
-				if attempt := bifrost.beginProviderAttempt(req.Context, provider.GetProviderKey(), originalModelRequested, k, &req.BifrostRequest); attempt != nil {
+				if attempt := bifrost.beginProviderAttempt(req.Context, provider.GetProviderKey(), originalModelRequested, k, &req.BifrostRequest, providerRevision); attempt != nil {
 					defer func() {
 						attempt.Observe(response, responseErr)
 						attempt.End()

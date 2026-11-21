@@ -27,7 +27,10 @@ func testController() (*Controller, *time.Time) {
 	return c, &now
 }
 func observe(c *Controller, provider schemas.ModelProvider, model, key string, err *schemas.BifrostError) {
-	a := c.BeginProviderAttempt(testContext(), schemas.ProviderAttemptInfo{Provider: provider, Model: model, KeyID: key, KeyName: key})
+	observeWithContext(c, testContext(), provider, model, key, err)
+}
+func observeWithContext(c *Controller, ctx *schemas.BifrostContext, provider schemas.ModelProvider, model, key string, err *schemas.BifrostError) {
+	a := c.BeginProviderAttempt(ctx, schemas.ProviderAttemptInfo{Provider: provider, Model: model, KeyID: key, KeyName: key})
 	if err == nil {
 		a.Observe(&schemas.BifrostResponse{}, nil)
 	} else {
@@ -50,7 +53,8 @@ func TestAdaptiveKeyRefusalsAndRealRecovery(t *testing.T) {
 		}
 	}
 	*now = now.Add(time.Minute)
-	k, _ := c.SelectKey(testContext(), testKeys, schemas.OpenAI, "model")
+	probeCtx := testContext()
+	k, _ := c.SelectKey(probeCtx, testKeys, schemas.OpenAI, "model")
 	if k.ID != "a" {
 		t.Fatal("due credential did not receive real recheck")
 	}
@@ -58,7 +62,7 @@ func TestAdaptiveKeyRefusalsAndRealRecovery(t *testing.T) {
 	if k.ID != "b" {
 		t.Fatal("parallel request duplicated whole-key recheck")
 	}
-	observe(c, schemas.OpenAI, "model", "a", nil)
+	observeWithContext(c, probeCtx, schemas.OpenAI, "model", "a", nil)
 	if c.holdLocked(routeID{schemas.OpenAI, "other", "a"}, *now) != nil {
 		t.Fatal("successful recheck retained hold")
 	}
@@ -103,6 +107,7 @@ func TestAdaptiveHoldDoesNotGrowFromAlreadyInflightCalls(t *testing.T) {
 	}
 	*now = until.Add(time.Second)
 	observe(c, schemas.OpenAI, "m", "a", responseError(429))
+	h = c.holdLocked(routeID{schemas.OpenAI, "m", "a"}, *now)
 	if h.Rung != 2 || h.HoldUntil.Sub(*now) < 54*time.Second {
 		t.Fatalf("recheck rung=%d delay=%v", h.Rung, h.HoldUntil.Sub(*now))
 	}
@@ -117,6 +122,7 @@ func TestAdaptiveTransientRecheckKeepsRefusalScope(t *testing.T) {
 	h := c.holdLocked(routeID{schemas.OpenAI, "m", "a"}, *now)
 	*now = h.HoldUntil.Add(time.Second)
 	observe(c, schemas.OpenAI, "m", "a", responseError(503))
+	h = c.holdLocked(routeID{schemas.OpenAI, "m", "a"}, *now)
 	if h.HoldClass != schemas.FailureClassRateLimit || h.Rung != 1 || !h.HoldUntil.After(*now) {
 		t.Fatalf("network failure changed refusal: %+v", h)
 	}
@@ -262,8 +268,8 @@ func TestAdaptiveStateBoundAndConcurrentStreams(t *testing.T) {
 	for i := 0; i < maxRoutes+2; i++ {
 		observe(c, schemas.OpenAI, fmt.Sprintf("m%d", i), "a", nil)
 	}
-	if len(c.routes) > maxRoutes || len(c.events) > maxEvents {
-		t.Fatalf("unbounded state routes=%d events=%d", len(c.routes), len(c.events))
+	if len(c.routes) > maxRoutes {
+		t.Fatalf("unbounded telemetry routes=%d", len(c.routes))
 	}
 }
 
@@ -283,6 +289,7 @@ func BenchmarkAdaptiveKeySelection(b *testing.B) {
 		c.enabled.Store(false)
 		b.ReportAllocs()
 		for b.Loop() {
+			ctx.ClearValue(schemas.BifrostContextKeyRoutingEngineLogs)
 			c.SelectKey(ctx, testKeys, schemas.OpenAI, "m")
 		}
 	})
@@ -290,6 +297,7 @@ func BenchmarkAdaptiveKeySelection(b *testing.B) {
 		c.enabled.Store(true)
 		b.ReportAllocs()
 		for b.Loop() {
+			ctx.ClearValue(schemas.BifrostContextKeyRoutingEngineLogs)
 			c.SelectKey(ctx, testKeys, schemas.OpenAI, "m")
 		}
 	})

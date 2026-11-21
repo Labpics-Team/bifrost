@@ -17,35 +17,44 @@ type direction struct {
 	model    string
 	score    float64
 	latency  float64
-	due      *route
+	due      *condition
+	recover  *route
+	eligible bool
 }
 type probeContextKey struct{}
 
 func (c *Controller) reserveProbe(ctx *schemas.BifrostContext, d direction) bool {
-	if d.due == nil {
+	if d.due != nil {
+		return c.reserveCondition(ctx, routeID{d.provider, d.model, d.due.KeyID}, false)
+	}
+	if d.recover == nil {
 		return false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	r := d.recover
 	now := c.now()
-	heldDue := !d.due.HoldUntil.IsZero() && !d.due.HoldUntil.After(now)
-	recoveryDue := d.due.HoldUntil.IsZero() && !d.due.FailedUntil.IsZero() && !d.due.FailedUntil.After(now)
-	if (!heldDue && !recoveryDue) || d.due.ProbeUntil.After(now) {
+	if c.routes[r.routeID] != r || r.FailedUntil.IsZero() || r.FailedUntil.After(now) || r.ProbeUntil.After(now) {
 		return false
 	}
-	d.due.ProbeUntil = c.now().Add(5 * time.Minute)
-	ctx.SetValue(probeContextKey{}, d.due.routeID)
+	c.probeSequence++
+	r.ProbeID = c.probeSequence
+	r.ProbeUntil = now.Add(5 * time.Minute)
+	ctx.SetValue(probeContextKey{}, probeReservation{routeID: r.routeID, token: r.ProbeID})
 	return true
 }
 
 func (c *Controller) direction(ctx *schemas.BifrostContext, provider schemas.ModelProvider, model, keyID string) direction {
-	d := direction{provider: provider, model: model, score: 1}
+	d := direction{provider: provider, model: model}
 	if c.keys == nil || c.supports == nil {
 		return d
 	}
 	keys, err := c.keys(ctx, provider)
 	if err != nil {
 		return d
+	}
+	for _, key := range keys {
+		c.syncKey(provider, key)
 	}
 	now := c.now()
 	c.mu.Lock()
@@ -62,14 +71,26 @@ func (c *Controller) direction(ctx *schemas.BifrostContext, provider schemas.Mod
 		if r := c.routes[id]; r != nil {
 			latency += r.LatencyMS
 			if !r.FailedUntil.IsZero() && !r.FailedUntil.After(now) && !r.ProbeUntil.After(now) && c.holdLocked(id, now) == nil {
-				d.due = r
+				d.recover = r
 			}
 		}
 		if h := c.holdLocked(id, now); h != nil && !h.HoldUntil.After(now) && !h.ProbeUntil.After(now) {
 			d.due = h
 		}
 	}
+	if count == 0 && c.keyless != nil && c.keyless(provider) {
+		d.eligible = true
+		id := routeID{Provider: provider, Model: model}
+		d.score = c.weightLocked(id, now)
+		if r := c.routes[id]; r != nil {
+			d.latency = r.LatencyMS
+			if !r.FailedUntil.IsZero() && !r.FailedUntil.After(now) && !r.ProbeUntil.After(now) {
+				d.recover = r
+			}
+		}
+	}
 	if count > 0 {
+		d.eligible = true
 		d.score = total / float64(count)
 		// Comparing the inverse first-response latency is relative across the
 		// providers serving this same requested model, including aliases.
@@ -111,7 +132,10 @@ func (c *Controller) Route(ctx *schemas.BifrostContext, req *schemas.BifrostRequ
 	directions := make([]direction, 0)
 	for _, p := range c.providers(model) {
 		if permitted(p) {
-			directions = append(directions, c.direction(ctx, p, model, ""))
+			d := c.direction(ctx, p, model, "")
+			if d.eligible {
+				directions = append(directions, d)
+			}
 		}
 	}
 	baseline := 0.0
@@ -130,6 +154,7 @@ func (c *Controller) Route(ctx *schemas.BifrostContext, req *schemas.BifrostRequ
 	sort.SliceStable(directions, func(i, j int) bool { return directions[i].score > directions[j].score })
 	selected := schemas.Fallback{Provider: provider, Model: model}
 	redirected := false
+	checking := false
 	if !named {
 		if len(directions) == 0 {
 			return nil
@@ -155,29 +180,34 @@ func (c *Controller) Route(ctx *schemas.BifrostContext, req *schemas.BifrostRequ
 		for _, d := range directions {
 			if c.reserveProbe(ctx, d) {
 				selected.Provider = d.provider
+				checking = true
 				break
 			}
 		}
-	} else if current := c.direction(ctx, provider, model, ""); cfg.RerouteFailedDirections && current.score == 0 && !c.reserveProbe(ctx, current) {
-		if cfg.RerouteTarget == "fallbacks" {
-			for _, fb := range fallbacks {
-				if permitted(fb.Provider) && c.direction(ctx, fb.Provider, fb.Model, fb.KeyID).score > 0 {
-					selected = fb
-					redirected = true
-					break
+	} else if current := c.direction(ctx, provider, model, ""); cfg.RerouteFailedDirections && current.score == 0 {
+		checking = c.reserveProbe(ctx, current)
+		if !checking {
+			if cfg.RerouteTarget == "fallbacks" {
+				for _, fb := range fallbacks {
+					if permitted(fb.Provider) && c.direction(ctx, fb.Provider, fb.Model, fb.KeyID).score > 0 {
+						selected = fb
+						redirected = true
+						break
+					}
 				}
 			}
-		} else {
-			for _, d := range directions {
-				if d.provider != provider && d.score > 0 {
-					selected.Provider = d.provider
-					redirected = true
-					break
+			if !redirected {
+				for _, d := range directions {
+					if d.provider != provider && d.score > 0 {
+						selected.Provider = d.provider
+						redirected = true
+						break
+					}
 				}
 			}
 		}
 	}
-	if named && !redirected && !cfg.AppendFallbacksToPinned {
+	if named && !redirected && !checking && !cfg.AppendFallbacksToPinned {
 		return nil
 	}
 	chain := make([]schemas.Fallback, 0, len(fallbacks)+len(directions)+1)
@@ -197,7 +227,7 @@ func (c *Controller) Route(ctx *schemas.BifrostContext, req *schemas.BifrostRequ
 		}
 		appendUnique(fb)
 	}
-	if !named || cfg.AppendFallbacksToPinned {
+	if !named || checking || cfg.AppendFallbacksToPinned {
 		for _, d := range directions {
 			if d.score > 0 {
 				appendUnique(schemas.Fallback{Provider: d.provider, Model: model, Inferred: true})
@@ -216,44 +246,4 @@ func (c *Controller) Route(ctx *schemas.BifrostContext, req *schemas.BifrostRequ
 	ctx.AppendRoutingEngineLog(schemas.RoutingEngineLoadbalancing, schemas.LogLevelInfo, fmt.Sprintf("Adaptive routing selected %s/%s from observed key health; %d fallback(s)", selected.Provider, selected.Model, len(chain)))
 	schemas.AppendToContextList(ctx, schemas.BifrostContextKeyRoutingEnginesUsed, schemas.RoutingEngineLoadbalancing)
 	return nil
-}
-
-// ResetProvider is called after a native provider/key edit. Measurements of the
-// old credential/configuration must not keep a replacement out of rotation.
-func (c *Controller) ResetProvider(provider schemas.ModelProvider) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for id := range c.routes {
-		if id.Provider == provider {
-			delete(c.routes, id)
-		}
-	}
-}
-
-func (c *Controller) ResetKey(provider schemas.ModelProvider, keyID string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for id := range c.routes {
-		if id.Provider == provider && id.KeyID == keyID {
-			delete(c.routes, id)
-		}
-	}
-}
-
-// Release uses the native held-key API semantics: no provider releases all;
-// provider/key with no model releases all models including a whole-key hold.
-func (c *Controller) Release(provider schemas.ModelProvider, keyID, model string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for id, r := range c.routes {
-		if provider != "" && (id.Provider != provider || id.KeyID != keyID || model != "" && id.Model != model) {
-			continue
-		}
-		r.HoldUntil = time.Time{}
-		r.ProbeUntil = time.Time{}
-		r.FailedUntil = time.Time{}
-		r.Rung = 0
-		r.Recovering = true
-		r.Recoveries = 0
-	}
 }

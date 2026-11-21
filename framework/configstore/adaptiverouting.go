@@ -87,6 +87,14 @@ func migrationAddAdaptiveRoutingState(ctx context.Context, db *gorm.DB, logger s
 	})
 }
 
+func migrationAddAdaptiveProviderRevision(ctx context.Context, db *gorm.DB, logger schemas.Logger) error {
+	return RunSingleMigration(ctx, nil, db, logger, &migrator.Migration{
+		ID:       "add_adaptive_provider_revision",
+		Migrate:  func(tx *gorm.DB) error { return tx.WithContext(ctx).AutoMigrate(&Incident{}) },
+		Rollback: func(*gorm.DB) error { return errors.New("adaptive incident configuration identity must be preserved") },
+	})
+}
+
 func (s *AdaptiveRoutingStore) Load(ctx context.Context) (AdaptiveState, error) {
 	var state AdaptiveState
 	err := s.store.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {

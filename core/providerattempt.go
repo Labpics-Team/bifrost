@@ -5,7 +5,14 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
-func (bifrost *Bifrost) beginProviderAttempt(ctx *schemas.BifrostContext, provider schemas.ModelProvider, model string, key schemas.Key, req *schemas.BifrostRequest) schemas.ProviderAttempt {
+func (bifrost *Bifrost) observeProviderConfiguration(provider schemas.ModelProvider, config *schemas.ProviderConfig) string {
+	if observer, ok := bifrost.providerAttemptObserver.(schemas.ProviderConfigurationObserver); ok {
+		return observer.ProviderConfigured(provider, config)
+	}
+	return ""
+}
+
+func (bifrost *Bifrost) beginProviderAttempt(ctx *schemas.BifrostContext, provider schemas.ModelProvider, model string, key schemas.Key, req *schemas.BifrostRequest, revision string) schemas.ProviderAttempt {
 	if bifrost.providerAttemptObserver == nil || model == "" {
 		return nil
 	}
@@ -15,7 +22,7 @@ func (bifrost *Bifrost) beginProviderAttempt(ctx *schemas.BifrostContext, provid
 		return nil
 	}
 	return bifrost.providerAttemptObserver.BeginProviderAttempt(ctx, schemas.ProviderAttemptInfo{
-		Provider: provider, Model: model, KeyID: key.ID, KeyName: key.Name,
+		Provider: provider, ProviderRevision: revision, Model: model, KeyID: key.ID, KeyName: key.Name, Key: key,
 	})
 }
 

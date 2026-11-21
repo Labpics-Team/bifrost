@@ -43,8 +43,9 @@ missing switches become false, and missing retention/interval values are invalid
 
 The dashboard shows observed provider/model/key health, first-response latency,
 in-flight attempts and held credentials. The health score excludes the relative
-latency adjustment made when selecting from an eligible pool. **Incidents** shows
-recent state transitions from this running process. The existing LLM request logs
+latency adjustment made when selecting from an eligible pool. **Incidents** shows durable problems and their lifecycle: opening, holds, real
+checks, recovery, confirmed resolution and configuration changes. Each event
+can link to the native request log that supplied the observation. The existing LLM request logs
 retain provider decisions through Bifrost's normal logging policy.
 
 `POST /api/adaptive-routing/conditions/clear` releases holds. Supply `provider`
@@ -64,6 +65,11 @@ A provider already named by the caller, a rule or a virtual key remains selected
 by default. The optional append, redirect and prune settings adjust this policy.
 For a named provider, pruning applies only when appending alternatives is enabled
 or the request was actually redirected, following the native settings contract.
+A due check of a named provider keeps healthy fallbacks even when appending
+alternatives to ordinary named traffic is off. If every explicitly configured
+fallback is failing, redirecting can use the healthy compatible, allowed global
+pool. A managed provider without an eligible key is excluded; native keyless
+providers remain supported.
 Explicit caller/rule key pins and direct credentials retain their native
 precedence. Adaptive routing does not change core's retry loop or session
 affinity. A session binding can still name its existing provider/key; native
@@ -91,19 +97,73 @@ startup attempts that core retries before response plugins see them.
 
 ## State and maintenance
 
-The controller retains at most 8,192 key/model records (including whole-key holds)
-and 4,096 transitions, without prompts, response bodies or credential values.
-Idle records are removed after 24 hours when status is read; the cap also evicts
-the oldest idle record. Active attempts are not evicted. History is process-local,
-bounded by both retention and record count; it is not Enterprise's persisted
-historical analytics. Health and load start fresh after restart.
+The native `config.db` holds conditions, lifecycle incidents and their events.
+A condition's next-check time is an admission time, never an expiry time. Due
+conditions survive restart, telemetry eviction and idle cleanup until a real
+check, an operator action or a configuration change resolves them. Reading
+`/api/adaptive-routing/status` does not mutate any routing state.
 
-Only nonexpired holds are snapshotted through the existing ConfigStore, on the
-configured interval and orderly shutdown. A saved credential/configuration hash
-prevents restoring a hold onto a changed key. No per-request database writes are
-added. The snapshot is for a single Bifrost process; the fork does not implement
-Enterprise cluster replication or leader election. Do not share its snapshot
-row between independently active gateway replicas.
+Each attempt captures the actual selected key's configuration fingerprint, the
+provider worker's configuration revision and its condition/probe generations.
+A late answer cannot release a newer refusal, clear another check's reservation
+or affect a replacement credential or endpoint. Provider identity is computed
+when core builds its workers, including the resolved network and proxy settings.
+The fingerprint includes resolved secrets as a digest; credential values,
+prompts and response bodies are not stored in the adaptive database. The controller
+keeps one frozen native configuration snapshot per credential revision;
+unchanged requests compare that snapshot without rebuilding its digest.
+Omitted key flags and their explicit native defaults have the same identity,
+so reading a file-supplied key back from SQLite does not release its hold.
+
+One lifecycle writer commits a condition and its incident events atomically,
+then publishes that state to routing. It releases the shared reader mutex during
+SQLite IO. The existing configuration database uses WAL with `synchronous=FULL`;
+normal health samples do not write to the database. Observation-only updates,
+including a new healthy model or a previously unused key, skip the writer queue.
+A failed manual release
+returns an error and leaves the committed hold in force. Storage errors are
+visible in the status response and native routing logs. Startup fails if durable
+state cannot be read instead of silently starting with empty restrictions.
+Provider/key edits and removal finish their native operation even if adaptive
+cleanup fails. Maintenance retries that cleanup, and startup compares persisted
+incident/condition identity against the live configuration. An endpoint edit
+followed by process loss therefore closes the old observations as **No longer
+observed**, without claiming recovery or applying the old endpoint's hold.
+
+The routing telemetry cache retains at most 8,192 key/model records. Maintenance
+removes idle telemetry after 24 hours; it never deletes unresolved conditions.
+The configured snapshot interval saves the most recent telemetry, at most 2,048
+records and 1 MiB. The snapshot carries the lifecycle revision and cannot cross
+a later key rotation or state transition. In-flight attempts and probe leases
+are not restored: after restart a due condition can receive a fresh real check.
+
+Incidents use server-side filters, ordering and cursor pagination through
+`GET /api/adaptive-routing/incidents` and `GET /api/adaptive-routing/incidents/{id}`.
+A one-hour gap in recovery traffic is **Waiting for traffic**, not a recovery.
+Key/provider removal ends the old observation as **No longer observed**;
+`closed_at` records that end, while `resolved_at` is set only for confirmed
+recovery. Maintenance deletes closed incidents and their events after the
+configured retention, in batches of at most 1,000. Open incidents are retained.
+
+**Record Routing History** controls optional health diagnostics. Required
+condition lifecycle records remain durable while it is off, and native request
+log explanations remain available. A timer is not evidence of recovery.
+
+This implementation has one active process and one local SQLite writer. The
+Labpics deployment uses one replica, `Recreate`, a ReadWriteOnce data volume and
+a 120-second termination allowance. Its existing `config.db` backup covers the
+adaptive lifecycle. It does not implement Enterprise cluster replication or
+leader election; independently active replicas must not share this runtime.
+
+A local Linux measurement on an i9-12900K measured a condition/incident/event
+transaction at 3.29 ms with FULL durability (0.38 ms with NORMAL). This is the
+cost of a lifecycle transition, not a per-request write. With two providers and
+four managed keys, the current selection path measured 3.78 microseconds and
+2,296 bytes per request; key selection measured 2.21 microseconds and attempt
+observation 1.08 microseconds. Explicit-provider and unconfigured paths retain
+zero allocations. The contention test
+checks warmed and first-use healthy requests while a release is waiting for
+SQLite's writer lock.
 
 The integration consists of the routing plugin, existing `KeySelector`, a small
 optional core attempt-observation hook and the existing HTTP administration
@@ -115,7 +175,14 @@ Focused checks after preparing the local Go workspace:
 
 ```sh
 go test ./plugins/routing/adaptive ./core -run 'TestAdaptive|TestProviderAttempt'
-go test ./transports/bifrost-http/lib ./transports/bifrost-http/handlers -run 'TestAdaptive|TestConfigDataAdaptive'
+go test ./transports/bifrost-http/lib ./transports/bifrost-http/handlers ./transports/bifrost-http/server -run 'TestAdaptive|TestConfigDataAdaptive'
 go test -race ./plugins/routing/adaptive ./core -run 'TestAdaptive|TestProviderAttempt'
 go test ./plugins/routing/adaptive ./core -run '^$' -bench 'BenchmarkAdaptive|BenchmarkProviderAttempt' -benchmem
 ```
+
+The real HTTP/SSE and browser fixture is
+`tests/e2e/features/adaptive-routing/runtime-fixture.py --binary tmp/bifrost-http`.
+Run its companion `adaptive-routing-runtime.spec.ts` with
+`ADAPTIVE_RUNTIME_FIXTURE_URL=http://127.0.0.1:18862`. It uses an isolated native
+SQLite database and a controlled provider to check refusal, incident/request-log
+links, crash/restart, recovery and streaming fallbacks without mocked APIs.
