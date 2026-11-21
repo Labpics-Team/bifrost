@@ -4830,6 +4830,10 @@ func extractSuccessfulListModelsResponses(results chan schemas.ListModelsByKeyRe
 
 	for result := range results {
 		if result.Err != nil {
+			// Declare attribution at the provider boundary, before hooks can
+			// replace this error with a policy refusal. Downstream aggregators
+			// cannot distinguish those sources from the HTTP status alone.
+			result.Err.ExtraFields.ErrorType = schemas.ClassifyErrorType(result.Err, schemas.ListModelsRequest)
 			errMsg := "unknown error"
 			if errorField := result.Err.Error; errorField != nil {
 				if errorField.Message != "" {
@@ -4888,6 +4892,7 @@ func HandleKeylessListModelsRequest(
 
 	// If request failed, attach status to error
 	if bifrostErr != nil {
+		bifrostErr.ExtraFields.ErrorType = schemas.ClassifyErrorType(bifrostErr, schemas.ListModelsRequest)
 		keyStatus.Status = schemas.KeyStatusListModelsFailed
 		keyStatus.Error = bifrostErr
 		bifrostErr.ExtraFields.KeyStatuses = []schemas.KeyStatus{keyStatus}

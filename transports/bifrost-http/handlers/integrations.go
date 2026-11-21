@@ -20,9 +20,7 @@ type IntegrationHandler struct {
 }
 
 // AccessResolver narrows the provider fan-out of a models listing to what the request may reach
-type AccessResolver interface {
-	NarrowListModelsProviders(bifrostCtx *schemas.BifrostContext)
-}
+type AccessResolver = integrations.AccessResolver
 
 // NewIntegrationHandler creates a new integration handler instance.
 // WebSocket handlers may be nil if WebSocket support is not configured.

@@ -155,7 +155,11 @@
       "TestWarpSearchDeclaresItsQueryFilterIndexes"
     ],
     "github.com/maximhq/bifrost/transports/v2/bifrost-http/server": [
-      "TestRoutingModelsHTTPAdmission"
+      "TestRoutingModelsHTTPAdmission",
+      "TestUnifiedModelCatalogHTTP",
+      "TestUnifiedModelCatalogProviderFailure",
+      "TestUnifiedModelCatalogPreservesPolicyFailure",
+      "TestUnifiedModelCatalogPreservesMixedProviderPolicyFailure"
     ],
     "github.com/maximhq/bifrost/core/providers/anthropic": [
       "TestToAnthropicChatCompletionError",

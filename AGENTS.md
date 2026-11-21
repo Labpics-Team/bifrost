@@ -13,10 +13,9 @@ are declared in `ci/verification.json`.
 The first import reproduced the previously deployed source and tests. Subsequent
 review removes overrides that conflict with native behavior; FORK.md records the
 retained differences. Verify behavior changes with the applicable guidance below.
-This first slice covers the repository and its verification only. Infra still
-builds the pinned upstream with patches. Switching its source, publishing an
-image or deploying the fork requires a separate task; merging `labpics` only
-runs the fork verification workflow.
+Infra builds a pinned revision of this fork without external patches. Merging
+`labpics` runs the fork verification workflow; image publication and runtime
+activation use Infra's source and immutable image pins.
 
 > Context for AI agents (Claude Code, Copilot, Cursor, etc.) working on this codebase. Read this fully before making changes.
 

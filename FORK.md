@@ -35,7 +35,7 @@ Merge в `labpics` запускает проверки форка, но сам �
 | Доступность кэша | Недоступный кэш отключается до фонового восстановления; ограничение чтения store не сокращает срок embedding или самого запроса | [Qdrant](framework/vectorstore/qdrant.go), [semanticcache](plugins/semanticcache/main.go), [readiness](transports/bifrost-http/handlers/health.go) |
 | Декодирование replay | Сохранённый raw response воспроизводится без округления JSON-чисел; правила сопоставления запросов остаются штатными | [cached response decoding](plugins/semanticcache/utils.go) |
 | Повтор транспорта | Fasthttp не повторяет уже записанный неидемпотентный запрос скрыто внутри одной попытки; решение о следующей попытке остаётся в штатном retry/fallback loop | [transport](core/providers/utils/roundtripper.go), [retry loop](core/bifrost.go) |
-| Каталог Routing Rules | `/v1/routing/models` читает доступные caller публичные имена из живых правил без второго каталога и запросов к провайдерам | [routing](plugins/routing/models.go), [HTTP admission](transports/bifrost-http/server/routingmodels.go) |
+| Каталог Routing Rules | `/v1/models` и SDK-каталоги включают доступные имена из живых правил рядом с прямыми моделями, с общей pagination; отдельный `/v1/routing/models` сохранён на время вывода старых клиентов | [routing](plugins/routing/models.go), [HTTP admission](transports/bifrost-http/server/routingmodels.go) |
 | Фильтры журнала SQLite | Покрывающие индексы для моделей и ключей сохраняют штатные SQL, срок выборки и ограничения видимости; Dashboard запрашивает MCP-справочник только на вкладке MCP | [SQLite indexes](framework/logstore/sqlitefilters.go), [dashboard](ui/app/workspace/dashboard/page.tsx) |
 
 Причины проверяются по поведению. Например, upstream разрешает повтор после
@@ -111,6 +111,17 @@ Direct-only отключает поиск по сходству embeddings, но
 `model == "имя"`. Он применяет native admission и права на выбираемые primary
 targets, сохраняет приоритет первого объявления с пригодным target и pagination. Каталог не
 предсказывает произвольную CEL-маршрутизацию и не обещает успех inference.
+Общий `/v1/models` и `/openai/v1/models` дополняют этими именами штатный каталог
+провайдеров. Изменение правила сразу меняет выдачу; отдельного реестра алиасов нет.
+Сортировка и pagination выполняются после объединения, а явный запрос каталога
+одного провайдера сохраняет его собственную выдачу. При отказе discovery
+провайдеров разрешённые алиасы остаются в каталоге, когда источник отказа явно
+обозначен на native discovery boundary; статусы ключей сохраняют диагностику.
+Если discovery всех провайдеров завершился ошибкой, отказ политики или ошибка
+неизвестного происхождения имеют приоритет над provider outage независимо от
+порядка завершения. Частично успешная штатная выдача сохраняется.
+Ошибки допуска, hooks, проверки direct key и отмена запроса сохраняются;
+неизвестный источник ошибки не считается отказом провайдера.
 
 Идентичность embeddings следует из фактических provider/model и размерности.
 Смена весов или preprocessing под прежним model ID неразличима по стандартному
