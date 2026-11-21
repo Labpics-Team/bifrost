@@ -88,6 +88,7 @@ test('real requests produce durable incidents and native request logs across res
   }
   const resolved = await getIncident(incident.id)
   expect(resolved.status).toBe('resolved')
+  expect(resolved.failure_class).toBe('rate_limit')
   expect(resolved.resolved_at).toBeTruthy()
   expect(resolved.closed_at).toBeTruthy()
   await page.request.post(`${fixtureURL}/_fixture/restart`, { data: {}, timeout: 90_000 })
@@ -120,6 +121,8 @@ test('real requests produce durable incidents and native request logs across res
   await expect(page.getByText('log not found', { exact: false }).first()).toBeVisible()
   await page.goto(`${gateway}/workspace/adaptive-routing/incidents?incident=${incident.id}`)
   await expect(page.getByTestId('adaptive-incident-detail')).toContainText('Resolved')
+  await expect(page.getByTestId('adaptive-incident-detail').locator('dd').filter({ hasText: 'Rate limit reached' })).toBeVisible()
+  await expect(page.getByTestId('adaptive-incident-event-cause').first()).toContainText('Rate limit reached')
   await page.setViewportSize({ width: 390, height: 844 })
   await page.screenshot({ path: testInfo.outputPath('incident-mobile.png'), fullPage: true })
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy()
