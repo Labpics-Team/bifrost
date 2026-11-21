@@ -55,6 +55,7 @@ import (
 	"github.com/maximhq/bifrost/plugins/otel"
 	"github.com/maximhq/bifrost/plugins/prompts"
 	"github.com/maximhq/bifrost/plugins/routing"
+	"github.com/maximhq/bifrost/plugins/routing/adaptive"
 	"github.com/maximhq/bifrost/plugins/routing/complexity"
 	"github.com/maximhq/bifrost/plugins/routing/rules"
 	"github.com/maximhq/bifrost/plugins/semanticcache"
@@ -242,7 +243,8 @@ type ConfigData struct {
 	// provider's own proxy_config.
 	ProxyConfig *GlobalProxyFileConfig `json:"proxy_config,omitempty"`
 	// Warp is the Warp settings page (models, behaviour, log search, topics).
-	Warp *WarpFileConfig `json:"warp,omitempty"`
+	Warp               *WarpFileConfig  `json:"warp,omitempty"`
+	LoadBalancerConfig *adaptive.Config `json:"load_balancer_config,omitempty"`
 
 	presentSections           map[string]bool
 	presentGovernanceSections map[string]bool
@@ -561,31 +563,32 @@ func (cd *ConfigData) UnmarshalJSON(data []byte) error {
 
 	// First, unmarshal into a temporary struct to get all fields except the complex configs
 	type TempConfigData struct {
-		Version           int                                   `json:"version,omitempty"`
-		EnvLabel          string                                `json:"env_label,omitempty"`
-		DisableOnboarding *bool                                 `json:"disable_onboarding,omitempty"`
-		SourceOfTruth     string                                `json:"source_of_truth,omitempty"`
-		FrameworkConfig   json.RawMessage                       `json:"framework,omitempty"`
-		Server            *ServerConfig                         `json:"server,omitempty"`
-		Client            *configstore.ClientConfig             `json:"client"`
-		EncryptionKey     *schemas.SecretVar                    `json:"encryption_key"`
-		AuthConfig        *configstore.AuthConfig               `json:"auth_config,omitempty"`
-		SetupToken        *schemas.SecretVar                    `json:"setup_token,omitempty"`
-		Providers         map[string]configstore.ProviderConfig `json:"providers"`
-		MCP               *schemas.MCPConfig                    `json:"mcp,omitempty"`
-		Webhooks          []*WebhookEndpointConfig              `json:"webhooks,omitempty"`
-		Agents            []*AgentRegistrationFileConfig        `json:"agents,omitempty"`
-		Relays            []*schemas.RelayConfig                `json:"relays,omitempty"`
-		Governance        *configstore.GovernanceConfig         `json:"governance,omitempty"`
-		VectorStoreConfig json.RawMessage                       `json:"vector_store,omitempty"`
-		ConfigStoreConfig json.RawMessage                       `json:"config_store,omitempty"`
-		LogsStoreConfig   json.RawMessage                       `json:"logs_store,omitempty"`
-		Plugins           []*schemas.PluginConfig               `json:"plugins,omitempty"`
-		WebSocket         *schemas.WebSocketConfig              `json:"websocket,omitempty"`
-		FeatureFlags      *FeatureFlagsFileConfig               `json:"feature_flags,omitempty"`
-		ProxyConfig       *GlobalProxyFileConfig                `json:"proxy_config,omitempty"`
-		Warp              *WarpFileConfig                       `json:"warp,omitempty"`
-		SkillsRegistry    *SkillsRegistryConfig                 `json:"skills_registry,omitempty"`
+		Version            int                                   `json:"version,omitempty"`
+		EnvLabel           string                                `json:"env_label,omitempty"`
+		DisableOnboarding  *bool                                 `json:"disable_onboarding,omitempty"`
+		SourceOfTruth      string                                `json:"source_of_truth,omitempty"`
+		FrameworkConfig    json.RawMessage                       `json:"framework,omitempty"`
+		Server             *ServerConfig                         `json:"server,omitempty"`
+		Client             *configstore.ClientConfig             `json:"client"`
+		EncryptionKey      *schemas.SecretVar                    `json:"encryption_key"`
+		AuthConfig         *configstore.AuthConfig               `json:"auth_config,omitempty"`
+		SetupToken         *schemas.SecretVar                    `json:"setup_token,omitempty"`
+		Providers          map[string]configstore.ProviderConfig `json:"providers"`
+		MCP                *schemas.MCPConfig                    `json:"mcp,omitempty"`
+		Webhooks           []*WebhookEndpointConfig              `json:"webhooks,omitempty"`
+		Agents             []*AgentRegistrationFileConfig        `json:"agents,omitempty"`
+		Relays             []*schemas.RelayConfig                `json:"relays,omitempty"`
+		Governance         *configstore.GovernanceConfig         `json:"governance,omitempty"`
+		VectorStoreConfig  json.RawMessage                       `json:"vector_store,omitempty"`
+		ConfigStoreConfig  json.RawMessage                       `json:"config_store,omitempty"`
+		LogsStoreConfig    json.RawMessage                       `json:"logs_store,omitempty"`
+		Plugins            []*schemas.PluginConfig               `json:"plugins,omitempty"`
+		WebSocket          *schemas.WebSocketConfig              `json:"websocket,omitempty"`
+		FeatureFlags       *FeatureFlagsFileConfig               `json:"feature_flags,omitempty"`
+		ProxyConfig        *GlobalProxyFileConfig                `json:"proxy_config,omitempty"`
+		Warp               *WarpFileConfig                       `json:"warp,omitempty"`
+		LoadBalancerConfig json.RawMessage                       `json:"load_balancer_config,omitempty"`
+		SkillsRegistry     *SkillsRegistryConfig                 `json:"skills_registry,omitempty"`
 	}
 
 	var temp TempConfigData
@@ -614,6 +617,14 @@ func (cd *ConfigData) UnmarshalJSON(data []byte) error {
 	cd.FeatureFlags = temp.FeatureFlags
 	cd.ProxyConfig = temp.ProxyConfig
 	cd.Warp = temp.Warp
+	cd.LoadBalancerConfig = nil
+	if len(temp.LoadBalancerConfig) > 0 && string(temp.LoadBalancerConfig) != "null" {
+		config, err := adaptive.ParseFileConfig(temp.LoadBalancerConfig)
+		if err != nil {
+			return fmt.Errorf("invalid load_balancer_config: %w", err)
+		}
+		cd.LoadBalancerConfig = &config
+	}
 	cd.presentGovernanceSections = nil
 	if rawGovernance, ok := raw["governance"]; ok && len(rawGovernance) > 0 {
 		var rawGovernanceFields map[string]json.RawMessage
@@ -749,6 +760,8 @@ type Config struct {
 	// service exists; warpFileIsSourceOfTruth applies it on every boot rather than when it changes.
 	warpFileConfig          *WarpFileConfig
 	warpFileIsSourceOfTruth bool
+	LoadBalancerConfig      *adaptive.Config
+	AdaptiveRouter          *adaptive.Controller
 	// HTTPClientFactory hands out outbound clients that honour ProxyConfig per purpose
 	// and follow its changes live (see network.HTTPClientFactory).
 	HTTPClientFactory *network.HTTPClientFactory
@@ -1254,6 +1267,7 @@ func LoadConfig(ctx context.Context, configDirPath string) (*Config, error) {
 	loadProxyConfig(ctx, config, &configData)
 	// 9b. Warp config from the file, applied later by the server through the Warp service
 	config.warpFileConfig = configData.Warp
+	config.LoadBalancerConfig = configData.LoadBalancerConfig
 	config.warpFileIsSourceOfTruth = configData.isConfigJSONSourceOfTruth()
 	// 10. Plugins
 	loadPlugins(ctx, config, &configData)

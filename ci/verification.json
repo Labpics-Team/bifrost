@@ -116,7 +116,10 @@
       "TestRetryBackoffStopsWhenRequestDeadlineExpires",
       "TestScenarioEveryKeyRefusedIsTriedOnce",
       "TestOwnedStreamCancellationDoesNotWaitForReader",
-      "TestOwnedStreamCancellationIsNotCleanEOF"
+      "TestOwnedStreamCancellationIsNotCleanEOF",
+      "TestProviderAttemptObserverSeesEachRetryAndStreamingTeardown",
+      "TestProviderAttemptObserverSeesTTFTFailureBeforeHealthyFallback",
+      "TestExplicitKeySelectionExplainsNativePin"
     ],
     "github.com/maximhq/bifrost/core/providers/utils": [
       "TestContextTransport_TruncatedContentLengthStreamReportsUnexpectedEOFAndDiscardsConn",
@@ -164,7 +167,8 @@
       "TestUnifiedModelCatalogHTTP",
       "TestUnifiedModelCatalogProviderFailure",
       "TestUnifiedModelCatalogPreservesPolicyFailure",
-      "TestUnifiedModelCatalogPreservesMixedProviderPolicyFailure"
+      "TestUnifiedModelCatalogPreservesMixedProviderPolicyFailure",
+      "TestAdaptivePersistenceFailureDoesNotAbortNativeConfiguration"
     ],
     "github.com/maximhq/bifrost/core/providers/anthropic": [
       "TestToAnthropicChatCompletionError",
@@ -173,7 +177,47 @@
     "github.com/maximhq/bifrost/framework/configstore": [
       "TestOIDCConfig",
       "TestOIDCConfigStoreRoundTrip",
-      "TestOIDCConfigEncryption"
+      "TestOIDCConfigEncryption",
+      "TestAdaptiveStoreAtomicLifecycleAndCheckpoint",
+      "TestAdaptiveStoreConcurrentMutationHasOneWinner",
+      "TestAdaptiveStoreRecoversCommittedLifecycleAfterCrash",
+      "TestAdaptiveStoreQueriesAndRetention",
+      "TestAdaptiveStoreRejectsBrokenIncidentLinks",
+      "TestAdaptiveStoreClosureWithoutRecovery",
+      "TestAdaptiveNativeConfigDurability"
+    ],
+    "github.com/maximhq/bifrost/plugins/routing/adaptive": [
+      "TestAdaptiveOldSuccessCannotReleaseNewHold",
+      "TestAdaptiveOldCompletionCannotReleaseNewProbe",
+      "TestAdaptiveStatusDoesNotForgetUnresolvedHold",
+      "TestAdaptiveDueHoldSurvivesSnapshotRestart",
+      "TestAdaptiveSnapshotDoesNotRebindRefusalToRotatedKey",
+      "TestAdaptiveProviderNeedsEligibleKey",
+      "TestAdaptiveFallbackRedirectUsesGlobalLastResort",
+      "TestAdaptiveNamedDueProbeKeepsHealthyFallback",
+      "TestAdaptiveEvictionKeepsUnresolvedConditions",
+      "TestAdaptiveManualReleaseFencesOldCompletion",
+      "TestAdaptiveDurableIncidentLifecycle",
+      "TestAdaptiveFailedReleaseKeepsCommittedHold",
+      "TestAdaptiveSQLiteWaitDoesNotBlockHealthyTraffic",
+      "TestAdaptiveDueKeyCheckDoesNotBlockHealthyTraffic",
+      "TestAdaptiveDueProviderCheckDoesNotBlockHealthyTraffic",
+      "TestAdaptiveScopeChangeResolvesAllRecoveredIncidents",
+      "TestAdaptiveSameScopeRefusalKeepsCompletedCheck",
+      "TestAdaptiveResolvedIncidentKeepsFailureCauseAfterRestart",
+      "TestAdaptiveProbeAdmissionIsVolatileUntilCompletion",
+      "TestAdaptiveFrozenRevisionDetectsNestedSecretRotation",
+      "TestAdaptiveHistoryOffKeepsDurableConditions",
+      "TestAdaptiveDeletedHealthyProviderDoesNotPoisonRestart",
+      "TestAdaptiveProviderEditFailedResetReconcilesAfterReopen",
+      "TestAdaptiveFailedConfigurationResetRetriesDuringMaintenance",
+      "TestAdaptiveNativeKeyRoundTripPreservesHold",
+      "TestAdaptiveProviderChoosesHealthyAndPreservesNamedTraffic",
+      "TestAdaptiveProviderRedirectAndFallbackPin",
+      "TestAdaptiveProviderDueCheckIsReservedAcrossRequests",
+      "TestAdaptiveProviderRecoversFromTransientFailureOnRealTraffic",
+      "TestAdaptivePruningFollowsNativeNamedProviderSettings",
+      "TestAdaptiveKeylessProviderUsesObservedHealth"
     ]
   }
 }

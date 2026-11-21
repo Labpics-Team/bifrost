@@ -27156,3 +27156,20 @@ func TestAgentGrantsFromConfigFile_NewKeyUnknownAgent(t *testing.T) {
 		assert.Empty(t, vk.AgentGrants)
 	}
 }
+
+func TestConfigDataAdaptiveRoutingIsOptIn(t *testing.T) {
+	var config ConfigData
+	if err := json.Unmarshal([]byte(`{}`), &config); err != nil {
+		t.Fatal(err)
+	}
+	if config.LoadBalancerConfig != nil {
+		t.Fatal("absent section enabled adaptive routing")
+	}
+	if err := json.Unmarshal([]byte(`{"load_balancer_config":{"append_fallbacks_to_pinned":true,"history_retention_days":100,"snapshot_persist_interval_seconds":1}}`), &config); err != nil {
+		t.Fatal(err)
+	}
+	c := config.LoadBalancerConfig
+	if c == nil || !c.DirectionSelectionEnabled || !c.RouteSelectionEnabled || !c.AppendFallbacksToPinned || c.HistoryRetentionDays != 30 || c.SnapshotIntervalSeconds != 5 {
+		t.Fatalf("wrong partial native settings: %+v", c)
+	}
+}

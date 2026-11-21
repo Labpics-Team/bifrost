@@ -23,6 +23,37 @@ type KeySelector func(ctx *BifrostContext, keys []Key, providerKey ModelProvider
 // from the available pool.
 type KeyPoolFilter func(ctx *BifrostContext, provider ModelProvider, model string, keys []Key) ([]Key, error)
 
+// ProviderAttemptObserver observes actual provider work, before response plugins.
+// A streaming attempt ends at teardown, not when its channel is returned. An
+// observer must be safe for concurrent chunks and End must be idempotent.
+type ProviderAttemptObserver interface {
+	BeginProviderAttempt(*BifrostContext, ProviderAttemptInfo) ProviderAttempt
+}
+
+// ProviderConfigurationObserver optionally identifies the configuration of a
+// newly built provider. Core captures the returned revision in its workers, so
+// an old worker cannot report an observation for a newer endpoint/configuration.
+// This callback must not perform database or network IO.
+type ProviderConfigurationObserver interface {
+	ProviderConfigured(ModelProvider, *ProviderConfig) string
+}
+
+type ProviderAttemptInfo struct {
+	Provider         ModelProvider
+	ProviderRevision string
+	Model            string
+	KeyID            string
+	KeyName          string
+	// Key is the actual configuration selected for this attempt, before alias
+	// resolution. Observers may fingerprint it, but must not persist credentials.
+	Key Key
+}
+
+type ProviderAttempt interface {
+	Observe(*BifrostResponse, *BifrostError)
+	End()
+}
+
 // BifrostConfig represents the configuration for initializing a Bifrost instance.
 // It contains the necessary components for setting up the system including account details,
 // plugins, logging, and initial pool size.
@@ -35,14 +66,15 @@ type BifrostConfig struct {
 	OAuth2Provider           OAuth2Provider
 	MCPHeadersProvider       MCPHeadersProvider // Backend for MCPAuthTypePerUserHeaders credential storage; nil disables per-user-headers auth (resolver errors at use)
 	Logger                   Logger
-	Tracer                   Tracer          // Tracer for distributed tracing (nil = NoOpTracer)
-	InitialPoolSize          int             // Initial pool size for sync pools in Bifrost. Higher values will reduce memory allocations but will increase memory usage.
-	DropExcessRequests       bool            // If true, in cases where the queue is full, requests will not wait for the queue to be empty and will be dropped instead.
-	MCPConfig                *MCPConfig      // MCP (Model Context Protocol) configuration for tool integration
-	KeySelector              KeySelector     // Custom key selector function
-	KeyPoolFilter            KeyPoolFilter   // Optional hook to filter available keys before selection; nil = all keys eligible
-	KVStore                  KVStore         // shared KV store for clustering/session stickiness; nil = disabled
-	SessionAffinity          SessionAffinity // Decides which key a session stays on; nil = Bifrost's own default, which needs KVStore to bind anything
+	Tracer                   Tracer                  // Tracer for distributed tracing (nil = NoOpTracer)
+	InitialPoolSize          int                     // Initial pool size for sync pools in Bifrost. Higher values will reduce memory allocations but will increase memory usage.
+	DropExcessRequests       bool                    // If true, in cases where the queue is full, requests will not wait for the queue to be empty and will be dropped instead.
+	MCPConfig                *MCPConfig              // MCP (Model Context Protocol) configuration for tool integration
+	KeySelector              KeySelector             // Custom key selector function
+	KeyPoolFilter            KeyPoolFilter           // Optional hook to filter available keys before selection; nil = all keys eligible
+	ProviderAttemptObserver  ProviderAttemptObserver // Optional observation of actual attempts; nil adds no request state
+	KVStore                  KVStore                 // shared KV store for clustering/session stickiness; nil = disabled
+	SessionAffinity          SessionAffinity         // Decides which key a session stays on; nil = Bifrost's own default, which needs KVStore to bind anything
 	ModelCatalog             ModelInfoProvider
 	MCPSharedDiscoveryStore  MCPDiscoveryStore
 	MCPPerUserDiscoveryStore MCPDiscoveryStore

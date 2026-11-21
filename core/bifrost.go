@@ -159,8 +159,9 @@ type Bifrost struct {
 	dropExcessRequests         atomic.Bool                           // If true, in cases where the queue is full, requests will not wait for the queue to be empty and will be dropped instead.
 	keySelector                schemas.KeySelector                   // Custom key selector function
 	keyPoolFilter              schemas.KeyPoolFilter                 // optional hook to veto keys before selection (nil = all eligible)
-	kvStore                    schemas.KVStore                       // optional KV store for session stickiness (nil = disabled)
-	sessionAffinity            schemas.SessionAffinity               // decides which key a session stays on; never nil after Init
+	providerAttemptObserver    schemas.ProviderAttemptObserver
+	kvStore                    schemas.KVStore         // optional KV store for session stickiness (nil = disabled)
+	sessionAffinity            schemas.SessionAffinity // decides which key a session stays on; never nil after Init
 }
 
 // ProviderQueue wraps a provider's request channel with lifecycle management
@@ -303,20 +304,21 @@ func Init(ctx context.Context, config schemas.BifrostConfig) (*Bifrost, error) {
 
 	bifrostCtx, cancel := schemas.NewBifrostContextWithCancel(ctx)
 	bifrost := &Bifrost{
-		ctx:           bifrostCtx,
-		cancel:        cancel,
-		account:       config.Account,
-		llmPlugins:    atomic.Pointer[[]schemas.LLMPlugin]{},
-		mcpPlugins:    atomic.Pointer[[]schemas.MCPPlugin]{},
-		a2aPlugins:    atomic.Pointer[[]schemas.A2APlugin]{},
-		requestQueues: sync.Map{},
-		waitGroups:    sync.Map{},
-		keySelector:   config.KeySelector,
-		keyPoolFilter: config.KeyPoolFilter,
-		mcpCredStore:  credstore.NewCredStore(config.OAuth2Provider, config.MCPHeadersProvider, config.Logger),
-		logger:        config.Logger,
-		kvStore:       config.KVStore,
-		modelCatalog:  config.ModelCatalog,
+		ctx:                     bifrostCtx,
+		cancel:                  cancel,
+		account:                 config.Account,
+		llmPlugins:              atomic.Pointer[[]schemas.LLMPlugin]{},
+		mcpPlugins:              atomic.Pointer[[]schemas.MCPPlugin]{},
+		a2aPlugins:              atomic.Pointer[[]schemas.A2APlugin]{},
+		requestQueues:           sync.Map{},
+		waitGroups:              sync.Map{},
+		keySelector:             config.KeySelector,
+		keyPoolFilter:           config.KeyPoolFilter,
+		providerAttemptObserver: config.ProviderAttemptObserver,
+		mcpCredStore:            credstore.NewCredStore(config.OAuth2Provider, config.MCPHeadersProvider, config.Logger),
+		logger:                  config.Logger,
+		kvStore:                 config.KVStore,
+		modelCatalog:            config.ModelCatalog,
 
 		mcpSharedDiscoveryStore:  config.MCPSharedDiscoveryStore,
 		mcpPerUserDiscoveryStore: config.MCPPerUserDiscoveryStore,
@@ -4465,9 +4467,10 @@ func (bifrost *Bifrost) UpdateProvider(providerKey schemas.ModelProvider) error 
 		providerConfig.ConcurrencyAndBufferSize.Concurrency,
 		providerKey,
 		providerConfig.ConcurrencyAndBufferSize.BufferSize)
+	providerRevision := bifrost.observeProviderConfiguration(providerKey, providerConfig)
 	for range providerConfig.ConcurrencyAndBufferSize.Concurrency {
 		newWaitGroup.Add(1)
-		go bifrost.requestWorker(provider, providerConfig, newPq, newWaitGroup)
+		go bifrost.requestWorker(provider, providerConfig, newPq, newWaitGroup, providerRevision)
 	}
 
 	// Step 5: Transfer buffered requests from the old queue to the new queue BEFORE
@@ -5350,9 +5353,10 @@ func (bifrost *Bifrost) prepareProvider(providerKey schemas.ModelProvider, confi
 
 	schemas.RegisterKnownProvider(providerKey)
 
+	providerRevision := bifrost.observeProviderConfiguration(providerKey, config)
 	for range config.ConcurrencyAndBufferSize.Concurrency {
 		currentWaitGroup.Add(1)
-		go bifrost.requestWorker(provider, config, pq, currentWaitGroup)
+		go bifrost.requestWorker(provider, config, pq, currentWaitGroup, providerRevision)
 	}
 
 	return nil
@@ -8251,7 +8255,7 @@ func applyProviderProxySignal(ctx *schemas.BifrostContext, config *schemas.Provi
 
 // requestWorker handles incoming requests from the queue for a specific provider.
 // It manages retries, error handling, and response processing.
-func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas.ProviderConfig, pq *ProviderQueue, waitGroup *sync.WaitGroup) {
+func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas.ProviderConfig, pq *ProviderQueue, waitGroup *sync.WaitGroup, providerRevision string) {
 	defer waitGroup.Done()
 
 	// Reusable timer for the response/error/stream handoff guard below. One timer per
@@ -8537,11 +8541,13 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 		// returned to the pool via its deferred finalizer.
 		if IsStreamRequestType(req.RequestType) {
 			stream, bifrostError = executeRequestWithRetries(req.Context, config, func(k schemas.Key) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+				attempt := bifrost.beginProviderAttempt(req.Context, provider.GetProviderKey(), originalModelRequested, k, &req.BifrostRequest, providerRevision)
 				// Arm this attempt's TTFT deadline before the provider dials: it
 				// covers the header wait and the first output chunk. The retry loop
 				// disarms and clears it once the first-chunk check settles.
-				if abort := providerUtils.NewAttemptAbort(req.firstTokenTimeout); abort != nil {
-					req.Context.SetValue(schemas.BifrostContextKeyStreamAttemptAbort, abort)
+				attemptAbort := providerUtils.NewAttemptAbort(req.firstTokenTimeout)
+				if attemptAbort != nil {
+					req.Context.SetValue(schemas.BifrostContextKeyStreamAttemptAbort, attemptAbort)
 				}
 				if aliasConfig := k.Aliases.ResolveConfig(originalModelRequested); aliasConfig != nil {
 					resolvedModel = aliasConfig.ModelID
@@ -8597,6 +8603,9 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 				}
 				startup := providerUtils.NewStreamStartupState(isPreamble, providerUtils.AttemptAbortFromContext(req.Context) != nil)
 				postHookRunner := func(ctx *schemas.BifrostContext, result *schemas.BifrostResponse, err *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError) {
+					if attempt != nil {
+						attempt.Observe(result, err)
+					}
 					// Populate extra fields before RunPostLLMHooks so plugins (e.g. logging)
 					// can read requestType/provider/model from the chunk or error.
 					// Uses the per-attempt snapshot — capturing the outer resolvedModel by
@@ -8644,6 +8653,7 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 				var finalizerOnce sync.Once
 				postHookSpanFinalizer := func(ctx context.Context) {
 					finalizerOnce.Do(func() {
+						finishProviderAttempt(attempt, attemptAbort)
 						pipeline.FinalizeStreamingPostHookSpans(ctx)
 						bifrost.releasePluginPipeline(pipeline)
 					})
@@ -8667,6 +8677,10 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 				// no deferred finalizer will run — release the pipeline directly
 				// so a retry doesn't inherit a leaked pool entry.
 				if streamErr != nil && streamCh == nil {
+					if attempt != nil {
+						attempt.Observe(nil, streamErr)
+						finishProviderAttempt(attempt, attemptAbort)
+					}
 					finalizerOnce.Do(func() {
 						bifrost.releasePluginPipeline(pipeline)
 					})
@@ -8674,7 +8688,13 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 				return streamCh, streamErr
 			}, keyProvider, req.RequestType, provider.GetProviderKey(), model, &req.BifrostRequest, bifrost.logger)
 		} else {
-			result, bifrostError = executeRequestWithRetries(req.Context, config, func(k schemas.Key) (*schemas.BifrostResponse, *schemas.BifrostError) {
+			result, bifrostError = executeRequestWithRetries(req.Context, config, func(k schemas.Key) (response *schemas.BifrostResponse, responseErr *schemas.BifrostError) {
+				if attempt := bifrost.beginProviderAttempt(req.Context, provider.GetProviderKey(), originalModelRequested, k, &req.BifrostRequest, providerRevision); attempt != nil {
+					defer func() {
+						attempt.Observe(response, responseErr)
+						attempt.End()
+					}()
+				}
 				if aliasConfig := k.Aliases.ResolveConfig(originalModelRequested); aliasConfig != nil {
 					resolvedModel = aliasConfig.ModelID
 					req.Context.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Key: originalModelRequested, Config: aliasConfig})
@@ -11308,6 +11328,7 @@ func pinKeys(ctx *schemas.BifrostContext, keys []schemas.Key, providerKey schema
 		if keyID = strings.TrimSpace(keyID); keyID != "" {
 			for _, key := range keys {
 				if key.ID == keyID {
+					logExplicitKeySelection(ctx, key, providerKey)
 					return []schemas.Key{key}, nil
 				}
 			}
@@ -11318,6 +11339,7 @@ func pinKeys(ctx *schemas.BifrostContext, keys []schemas.Key, providerKey schema
 		if keyName = strings.TrimSpace(keyName); keyName != "" {
 			for _, key := range keys {
 				if key.Name == keyName {
+					logExplicitKeySelection(ctx, key, providerKey)
 					return []schemas.Key{key}, nil
 				}
 			}
@@ -11325,6 +11347,10 @@ func pinKeys(ctx *schemas.BifrostContext, keys []schemas.Key, providerKey schema
 		}
 	}
 	return keys, nil
+}
+
+func logExplicitKeySelection(ctx *schemas.BifrostContext, key schemas.Key, provider schemas.ModelProvider) {
+	ctx.AppendRoutingEngineLog(schemas.RoutingEngineCore, schemas.LogLevelInfo, fmt.Sprintf("Explicit key pin selected %s (%s) for provider %s.", key.Name, key.ID, provider))
 }
 
 // applyKeyAlias points the request's model at this key's alias, as the per-attempt closure does for a selected key.
@@ -11522,6 +11548,7 @@ func (bifrost *Bifrost) selectKeyFromProviderForModelWithPool(ctx *schemas.Bifro
 			if keyID = strings.TrimSpace(keyID); keyID != "" {
 				for _, key := range supportedKeys {
 					if key.ID == keyID {
+						logExplicitKeySelection(ctx, key, providerKey)
 						return []schemas.Key{key}, false, nil
 					}
 				}
@@ -11532,6 +11559,7 @@ func (bifrost *Bifrost) selectKeyFromProviderForModelWithPool(ctx *schemas.Bifro
 			if keyName = strings.TrimSpace(keyName); keyName != "" {
 				for _, key := range supportedKeys {
 					if key.Name == keyName {
+						logExplicitKeySelection(ctx, key, providerKey)
 						return []schemas.Key{key}, false, nil
 					}
 				}

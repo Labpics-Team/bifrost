@@ -178,7 +178,7 @@ func runAbandonedRequests(t *testing.T, n int, fail bool, tracerOverride ...sche
 	pq := &ProviderQueue{queue: make(chan *ChannelMessage, n), done: make(chan struct{})}
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go client.requestWorker(upstream, cfg, pq, &wg)
+	go client.requestWorker(upstream, cfg, pq, &wg, "")
 
 	for i := 0; i < n; i++ {
 		ctx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
@@ -282,7 +282,7 @@ func TestRequestWorkerDeliversWhenCallerClaimsLate(t *testing.T) {
 	pq := &ProviderQueue{queue: make(chan *ChannelMessage, 1), done: make(chan struct{})}
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go client.requestWorker(upstream, cfg, pq, &wg)
+	go client.requestWorker(upstream, cfg, pq, &wg, "")
 
 	ctx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
 	defer cancel()
@@ -365,7 +365,7 @@ func runClaimedDeliveriesWithDeadCaller(t *testing.T, n int, fail bool) {
 	pq := &ProviderQueue{queue: make(chan *ChannelMessage, n), done: make(chan struct{})}
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go client.requestWorker(upstream, cfg, pq, &wg)
+	go client.requestWorker(upstream, cfg, pq, &wg, "")
 
 	for i := 0; i < n; i++ {
 		ctx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
@@ -503,7 +503,7 @@ func TestRequestWorkerBillsAbandonedKeySelectionError(t *testing.T) {
 	pq := &ProviderQueue{queue: make(chan *ChannelMessage, n), done: make(chan struct{})}
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go client.requestWorker(upstream, cfg, pq, &wg)
+	go client.requestWorker(upstream, cfg, pq, &wg, "")
 
 	for i := 0; i < n; i++ {
 		ctx, cancel := schemas.NewBifrostContextWithCancel(context.Background())

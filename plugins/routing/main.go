@@ -21,6 +21,7 @@ import (
 	"github.com/maximhq/bifrost/framework/configstore"
 	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/vectorstore"
+	"github.com/maximhq/bifrost/plugins/routing/adaptive"
 	"github.com/maximhq/bifrost/plugins/routing/complexity"
 	"github.com/maximhq/bifrost/plugins/routing/rules"
 )
@@ -56,7 +57,8 @@ type Config struct {
 	ComplexityAnalyzerConfig *complexity.AnalyzerConfig `json:"complexity_analyzer_config,omitempty"`
 	// KVStore is the runtime-only shared store used for complexity
 	// session state. It is injected by the host and is never serialized.
-	KVStore schemas.KVStore `json:"-"`
+	KVStore        schemas.KVStore      `json:"-"`
+	AdaptiveRouter *adaptive.Controller `json:"-"`
 }
 
 // chainMaxDepthOrDefault resolves the configured chain depth, falling back to the default.
@@ -71,6 +73,7 @@ func (c *Config) chainMaxDepthOrDefault() *int {
 
 // RoutingPlugin evaluates routing rules for every request.
 type RoutingPlugin struct {
+	AdaptiveRouter     *adaptive.Controller
 	rules              rules.Store
 	engine             *rules.Engine
 	complexityAnalyzer atomic.Pointer[complexity.ComplexityAnalyzer]
@@ -176,6 +179,9 @@ func InitFromStore(
 		logger:             logger,
 		semanticClassifier: complexity.NewSemanticClassifier(ctx, logger),
 		llmClassifier:      complexity.NewLLMClassifier(logger),
+	}
+	if config != nil {
+		plugin.AdaptiveRouter = config.AdaptiveRouter
 	}
 	if config != nil && config.KVStore != nil {
 		plugin.sessionStore = newComplexitySessionStore(config.KVStore, complexitySessionInactivityTTL)
@@ -445,7 +451,13 @@ func (p *RoutingPlugin) PreRequestHook(ctx *schemas.BifrostContext, req *schemas
 	// disallowed provider or model on every routed LLM attempt. A request with no grant, or with no
 	// permits, has nothing to allow or deny, and publishing is a no-op.
 	p.governance.PublishRoutingAllowlist(ctx, routedModel)
-	return p.governance.LoadBalanceProvider(ctx, req)
+	if err := p.governance.LoadBalanceProvider(ctx, req); err != nil {
+		return err
+	}
+	if p.AdaptiveRouter != nil {
+		return p.AdaptiveRouter.Route(ctx, req)
+	}
+	return nil
 }
 
 // routeLargePayloadModel wraps a model string in a synthetic BifrostRequest, runs the same
@@ -476,6 +488,11 @@ func (p *RoutingPlugin) routeLargePayloadModel(ctx *schemas.BifrostContext, scop
 
 	if err := p.governance.LoadBalanceProvider(ctx, synthetic); err != nil {
 		return modelIn, err
+	}
+	if p.AdaptiveRouter != nil {
+		if err := p.AdaptiveRouter.Route(ctx, synthetic); err != nil {
+			return modelIn, err
+		}
 	}
 
 	provider, model, _ := synthetic.GetRequestFields()
