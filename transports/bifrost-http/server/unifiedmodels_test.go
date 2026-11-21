@@ -24,7 +24,7 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-func newUnifiedModelCatalog(t testing.TB, providerStatus int) (*BifrostHTTPServer, *routing.RoutingPlugin, *router.Router) {
+func newUnifiedModelCatalog(t testing.TB, providerStatus int, otherProviders ...schemas.ModelProvider) (*BifrostHTTPServer, *routing.RoutingPlugin, *router.Router) {
 	t.Helper()
 	log := bifrost.NewNoOpLogger()
 	SetLogger(log)
@@ -48,9 +48,14 @@ func newUnifiedModelCatalog(t testing.TB, providerStatus int) (*BifrostHTTPServe
 			},
 		},
 	}
+	providerConfigs := []tables.TableVirtualKeyProviderConfig{{Provider: "openai", AllowedModels: schemas.WhiteList{"physical"}, AllowAllKeys: true}}
+	for _, provider := range otherProviders {
+		config.Providers[provider] = config.Providers[schemas.OpenAI]
+		providerConfigs = append(providerConfigs, tables.TableVirtualKeyProviderConfig{Provider: string(provider), AllowedModels: schemas.WhiteList{"physical"}, AllowAllKeys: true})
+	}
 	mandatory := true
 	gov, err := governance.Init(context.Background(), &governance.Config{IsVkMandatory: &mandatory}, log, nil, &configstore.GovernanceConfig{
-		VirtualKeys: []tables.TableVirtualKey{{ID: "reader", Name: "reader", Value: *schemas.NewSecretVar("sk-bf-reader"), IsActive: bifrost.Ptr(true), ProviderConfigs: []tables.TableVirtualKeyProviderConfig{{Provider: "openai", AllowedModels: schemas.WhiteList{"physical"}, AllowAllKeys: true}}}},
+		VirtualKeys: []tables.TableVirtualKey{{ID: "reader", Name: "reader", Value: *schemas.NewSecretVar("sk-bf-reader"), IsActive: bifrost.Ptr(true), ProviderConfigs: providerConfigs}},
 	}, nil, nil, nil)
 	require.NoError(t, err)
 	routes, err := routing.Init(context.Background(), nil, log, nil, gov)
@@ -146,8 +151,10 @@ func TestUnifiedModelCatalogProviderFailure(t *testing.T) {
 }
 
 type catalogPolicyPlugin struct {
-	status int
-	post   bool
+	status   int
+	post     bool
+	provider schemas.ModelProvider
+	delay    time.Duration
 }
 
 func (p *catalogPolicyPlugin) GetName() string { return "catalog-policy" }
@@ -159,8 +166,11 @@ func (p *catalogPolicyPlugin) refusal() *schemas.BifrostError {
 	return &schemas.BifrostError{StatusCode: bifrost.Ptr(p.status), Error: &schemas.ErrorField{Message: "catalog policy refuses this caller"}}
 }
 func (p *catalogPolicyPlugin) PreLLMHook(_ *schemas.BifrostContext, request *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
-	if p.post {
+	if p.post || (p.provider != "" && request.ListModelsRequest.Provider != p.provider) {
 		return request, nil, nil
+	}
+	if p.delay > 0 {
+		time.Sleep(p.delay)
 	}
 	return request, &schemas.LLMPluginShortCircuit{Error: p.refusal()}, nil
 }
@@ -194,6 +204,23 @@ func TestUnifiedModelCatalogPreservesPolicyFailure(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestUnifiedModelCatalogPreservesMixedProviderPolicyFailure(t *testing.T) {
+	// A fast provider outage must not hide another provider's later policy
+	// refusal when the aggregate has no successful models. The delay reproduces
+	// the fan-out ordering that originally turned the 403 into aliases-only 200.
+	s, _, r := newUnifiedModelCatalog(t, http.StatusServiceUnavailable, schemas.Groq)
+	require.NoError(t, s.Client.ReloadPlugin(&catalogPolicyPlugin{status: http.StatusForbidden, provider: schemas.OpenAI, delay: 100 * time.Millisecond}, []schemas.PluginType{schemas.PluginTypeLLM}))
+	for _, path := range []string{"/v1/models", "/openai/v1/models"} {
+		ctx := &fasthttp.RequestCtx{}
+		ctx.Request.Header.SetMethod("GET")
+		ctx.Request.SetRequestURI(path)
+		ctx.Request.Header.Set("x-bf-vk", "sk-bf-reader")
+		r.Handler(ctx)
+		require.Equal(t, http.StatusForbidden, ctx.Response.StatusCode(), string(ctx.Response.Body()))
+		require.Contains(t, string(ctx.Response.Body()), "catalog policy refuses this caller")
 	}
 }
 

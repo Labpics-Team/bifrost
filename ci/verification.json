@@ -155,7 +155,8 @@
       "TestRoutingModelsHTTPAdmission",
       "TestUnifiedModelCatalogHTTP",
       "TestUnifiedModelCatalogProviderFailure",
-      "TestUnifiedModelCatalogPreservesPolicyFailure"
+      "TestUnifiedModelCatalogPreservesPolicyFailure",
+      "TestUnifiedModelCatalogPreservesMixedProviderPolicyFailure"
     ],
     "github.com/maximhq/bifrost/core/providers/anthropic": [
       "TestToAnthropicChatCompletionError",

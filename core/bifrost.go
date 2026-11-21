@@ -832,12 +832,17 @@ func (bifrost *Bifrost) ListAllModels(ctx *schemas.BifrostContext, req *schemas.
 		if len(result.keyStatuses) > 0 {
 			allKeyStatuses = append(allKeyStatuses, result.keyStatuses...)
 		}
-		if result.err != nil && firstError == nil {
-			firstError = result.err
+		if result.err != nil {
+			// A fast discovery outage must not mask a later policy or unknown
+			// failure when every provider failed. Only explicitly attributed
+			// provider failures can support the transport's aliases-only result.
+			if firstError == nil || (strings.HasPrefix(string(firstError.ExtraFields.ErrorType), "provider_") && !strings.HasPrefix(string(result.err.ExtraFields.ErrorType), "provider_")) {
+				firstError = result.err
+			}
 		}
 	}
 
-	// If we couldn't get any models from any provider, return the first error
+	// If every provider failed, prefer a request/policy failure over an outage.
 	if len(allModels) == 0 && firstError != nil {
 		// Attach all key statuses to the error
 		firstError.ExtraFields.KeyStatuses = allKeyStatuses
