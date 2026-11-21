@@ -5,6 +5,9 @@
     "version": "2.5.1"
   },
   "required_tests": {
+    "github.com/maximhq/bifrost/framework/logstore": [
+      "TestSQLiteFilterIndexesPreserveResultsAndCoverQueries"
+    ],
     "github.com/maximhq/bifrost/core/providers/openai": [
       "TestToOpenAIResponsesRequest_PreservesNamedOutputWithoutCallID",
       "TestToOpenAIResponsesRequest_NamedOutputCallIDVariants",

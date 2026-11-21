@@ -36,6 +36,7 @@ Merge в `labpics` запускает проверки форка, но сам �
 | Декодирование replay | Сохранённый raw response воспроизводится без округления JSON-чисел; правила сопоставления запросов остаются штатными | [cached response decoding](plugins/semanticcache/utils.go) |
 | Повтор транспорта | Fasthttp не повторяет уже записанный неидемпотентный запрос скрыто внутри одной попытки; решение о следующей попытке остаётся в штатном retry/fallback loop | [transport](core/providers/utils/roundtripper.go), [retry loop](core/bifrost.go) |
 | Каталог Routing Rules | `/v1/routing/models` читает доступные caller публичные имена из живых правил без второго каталога и запросов к провайдерам | [routing](plugins/routing/models.go), [HTTP admission](transports/bifrost-http/server/routingmodels.go) |
+| Фильтры журнала SQLite | Покрывающие индексы для моделей и ключей сохраняют штатные SQL, срок выборки и ограничения видимости; Dashboard запрашивает MCP-справочник только на вкладке MCP | [SQLite indexes](framework/logstore/sqlitefilters.go), [dashboard](ui/app/workspace/dashboard/page.tsx) |
 
 Причины проверяются по поведению. Например, upstream разрешает повтор после
 записи на reused connection в
