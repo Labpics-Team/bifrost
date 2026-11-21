@@ -1,6 +1,8 @@
 import type {
 	AdaptiveRoutingConfig,
-	AdaptiveRoutingEvent,
+	AdaptiveRoutingIncidentDetail,
+	AdaptiveRoutingIncidentPage,
+	AdaptiveRoutingIncidentQuery,
 	AdaptiveRoutingStatus,
 	ClearAdaptiveRoutingCondition,
 } from "@/lib/types/adaptiveRouting";
@@ -20,8 +22,12 @@ export const adaptiveRoutingApi = baseApi.enhanceEndpoints({ addTagTypes: ["Adap
 			query: () => "/adaptive-routing/status",
 			providesTags: ["AdaptiveRoutingStatus"],
 		}),
-		getAdaptiveRoutingHistory: builder.query<{ events: AdaptiveRoutingEvent[] }, void>({
-			query: () => "/adaptive-routing/history",
+		getAdaptiveRoutingIncidents: builder.query<AdaptiveRoutingIncidentPage, AdaptiveRoutingIncidentQuery>({
+			query: (params) => ({ url: "/adaptive-routing/incidents", params }),
+			providesTags: ["LoadBalancerHistory"],
+		}),
+		getAdaptiveRoutingIncident: builder.query<AdaptiveRoutingIncidentDetail, { id: string; cursor?: string; limit?: number }>({
+			query: ({ id, ...params }) => ({ url: `/adaptive-routing/incidents/${encodeURIComponent(id)}`, params }),
 			providesTags: ["LoadBalancerHistory"],
 		}),
 		clearAdaptiveRoutingCondition: builder.mutation<void, ClearAdaptiveRoutingCondition>({
@@ -35,6 +41,7 @@ export const {
 	useGetAdaptiveRoutingConfigQuery,
 	useUpdateAdaptiveRoutingConfigMutation,
 	useGetAdaptiveRoutingStatusQuery,
-	useGetAdaptiveRoutingHistoryQuery,
+	useGetAdaptiveRoutingIncidentsQuery,
+	useGetAdaptiveRoutingIncidentQuery,
 	useClearAdaptiveRoutingConditionMutation,
 } = adaptiveRoutingApi;

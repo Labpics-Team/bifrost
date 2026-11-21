@@ -9,24 +9,17 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { getProviderLabel } from "@/lib/constants/logs";
 import { useLocale } from "@/lib/i18n/useLocale";
 import { parseAsSafeArrayOf, parseAsSafeString } from "@/lib/queryParamsParser";
-import {
-	useClearAdaptiveRoutingConditionMutation,
-	useGetAdaptiveRoutingConfigQuery,
-	useGetAdaptiveRoutingHistoryQuery,
-	useGetAdaptiveRoutingStatusQuery,
-} from "@/lib/store/apis/adaptiveRoutingApi";
-import { getErrorMessage } from "@/lib/store/apis/baseApi";
-import { type AdaptiveRouteStatus, type AdaptiveRoutingEvent, ROUTE_STATES, type RouteState } from "@/lib/types/adaptiveRouting";
+import { useClearAdaptiveRoutingConditionMutation, useGetAdaptiveRoutingStatusQuery } from "@/lib/store/apis/adaptiveRoutingApi";
+import { type AdaptiveRouteStatus, ROUTE_STATES, type RouteState } from "@/lib/types/adaptiveRouting";
 import { withBasePath } from "@/lib/utils/basePath";
-import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
 import { Link } from "@tanstack/react-router";
 import { type ColumnDef, flexRender, getCoreRowModel, getPaginationRowModel, useReactTable } from "@tanstack/react-table";
-import { Activity, ChevronLeft, ChevronRight, FileText, RefreshCw, Settings2, Unlock } from "lucide-react";
+import { Activity, ChevronLeft, ChevronRight, FileText, RefreshCw, Settings2 } from "lucide-react";
 import { createSerializer, parseAsBoolean, parseAsInteger, parseAsString, parseAsStringLiteral, useQueryStates } from "nuqs";
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { toast } from "sonner";
 import { RoutingQueryState } from "./routingQueryState";
+import { ReleaseHoldButton } from "./releaseHoldButton";
 
 const stateTones: Record<RouteState, PageTagTone> = {
 	unknown: "neutral",
@@ -45,10 +38,9 @@ const serializeLogs = createSerializer({
 	period: parseAsString,
 });
 const emptyRoutes: AdaptiveRouteStatus[] = [];
-type RouteRow = AdaptiveRouteStatus & { timestamp?: string };
+type RouteRow = AdaptiveRouteStatus;
 
 function logsHref(row?: RouteRow) {
-	const timestamp = row?.timestamp ? Date.parse(row.timestamp) / 1000 : undefined;
 	return withBasePath(
 		serializeLogs(
 			"/workspace/logs",
@@ -57,46 +49,18 @@ function logsHref(row?: RouteRow) {
 						providers: [row.provider],
 						models: row.model ? [row.model] : [],
 						selected_key_ids: row.key_id ? [row.key_id] : [],
-						...(timestamp && Number.isFinite(timestamp)
-							? { start_time: Math.floor(timestamp) - 300, end_time: Math.floor(timestamp) + 300, period: "" }
-							: {}),
 					}
 				: {},
 		),
 	);
 }
 
-function RouteActions({ row, history }: { row: RouteRow; history: boolean }) {
+function RouteActions({ row }: { row: RouteRow }) {
 	const { t } = useTranslation("observability");
-	const canUpdate = useRbac(RbacResource.AdaptiveRouter, RbacOperation.Update);
-	const [release, { isLoading }] = useClearAdaptiveRoutingConditionMutation();
 	const keyWide = !row.model || row.failure_class === "credential" || row.failure_class === "quota";
-	async function clearHold() {
-		try {
-			await release({
-				provider: row.provider,
-				key_id: row.key_id,
-				...(keyWide ? {} : { model: row.model }),
-			}).unwrap();
-			toast.success(t("adaptiveRouting.released"));
-		} catch (error) {
-			toast.error(getErrorMessage(error));
-		}
-	}
 	return (
 		<div className="flex justify-end gap-2">
-			{!history && row.state === "held" && canUpdate && (
-				<Button
-					variant="outline"
-					onClick={() => void clearHold()}
-					disabled={isLoading}
-					data-testid="adaptive-routing-release"
-					title={t(keyWide ? "adaptiveRouting.releaseKey" : "adaptiveRouting.releaseModel")}
-				>
-					<Unlock className="size-3.5" />
-					{t("adaptiveRouting.release")}
-				</Button>
-			)}
+			{row.state === "held" && <ReleaseHoldButton provider={row.provider} keyId={row.key_id} model={keyWide ? undefined : row.model} />}
 			<Button asChild variant="ghost">
 				<a href={logsHref(row)} aria-label={t("adaptiveRouting.viewLogs")} title={t("adaptiveRouting.viewLogs")}>
 					<FileText className="size-4" />
@@ -106,7 +70,7 @@ function RouteActions({ row, history }: { row: RouteRow; history: boolean }) {
 	);
 }
 
-export default function AdaptiveRoutingView({ history = false }: { history?: boolean }) {
+export default function AdaptiveRoutingView() {
 	const { t } = useTranslation("observability");
 	const { t: shell } = useTranslation("shell");
 	const { t: common } = useTranslation("common");
@@ -118,26 +82,12 @@ export default function AdaptiveRoutingView({ history = false }: { history?: boo
 		live: parseAsBoolean.withDefault(true),
 	});
 	const status = useGetAdaptiveRoutingStatusQuery(undefined, {
-		pollingInterval: filters.live && !history ? 5000 : 0,
+		pollingInterval: filters.live ? 5000 : 0,
 		skipPollingIfUnfocused: true,
 	});
-	const events = useGetAdaptiveRoutingHistoryQuery(undefined, {
-		skip: !history,
-		pollingInterval: filters.live && history ? 5000 : 0,
-		skipPollingIfUnfocused: true,
-	});
-	const config = useGetAdaptiveRoutingConfigQuery(undefined, { skip: !history });
-	const query = history ? events : status;
+	const query = status;
 	const routes = status.data?.routes ?? emptyRoutes;
-	const source = useMemo<RouteRow[]>(
-		() =>
-			history
-				? [...(events.data?.events ?? [])].sort((a: AdaptiveRoutingEvent, b: AdaptiveRoutingEvent) =>
-						b.timestamp.localeCompare(a.timestamp),
-					)
-				: routes,
-		[history, events.data, routes],
-	);
+	const source = routes;
 	const providers = useMemo(() => [...new Set(source.map((row) => row.provider))], [source]);
 	const filtered = useMemo(() => {
 		const search = filters.q.trim().toLowerCase();
@@ -154,15 +104,6 @@ export default function AdaptiveRoutingView({ history = false }: { history?: boo
 	const columns = useMemo<ColumnDef<RouteRow>[]>(() => {
 		const date = (value?: string) => (value && !value.startsWith("0001-") ? new Date(value).toLocaleString(locale) : t("labels.nA"));
 		return [
-			...(history
-				? [
-						{
-							id: "timestamp",
-							header: t("labels.time"),
-							cell: ({ row }) => <span className="text-muted-foreground tabular-nums">{date(row.original.timestamp)}</span>,
-						} satisfies ColumnDef<RouteRow>,
-					]
-				: []),
 			{
 				id: "route",
 				header: t("adaptiveRouting.providerKey"),
@@ -226,35 +167,33 @@ export default function AdaptiveRoutingView({ history = false }: { history?: boo
 					</span>
 				),
 			},
-			...(!history
-				? ([
-						{
-							accessorKey: "latency_ms",
-							header: t("adaptiveRouting.firstResponse"),
-							cell: ({ row }) => (
-								<span className="tabular-nums">
-									{row.original.samples
-										? t("adaptiveRouting.milliseconds", {
-												value: row.original.latency_ms.toLocaleString(locale, {
-													maximumFractionDigits: 0,
-												}),
-											})
-										: t("labels.nA")}
-								</span>
-							),
-						},
-						{
-							accessorKey: "inflight",
-							header: t("adaptiveRouting.inflight"),
-							cell: ({ row }) => row.original.inflight.toLocaleString(locale),
-						},
-						{
-							accessorKey: "samples",
-							header: t("adaptiveRouting.samples"),
-							cell: ({ row }) => row.original.samples.toLocaleString(locale),
-						},
-					] satisfies ColumnDef<RouteRow>[])
-				: []),
+			...([
+				{
+					accessorKey: "latency_ms",
+					header: t("adaptiveRouting.firstResponse"),
+					cell: ({ row }) => (
+						<span className="tabular-nums">
+							{row.original.samples
+								? t("adaptiveRouting.milliseconds", {
+										value: row.original.latency_ms.toLocaleString(locale, {
+											maximumFractionDigits: 0,
+										}),
+									})
+								: t("labels.nA")}
+						</span>
+					),
+				},
+				{
+					accessorKey: "inflight",
+					header: t("adaptiveRouting.inflight"),
+					cell: ({ row }) => row.original.inflight.toLocaleString(locale),
+				},
+				{
+					accessorKey: "samples",
+					header: t("adaptiveRouting.samples"),
+					cell: ({ row }) => row.original.samples.toLocaleString(locale),
+				},
+			] satisfies ColumnDef<RouteRow>[]),
 			{
 				id: "failure",
 				header: t("adaptiveRouting.cause"),
@@ -264,18 +203,22 @@ export default function AdaptiveRoutingView({ history = false }: { history?: boo
 			{
 				id: "actions",
 				header: () => <span className="sr-only">{common("actions")}</span>,
-				cell: ({ row }) => <RouteActions row={row.original} history={history} />,
+				cell: ({ row }) => <RouteActions row={row.original} />,
 			},
 		];
-	}, [t, common, locale, history]);
+	}, [t, common, locale]);
 	const table = useReactTable({
 		data: filtered,
 		columns,
 		getCoreRowModel: getCoreRowModel(),
 		getPaginationRowModel: getPaginationRowModel(),
 		initialState: { pagination: { pageSize: 25 } },
-		getRowId: (row) => JSON.stringify([row.provider, row.model, row.key_id, row.timestamp]),
+		autoResetPageIndex: false,
+		getRowId: (row) => JSON.stringify([row.provider, row.model, row.key_id]),
 	});
+	useEffect(() => {
+		table.setPageIndex(0);
+	}, [filters.q, filters.provider, filters.state, table]);
 	const canFilter = source.length > 0 || Boolean(filters.q || filters.provider || filters.state !== "all");
 	const heldKeys = new Set(routes.filter((row) => row.state === "held").map((row) => JSON.stringify([row.provider, row.key_id]))).size;
 	const summary = [
@@ -286,20 +229,11 @@ export default function AdaptiveRoutingView({ history = false }: { history?: boo
 	] as const;
 	function refresh() {
 		void status.refetch();
-		if (history) {
-			void events.refetch();
-			void config.refetch();
-		}
 	}
 
 	return (
 		<div className="no-padding-parent flex min-w-0 flex-1 flex-col gap-4 p-4">
 			<PageTitle
-				breadcrumbs={
-					history
-						? [{ label: shell("nav.adaptiveRouting"), to: "/workspace/adaptive-routing" }, { label: shell("nav.incidents") }]
-						: undefined
-				}
 				title={shell("nav.adaptiveRouting")}
 				tags={
 					status.data
@@ -331,9 +265,7 @@ export default function AdaptiveRoutingView({ history = false }: { history?: boo
 				</div>
 				<div className="flex flex-wrap gap-2">
 					<Button variant="outline" asChild>
-						<Link to={history ? "/workspace/adaptive-routing" : "/workspace/adaptive-routing/incidents"}>
-							{shell(history ? "nav.adaptiveRoutingDashboard" : "nav.incidents")}
-						</Link>
+						<Link to="/workspace/adaptive-routing/incidents">{shell("nav.incidents")}</Link>
 					</Button>
 					<Button variant="outline" asChild>
 						<Link to="/workspace/adaptive-routing/settings">
@@ -343,11 +275,12 @@ export default function AdaptiveRoutingView({ history = false }: { history?: boo
 					</Button>
 				</div>
 			</div>
-			<RoutingQueryState
-				loading={query.isLoading || status.isLoading}
-				error={query.error || status.error || config.error}
-				retry={refresh}
-			/>
+			<RoutingQueryState loading={query.isLoading} error={query.error} retry={refresh} />
+			{status.data?.persistence && !status.data.persistence.healthy && (
+				<Alert variant="destructive">
+					<AlertDescription>{t("adaptiveRouting.persistenceFailed")}</AlertDescription>
+				</Alert>
+			)}
 			{status.data && !status.data.enabled && (
 				<Alert>
 					<AlertDescription className="flex flex-wrap items-center justify-between gap-3">
@@ -358,7 +291,7 @@ export default function AdaptiveRoutingView({ history = false }: { history?: boo
 					</AlertDescription>
 				</Alert>
 			)}
-			{!history && status.data && (
+			{status.data && (
 				<div className="grid grid-cols-2 divide-x divide-y rounded-sm border sm:grid-cols-4 sm:divide-y-0">
 					{summary.map(({ label, value }) => (
 						<div key={label} className="space-y-2 p-4">
@@ -369,14 +302,8 @@ export default function AdaptiveRoutingView({ history = false }: { history?: boo
 				</div>
 			)}
 			<div className="space-y-1">
-				<h2 className="text-sm font-semibold">{t(history ? "adaptiveRouting.transitions" : "adaptiveRouting.routeHealth")}</h2>
-				<p className="text-muted-foreground text-sm">{t(history ? "adaptiveRouting.historyHelp" : "adaptiveRouting.healthHelp")}</p>
-				{history && (
-					<a href={logsHref()} className="text-primary text-sm underline-offset-4 hover:underline">
-						{t("adaptiveRouting.viewLogs")}
-					</a>
-				)}
-				{history && config.data && !config.data.history_enabled && <p className="text-sm">{t("adaptiveRouting.historyDisabled")}</p>}
+				<h2 className="text-sm font-semibold">{t("adaptiveRouting.routeHealth")}</h2>
+				<p className="text-muted-foreground text-sm">{t("adaptiveRouting.healthHelp")}</p>
 			</div>
 			{canFilter && (
 				<div className="flex flex-wrap gap-2">
@@ -447,7 +374,7 @@ export default function AdaptiveRoutingView({ history = false }: { history?: boo
 							) : (
 								<TableRow>
 									<TableCell colSpan={columns.length} className="text-muted-foreground h-36 text-center whitespace-normal">
-										{t(source.length ? "adaptiveRouting.noMatches" : history ? "adaptiveRouting.noHistory" : "adaptiveRouting.noRoutes")}
+										{t(source.length ? "adaptiveRouting.noMatches" : "adaptiveRouting.noRoutes")}
 									</TableCell>
 								</TableRow>
 							)}
