@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -465,5 +466,104 @@ func TestAdaptiveSupersededTransientProbeCannotChangeHealth(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestAdaptiveDelayedProbeAdmissionKeepsSelectedGeneration(t *testing.T) {
+	for _, refusal := range []int{401, 503} {
+		for _, currentStatus := range []int{0, 200, refusal} {
+			t.Run(fmt.Sprintf("refusal=%d/current=%d", refusal, currentStatus), func(t *testing.T) {
+				c, now := providerController()
+				for range 3 {
+					observe(c, "p1", "m", "a", responseError(refusal))
+				}
+				selectCheck := func() *schemas.BifrostContext {
+					t.Helper()
+					ctx := testContext()
+					key, err := c.SelectKey(ctx, testKeys, "p1", "m")
+					if err != nil || key.ID != "a" {
+						t.Fatalf("due check was not selected: %s %v", key.ID, err)
+					}
+					return ctx
+				}
+				*now = now.Add(time.Minute)
+				oldCtx := selectCheck()
+				*now = now.Add(6 * time.Minute)
+				currentCtx := selectCheck()
+				info := schemas.ProviderAttemptInfo{Provider: "p1", Model: "m", KeyID: "a"}
+				current := c.BeginProviderAttempt(currentCtx, info)
+				if current == nil {
+					t.Fatal("current check was not observed")
+				}
+				defer current.End()
+				if currentStatus != 0 {
+					if currentStatus == 200 {
+						current.Observe(&schemas.BifrostResponse{}, nil)
+					} else {
+						current.Observe(nil, responseError(currentStatus))
+					}
+					current.End()
+				}
+				before, revision := c.Status()[0], c.revision
+				*now = now.Add(time.Second)
+				// Core's actual dispatch is unaffected. Only the obsolete observer
+				// must be rejected instead of acquiring the current generation.
+				if old := c.BeginProviderAttempt(oldCtx, info); old != nil {
+					old.Observe(&schemas.BifrostResponse{}, nil)
+					old.End()
+				}
+				after := c.Status()[0]
+				if !reflect.DeepEqual(after, before) || c.revision != revision {
+					t.Fatalf("delayed admission rebound obsolete selection to current state: before=%+v after=%+v", before, after)
+				}
+			})
+		}
+	}
+}
+
+func TestAdaptiveCompletedProbeContextObservesNextAttempt(t *testing.T) {
+	c, now := providerController()
+	for range 3 {
+		observe(c, "p1", "m", "a", responseError(503))
+	}
+	*now = now.Add(time.Minute)
+	ctx := testContext()
+	key, err := c.SelectKey(ctx, testKeys, "p1", "m")
+	if err != nil || key.ID != "a" {
+		t.Fatalf("due check was not selected: %s %v", key.ID, err)
+	}
+	info := schemas.ProviderAttemptInfo{Provider: "p1", Model: "m", KeyID: "a"}
+	check := c.BeginProviderAttempt(ctx, info)
+	check.Observe(nil, responseError(503))
+	check.End()
+	// Native keyless/fixed-key retry paths reuse their context without another
+	// adaptive key selection. A consumed reservation must not hide that attempt.
+	next := c.BeginProviderAttempt(ctx, info)
+	if next == nil {
+		t.Fatal("completed probe reservation suppressed the next actual attempt")
+	}
+	next.Observe(&schemas.BifrostResponse{}, nil)
+	next.End()
+	if got := c.Status()[0]; got.Samples != 5 || got.Score <= 0 {
+		t.Fatalf("next actual attempt was not observed: %+v", got)
+	}
+}
+
+func TestAdaptiveTransientCheckCannotOverrideNewHold(t *testing.T) {
+	c, now := providerController()
+	for range 3 {
+		observe(c, "p1", "m", "a", responseError(503))
+	}
+	*now = now.Add(time.Minute)
+	// SelectKey and direction both capture this recovery pointer before the
+	// reservation. A refusal can commit between those two local boundaries.
+	r := c.routes[routeID{"p1", "m", "a"}]
+	observe(c, "p1", "m", "a", responseError(401))
+	ctx := testContext()
+	if c.reserveProbe(ctx, direction{provider: "p1", model: "m", recover: r}) || ctx.Value(probeContextKey{}) != nil {
+		t.Fatal("stale transient direction reserved a check over a new credential hold")
+	}
+	if h := c.holdLocked(r.routeID, *now); h == nil || h.ProbeID != 0 {
+		t.Fatal("new credential hold acquired an unsolicited check")
 	}
 }

@@ -30,11 +30,15 @@ func (c *Controller) reserveProbe(ctx *schemas.BifrostContext, d direction) bool
 	if d.recover == nil {
 		return false
 	}
+	if !c.lifeMu.TryLock() {
+		return false
+	}
+	defer c.lifeMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r := d.recover
 	now := c.now()
-	if c.routes[r.routeID] != r || r.FailedUntil.IsZero() || r.FailedUntil.After(now) || r.ProbeUntil.After(now) {
+	if c.routes[r.routeID] != r || r.FailedUntil.IsZero() || r.FailedUntil.After(now) || r.ProbeUntil.After(now) || c.holdLocked(r.routeID, now) != nil {
 		return false
 	}
 	c.probeSequence++

@@ -34,6 +34,17 @@ type probeReservation struct {
 	token       uint64
 }
 
+func (c *Controller) reservationCurrentLocked(reserved probeReservation, now time.Time) bool {
+	if reserved.token == 0 {
+		return false
+	}
+	if h := c.holdLocked(reserved.routeID, now); h != nil {
+		return h.ID == reserved.conditionID && h.ProbeID == reserved.token
+	}
+	r := c.routes[reserved.routeID]
+	return reserved.conditionID == "" && r != nil && r.ProbeID == reserved.token
+}
+
 type transition struct {
 	advance   bool
 	upsert    []*condition

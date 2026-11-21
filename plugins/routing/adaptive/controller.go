@@ -196,13 +196,7 @@ func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, 
 	c.mu.Lock()
 	reserved, hasReservation := ctx.Value(probeContextKey{}).(probeReservation)
 	if hasReservation && reserved.Provider == provider && reserved.Model == model {
-		valid := false
-		if h := c.holdLocked(reserved.routeID, now); h != nil {
-			valid = h.ID == reserved.conditionID && h.ProbeID == reserved.token
-		} else if r := c.routes[reserved.routeID]; r != nil {
-			valid = r.ProbeID == reserved.token
-		}
-		if valid {
+		if c.reservationCurrentLocked(reserved, now) {
 			for _, key := range keys {
 				if key.ID == reserved.KeyID {
 					c.mu.Unlock()
@@ -210,6 +204,7 @@ func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, 
 				}
 			}
 		}
+		ctx.ClearValue(probeContextKey{})
 	}
 	var due []routeID
 	var recovering []*route
@@ -375,6 +370,17 @@ func (c *Controller) BeginProviderAttempt(ctx *schemas.BifrostContext, info sche
 	if !keyless && k != accepted {
 		return nil
 	}
+	probeID := uint64(0)
+	if lease, ok := ctx.Value(probeContextKey{}).(probeReservation); ok && lease.routeID == id {
+		// Selection and dispatch are separate boundaries. Consume the ticket
+		// once, checking its original identity before adopting current epochs.
+		// Native retries in this context can then observe their own attempts.
+		ctx.ClearValue(probeContextKey{})
+		if !c.reservationCurrentLocked(lease, now) {
+			return nil
+		}
+		probeID = lease.token
+	}
 	if keyless {
 		k = c.keyLocked(id)
 		k.revision = keylessRevision(info.ProviderRevision)
@@ -386,7 +392,7 @@ func (c *Controller) BeginProviderAttempt(ctx *schemas.BifrostContext, info sche
 	r.KeyRevision = k.revision
 	r.Inflight++
 	r.LastSeen = now
-	a := &attempt{controller: c, ctx: ctx, route: r, start: now, key: k, keyEpoch: k.epoch, modelEpoch: r.Epoch, providerRevision: info.ProviderRevision}
+	a := &attempt{controller: c, ctx: ctx, route: r, start: now, key: k, keyEpoch: k.epoch, modelEpoch: r.Epoch, probeID: probeID, providerRevision: info.ProviderRevision}
 	for _, scope := range []routeID{{Provider: id.Provider, KeyID: id.KeyID}, id} {
 		if i := c.incidentLocked(scope); i != nil && i.State == "recovering" && r.Samples == 0 {
 			r.Recovering = true
@@ -394,9 +400,6 @@ func (c *Controller) BeginProviderAttempt(ctx *schemas.BifrostContext, info sche
 	}
 	if h := c.holdLocked(id, now); h != nil {
 		a.holdID = h.ID
-	}
-	if lease, ok := ctx.Value(probeContextKey{}).(probeReservation); ok && lease.Provider == info.Provider && lease.Model == info.Model && lease.KeyID == info.KeyID {
-		a.probeID = lease.token
 	}
 	return a
 }

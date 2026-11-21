@@ -190,9 +190,18 @@ func TestAdaptiveProviderRecoveryProbeKeepsOtherRequestsOnHealthyAlternative(t *
 
 			attempt.Observe(&schemas.BifrostResponse{}, nil)
 			attempt.End()
+			for _, status := range c.Status() {
+				if status.Provider == "p1" && (status.State != "recovering" || status.Score <= 0) {
+					t.Fatalf("successful check did not restore a normal traffic score: %+v", status)
+				}
+			}
+			recoveryCtx := testContext()
 			recovered := routeRequest(provider)
-			if err := c.Route(testContext(), recovered); err != nil {
+			if err := c.Route(recoveryCtx, recovered); err != nil {
 				t.Fatal(err)
+			}
+			if recoveryCtx.Value(probeContextKey{}) != nil {
+				t.Fatal("successful recovery was replaced with another checking request")
 			}
 			p, _, fallbacks = recovered.GetRequestFields()
 			if p != "p1" && (len(fallbacks) != 1 || fallbacks[0].Provider != "p1") {

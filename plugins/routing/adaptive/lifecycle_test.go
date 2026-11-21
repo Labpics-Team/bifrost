@@ -262,25 +262,42 @@ func TestAdaptiveFailedReleaseKeepsCommittedHold(t *testing.T) {
 }
 
 func TestAdaptiveSQLiteWaitDoesNotBlockHealthyTraffic(t *testing.T) {
-	adaptiveHealthyTrafficDuringSQLiteWait(t, false, false)
+	adaptiveHealthyTrafficDuringSQLiteWait(t, false, false, 401)
 }
 
 func TestAdaptiveDueKeyCheckDoesNotBlockHealthyTraffic(t *testing.T) {
-	adaptiveHealthyTrafficDuringSQLiteWait(t, true, false)
+	adaptiveHealthyTrafficDuringSQLiteWait(t, true, false, 401)
 }
 
 func TestAdaptiveDueProviderCheckDoesNotBlockHealthyTraffic(t *testing.T) {
-	adaptiveHealthyTrafficDuringSQLiteWait(t, true, true)
+	adaptiveHealthyTrafficDuringSQLiteWait(t, true, true, 401)
 }
 
-func adaptiveHealthyTrafficDuringSQLiteWait(t *testing.T, due, routeProvider bool) {
+func TestAdaptiveTransientKeyCheckYieldsDuringSQLiteWrite(t *testing.T) {
+	adaptiveHealthyTrafficDuringSQLiteWait(t, true, false, 503)
+}
+
+func TestAdaptiveTransientProviderCheckYieldsDuringSQLiteWrite(t *testing.T) {
+	adaptiveHealthyTrafficDuringSQLiteWait(t, true, true, 503)
+}
+
+func adaptiveHealthyTrafficDuringSQLiteWait(t *testing.T, due, routeProvider bool, status int) {
 	t.Helper()
 	c, now := providerController()
 	s := newSettingsStore(t)
 	attachStore(t, c, s)
-	observe(c, "p1", "m", "a", responseError(401))
+	failKey := func(key string) {
+		attempts := 1
+		if status == 503 {
+			attempts = 3
+		}
+		for range attempts {
+			observe(c, "p1", "m", key, responseError(status))
+		}
+	}
+	failKey("a")
 	if routeProvider {
-		observe(c, "p1", "m", "b", responseError(401))
+		failKey("b")
 		observe(c, "p2", "m", "b", nil)
 		cfg := c.Config()
 		cfg.RerouteFailedDirections = true
@@ -306,7 +323,13 @@ func adaptiveHealthyTrafficDuringSQLiteWait(t *testing.T, due, routeProvider boo
 	}()
 	<-locked
 	releaseDone := make(chan error, 1)
-	go func() { releaseDone <- c.Release(context.Background(), "p1", "a", "") }()
+	go func() {
+		if status == 503 {
+			releaseDone <- c.ResetKey("p1", "a")
+		} else {
+			releaseDone <- c.Release(context.Background(), "p1", "a", "")
+		}
+	}()
 	deadline := time.Now().Add(time.Second)
 	for c.lifeMu.TryLock() {
 		c.lifeMu.Unlock()
