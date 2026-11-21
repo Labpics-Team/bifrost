@@ -21,10 +21,13 @@ import (
 )
 
 func TestValidateExternalURL(t *testing.T) {
+	lookupErr := errors.New("test DNS lookup failed")
 	tests := []struct {
 		name                string
 		url                 string
 		allowPrivateNetwork bool
+		resolvedIPs         []string
+		lookupErr           error
 		wantErr             bool
 		errMsg              string
 	}{
@@ -191,11 +194,90 @@ func TestValidateExternalURL(t *testing.T) {
 			wantErr:             true,
 			errMsg:              "unspecified IP addresses are not allowed",
 		},
+
+		// Hostnames are checked against every resolved address, not just the URL text.
+		{
+			name:        "hostname resolving to private address",
+			url:         "https://api.openai.com",
+			resolvedIPs: []string{"10.0.0.5"},
+			wantErr:     true,
+			errMsg:      "private IP addresses are not allowed",
+		},
+		{
+			name:        "hostname resolving to public and private addresses",
+			url:         "https://api.openai.com",
+			resolvedIPs: []string{"93.184.216.34", "10.0.0.5"},
+			wantErr:     true,
+			errMsg:      "private IP addresses are not allowed",
+		},
+		{
+			name:                "allow_private_network permits private hostname resolution",
+			url:                 "https://api.openai.com",
+			allowPrivateNetwork: true,
+			resolvedIPs:         []string{"10.0.0.5"},
+			wantErr:             false,
+		},
+		{
+			name:                "allow_private_network still blocks hostname resolving to metadata",
+			url:                 "https://api.openai.com",
+			allowPrivateNetwork: true,
+			resolvedIPs:         []string{"169.254.169.254"},
+			wantErr:             true,
+			errMsg:              "link-local IP addresses are not allowed",
+		},
+		{
+			name:                "allow_private_network still blocks mixed public and metadata resolution",
+			url:                 "https://api.openai.com",
+			allowPrivateNetwork: true,
+			resolvedIPs:         []string{"93.184.216.34", "169.254.169.254"},
+			wantErr:             true,
+			errMsg:              "link-local IP addresses are not allowed",
+		},
+		{
+			name:      "hostname lookup failure is rejected",
+			url:       "https://api.openai.com",
+			lookupErr: lookupErr,
+			wantErr:   true,
+			errMsg:    "failed to resolve hostname",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Keep these subtests sequential: lookupIPAddr is shared with the DNS timeout tests.
+			original := lookupIPAddr
+			t.Cleanup(func() { lookupIPAddr = original })
+			lookupIPAddr = func(_ context.Context, host string) ([]net.IPAddr, error) {
+				if ip := net.ParseIP(host); ip != nil {
+					return []net.IPAddr{{IP: ip}}, nil
+				}
+				var ips []string
+				switch host {
+				case "localhost":
+					ips = []string{"127.0.0.1", "::1"}
+				case "api.openai.com":
+					if tt.lookupErr != nil {
+						return nil, tt.lookupErr
+					}
+					ips = tt.resolvedIPs
+					if ips == nil {
+						ips = []string{"93.184.216.34", "2606:4700::1"}
+					}
+				default:
+					t.Fatalf("unexpected hostname lookup: %q", host)
+				}
+				addrs := make([]net.IPAddr, len(ips))
+				for i, ip := range ips {
+					addrs[i].IP = net.ParseIP(ip)
+					require.NotNil(t, addrs[i].IP, "invalid test IP %q", ip)
+				}
+				return addrs, nil
+			}
+
 			err := ValidateExternalURL(tt.url, tt.allowPrivateNetwork)
+			if tt.lookupErr != nil && !errors.Is(err, tt.lookupErr) {
+				t.Errorf("expected error to wrap DNS lookup failure, got %v", err)
+			}
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("expected error containing %q, got nil", tt.errMsg)
