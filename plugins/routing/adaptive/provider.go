@@ -38,6 +38,9 @@ func (c *Controller) reserveProbe(ctx *schemas.BifrostContext, d direction) bool
 		return false
 	}
 	c.probeSequence++
+	// A replacement check supersedes earlier outcomes even after its disposable
+	// lease is cleared. Attempts and incident writers already fence this epoch.
+	r.Epoch++
 	r.ProbeID = c.probeSequence
 	r.ProbeUntil = now.Add(5 * time.Minute)
 	ctx.SetValue(probeContextKey{}, probeReservation{routeID: r.routeID, token: r.ProbeID})

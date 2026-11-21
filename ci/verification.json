@@ -202,6 +202,7 @@
       "TestAdaptiveConcurrentAttemptNames",
       "TestAdaptiveKeyTransientRecoveryReservesSingleCheck",
       "TestAdaptiveIncidentUpdateCannotCrossManualRelease",
+      "TestAdaptiveSupersededTransientProbeCannotChangeHealth",
       "TestAdaptiveProviderRecoveryProbeKeepsOtherRequestsOnHealthyAlternative",
       "TestAdaptiveProviderUnavailablePoolStillSendsNativeAttempt",
       "TestAdaptiveOldSuccessCannotReleaseNewHold",

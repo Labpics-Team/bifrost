@@ -396,3 +396,74 @@ func TestAdaptiveIncidentUpdateCannotCrossManualRelease(t *testing.T) {
 		}
 	}
 }
+
+func TestAdaptiveSupersededTransientProbeCannotChangeHealth(t *testing.T) {
+	for _, oldStatus := range []int{200, 503} {
+		for _, currentStatus := range []int{0, 200, 503} {
+			t.Run(fmt.Sprintf("old=%d/current=%d", oldStatus, currentStatus), func(t *testing.T) {
+				c, now := providerController()
+				for range 3 {
+					observe(c, "p1", "m", "a", responseError(503))
+				}
+				beginCheck := func(request string) schemas.ProviderAttempt {
+					t.Helper()
+					ctx := testContext()
+					ctx.SetValue(schemas.BifrostContextKeyRequestID, request)
+					key, err := c.SelectKey(ctx, testKeys, "p1", "m")
+					if err != nil || key.ID != "a" {
+						t.Fatalf("due transient check was not selected: %s %v", key.ID, err)
+					}
+					a := c.BeginProviderAttempt(ctx, schemas.ProviderAttemptInfo{Provider: "p1", Model: "m", KeyID: "a"})
+					if a == nil {
+						t.Fatal("selected check was not observed")
+					}
+					return a
+				}
+				*now = now.Add(time.Minute)
+				old := beginCheck("old-check")
+				defer old.End()
+				*now = now.Add(6 * time.Minute)
+				current := beginCheck("current-check")
+				defer current.End()
+				if currentStatus != 0 {
+					if currentStatus == 200 {
+						current.Observe(&schemas.BifrostResponse{}, nil)
+					} else {
+						current.Observe(nil, responseError(currentStatus))
+					}
+					current.End()
+				}
+				before := c.Status()[0]
+				revision := c.revision
+				id := routeID{"p1", "m", "a"}
+				probeID := c.routes[id].ProbeID
+				*now = now.Add(time.Second)
+				if oldStatus == 200 {
+					old.Observe(&schemas.BifrostResponse{}, nil)
+				} else {
+					old.Observe(nil, responseError(oldStatus))
+				}
+				old.End()
+				after := c.Status()[0]
+				if after.State != before.State || before.Score == 0 && after.Score != 0 || after.Samples != before.Samples || after.ErrorRate != before.ErrorRate || after.LatencyMS != before.LatencyMS || !after.LastSeen.Equal(before.LastSeen) || after.Inflight != before.Inflight-1 {
+					t.Fatalf("superseded check changed current health: before=%+v after=%+v", before, after)
+				}
+				if c.revision != revision || c.routes[id].ProbeID != probeID {
+					t.Fatal("superseded check changed lifecycle or the current lease")
+				}
+				for _, i := range c.incidents {
+					if i.LastRequestID == "old-check" {
+						t.Fatal("superseded check was attached to a current incident")
+					}
+				}
+				if currentStatus == 0 {
+					current.Observe(&schemas.BifrostResponse{}, nil)
+					current.End()
+					if got := c.Status()[0]; got.Score == 0 || got.State != "recovering" || got.Samples != before.Samples+1 || got.Inflight != 0 {
+						t.Fatalf("current successful check did not restore health: %+v", got)
+					}
+				}
+			})
+		}
+	}
+}
