@@ -6,7 +6,15 @@ import { useGetAdaptiveRoutingIncidentQuery } from "@/lib/store/apis/adaptiveRou
 import { ChevronLeft, ChevronRight, FileText } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { IncidentCause, incidentDuration, incidentRequestHref, IncidentStatus } from "./incidentDisplay";
+import {
+	IncidentAction,
+	IncidentCause,
+	incidentDuration,
+	IncidentEventMessage,
+	incidentRequestHref,
+	IncidentStatus,
+	IncidentSummary,
+} from "./incidentDisplay";
 import { RoutingQueryState } from "./routingQueryState";
 import { ReleaseHoldButton } from "./releaseHoldButton";
 
@@ -23,7 +31,8 @@ export function IncidentDetail({ id, live, close }: { id: string; live: boolean;
 		},
 	);
 	const detail = query.currentData;
-	const incident = detail?.incident;
+	// The incident is independent of the event page. Retain it during navigation.
+	const incident = query.data?.incident;
 	const date = (value: string) => new Date(value).toLocaleString(locale);
 	const requestLinks = incident
 		? [
@@ -55,8 +64,12 @@ export function IncidentDetail({ id, live, close }: { id: string; live: boolean;
 						<>
 							<div className="space-y-3">
 								<IncidentStatus status={incident.status} />
-								<p className="font-medium">{incident.summary}</p>
-								<p className="text-muted-foreground text-sm">{incident.action}</p>
+								<p className="font-medium">
+									<IncidentSummary incident={incident} />
+								</p>
+								<p className="text-muted-foreground text-sm">
+									<IncidentAction incident={incident} />
+								</p>
 								{!incident.closed_at && incident.state === "held" && incident.key_id && (
 									<ReleaseHoldButton
 										provider={incident.provider}
@@ -115,10 +128,12 @@ export function IncidentDetail({ id, live, close }: { id: string; live: boolean;
 							<section className="space-y-4">
 								<h3 className="text-sm font-semibold">{t("adaptiveRouting.events")}</h3>
 								<ol className="space-y-4 border-l pl-4" data-testid="adaptive-incident-events">
-									{detail.events.map((event) => (
+									{detail?.events.map((event) => (
 										<li key={event.id} className="space-y-1">
 											<div className="text-muted-foreground text-xs tabular-nums">{date(event.timestamp)}</div>
-											<p className="text-sm">{event.message}</p>
+											<p className="text-sm">
+												<IncidentEventMessage event={event} />
+											</p>
 											{event.failure_class && (
 												<p className="text-muted-foreground text-xs" data-testid="adaptive-incident-event-cause">
 													{t("adaptiveRouting.cause")}: <IncidentCause cause={event.failure_class} />
@@ -136,29 +151,34 @@ export function IncidentDetail({ id, live, close }: { id: string; live: boolean;
 										</li>
 									))}
 								</ol>
-								{!detail.events.length && <p className="text-muted-foreground text-sm">{t("adaptiveRouting.noEvents")}</p>}
-								<div className="flex justify-end gap-2">
-									<Button
-										variant="outline"
-										size="icon"
-										aria-label={t("labels.previousPage")}
-										disabled={cursors.length === 1 || query.isFetching}
-										onClick={() => setCursors((pages) => pages.slice(0, -1))}
-									>
-										<ChevronLeft />
-									</Button>
-									<Button
-										variant="outline"
-										size="icon"
-										aria-label={t("labels.nextPage")}
-										disabled={!detail.next_cursor || query.isFetching}
-										onClick={() => setCursors((pages) => [...pages, detail.next_cursor!])}
-									>
-										<ChevronRight />
-									</Button>
-								</div>
+								{detail && !detail.events.length && <p className="text-muted-foreground text-sm">{t("adaptiveRouting.noEvents")}</p>}
 							</section>
 						</>
+					)}
+					{(detail || cursors.length > 1) && (
+						<div className="flex items-center justify-end gap-3 text-sm">
+							<Button
+								variant="outline"
+								size="icon"
+								aria-label={t("labels.previousPage")}
+								disabled={cursors.length === 1}
+								onClick={() => setCursors((pages) => pages.slice(0, -1))}
+							>
+								<ChevronLeft />
+							</Button>
+							<span className="tabular-nums" data-testid="adaptive-incident-events-page">
+								{t("adaptiveRouting.currentPage", { page: cursors.length.toLocaleString(locale) })}
+							</span>
+							<Button
+								variant="outline"
+								size="icon"
+								aria-label={t("labels.nextPage")}
+								disabled={!detail?.next_cursor || query.isFetching}
+								onClick={() => detail?.next_cursor && setCursors((pages) => [...pages, detail.next_cursor!])}
+							>
+								<ChevronRight />
+							</Button>
+						</div>
 					)}
 				</div>
 			</SheetContent>

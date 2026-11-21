@@ -1,5 +1,5 @@
 import { PageTagBadge, type PageTagTone } from "@/components/pageTitle";
-import type { AdaptiveRoutingIncident } from "@/lib/types/adaptiveRouting";
+import type { AdaptiveRoutingIncident, AdaptiveRoutingIncidentEvent } from "@/lib/types/adaptiveRouting";
 import { withBasePath } from "@/lib/utils/basePath";
 import { useTranslation } from "react-i18next";
 
@@ -20,6 +20,51 @@ export function IncidentStatus({ status }: { status: AdaptiveRoutingIncident["st
 export function IncidentCause({ cause }: { cause?: string }) {
 	const { t } = useTranslation("observability");
 	return <>{cause ? t(`adaptiveRouting.failureClasses.${cause}`, { defaultValue: cause }) : "—"}</>;
+}
+
+export function IncidentSummary({ incident }: { incident: AdaptiveRoutingIncident }) {
+	const { t } = useTranslation("observability");
+	if (incident.status === "no_longer_observed") return <>{t("adaptiveRouting.summaries.no_longer_observed")}</>;
+	if (incident.status === "waiting_for_traffic") return <>{t("adaptiveRouting.summaries.waiting_for_traffic")}</>;
+	const state = incident.state === "unknown" ? "degraded" : incident.state;
+	return <>{t(`adaptiveRouting.summaries.${state}`)}</>;
+}
+
+export function IncidentAction({ incident }: { incident: AdaptiveRoutingIncident }) {
+	const { t } = useTranslation("observability");
+	if (incident.closed_at || incident.state === "healthy") return null;
+	if (incident.state === "held" && (incident.failure_class === "credential" || incident.failure_class === "quota")) {
+		return <>{t("adaptiveRouting.actions.check_credentials")}</>;
+	}
+	const state = incident.state === "unknown" ? "degraded" : incident.state;
+	return <>{t(`adaptiveRouting.actions.${state}`)}</>;
+}
+
+export function IncidentEventMessage({ event }: { event: AdaptiveRoutingIncidentEvent }) {
+	const { t } = useTranslation("observability");
+	// Only known system events are translated. Provider and future event text stays intact.
+	switch (event.kind) {
+		case "state_changed":
+			return (
+				<>
+					{t("adaptiveRouting.eventMessages.state_changed", {
+						state: event.state ? t(`adaptiveRouting.states.${event.state}`) : t("adaptiveRouting.states.unknown"),
+					})}
+				</>
+			);
+		case "configuration_changed":
+		case "manual_release":
+		case "check_started":
+		case "hold_released":
+		case "held_again":
+		case "held":
+		case "telemetry_removed":
+		case "history_disabled":
+		case "waiting_for_traffic":
+			return <>{t(`adaptiveRouting.eventMessages.${event.kind}`)}</>;
+		default:
+			return <>{event.message}</>;
+	}
 }
 
 export function incidentDuration(incident: AdaptiveRoutingIncident, locale: string, now = Date.now()) {

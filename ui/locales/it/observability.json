@@ -1,5 +1,33 @@
 {
 	"adaptiveRouting": {
+		"summaries": {
+			"held": "Il fornitore ha rifiutato questa chiave.",
+			"recovering": "La rotta sta recuperando la propria quota di traffico.",
+			"healthy": "La rotta funziona di nuovo normalmente.",
+			"failed": "La rotta ha subito errori ripetuti.",
+			"degraded": "La rotta restituisce errori.",
+			"no_longer_observed": "La rotta non è più osservata. Il ripristino non è stato confermato.",
+			"waiting_for_traffic": "Il ripristino è in attesa di traffico reale."
+		},
+		"actions": {
+			"held": "La chiave resta sospesa finché una richiesta reale non la verifica.",
+			"check_credentials": "Controlla le credenziali o la quota nelle impostazioni del fornitore, oppure sblocca la chiave per verificarla ora.",
+			"recovering": "Le richieste reali riuscite ripristinano la sua quota di traffico.",
+			"failed": "Le alternative funzionanti ricevono traffico mentre questa rotta viene verificata.",
+			"degraded": "La sua quota di traffico è ridotta finché le osservazioni non migliorano."
+		},
+		"eventMessages": {
+			"configuration_changed": "La configurazione è cambiata; la rotta precedente non è più osservata.",
+			"manual_release": "Un operatore ha rimosso la sospensione; richieste reali devono confermare il ripristino.",
+			"check_started": "Una richiesta reale ha verificato la chiave sospesa; il risultato è registrato in questa transizione.",
+			"hold_released": "La verifica ha mostrato che il rifiuto precedente non si applica più.",
+			"held_again": "La verifica non ha confermato il ripristino; la chiave resta sospesa.",
+			"held": "Il fornitore ha rifiutato la chiave; il traffico ordinario la evita.",
+			"telemetry_removed": "La rotta non è più osservata dopo la rimozione della telemetria o un periodo di inattività.",
+			"history_disabled": "La cronologia facoltativa dello stato è stata disattivata prima della conferma del ripristino.",
+			"waiting_for_traffic": "Nessun traffico reale ha confermato il ripristino da un’ora.",
+			"state_changed": "Lo stato osservato della rotta è cambiato in {{state}}."
+		},
 		"providerSelection": "Selezione adattiva del provider",
 		"providerSelectionHelp": "Scegliere il provider in base a stato e latenza se la richiesta non ne indica uno. Provider e alternative indicati restano invariati salvo autorizzazione qui sotto. Disattivando, provider e alternative non vengono modificati.",
 		"keySelection": "Selezione adattiva della chiave",

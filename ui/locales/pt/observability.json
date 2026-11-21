@@ -1,5 +1,33 @@
 {
 	"adaptiveRouting": {
+		"summaries": {
+			"held": "O provedor recusou esta chave.",
+			"recovering": "A rota está recuperando sua parcela de tráfego.",
+			"healthy": "A rota voltou a funcionar normalmente.",
+			"failed": "A rota falhou repetidamente.",
+			"degraded": "A rota está retornando erros.",
+			"no_longer_observed": "A rota não é mais observada. A recuperação não foi confirmada.",
+			"waiting_for_traffic": "A recuperação aguarda tráfego real."
+		},
+		"actions": {
+			"held": "A chave permanece retida até que uma solicitação real a verifique.",
+			"check_credentials": "Verifique a credencial ou a cota nas configurações do provedor, ou libere a chave para verificá-la agora.",
+			"recovering": "Solicitações reais bem-sucedidas restauram sua parcela de tráfego.",
+			"failed": "Alternativas saudáveis recebem o tráfego enquanto esta rota é verificada.",
+			"degraded": "Sua parcela de tráfego é reduzida até que as observações melhorem."
+		},
+		"eventMessages": {
+			"configuration_changed": "A configuração mudou; a rota anterior não é mais observada.",
+			"manual_release": "Um operador removeu a retenção; solicitações reais devem confirmar a recuperação.",
+			"check_started": "Uma solicitação real verificou a chave retida; o resultado está registrado nesta transição.",
+			"hold_released": "A verificação mostrou que a recusa anterior não se aplica mais.",
+			"held_again": "A verificação não confirmou a recuperação; a chave permanece retida.",
+			"held": "O provedor recusou a chave; o tráfego comum a ignora.",
+			"telemetry_removed": "A rota não é mais observada após a remoção da telemetria ou um período de inatividade.",
+			"history_disabled": "O histórico opcional de integridade foi desativado antes da confirmação da recuperação.",
+			"waiting_for_traffic": "Nenhum tráfego real confirmou a recuperação há uma hora.",
+			"state_changed": "O estado observado da rota mudou para {{state}}."
+		},
 		"providerSelection": "Seleção adaptativa de provedor",
 		"providerSelectionHelp": "Escolher provedores por saúde e latência quando a solicitação não indica um. Provedores e alternativas indicados permanecem iguais, salvo permissão abaixo. Desativar impede mudanças de provedores e alternativas.",
 		"keySelection": "Seleção adaptativa de chave",

@@ -1,5 +1,33 @@
 {
 	"adaptiveRouting": {
+		"summaries": {
+			"held": "供應商拒絕了此金鑰。",
+			"recovering": "正在逐步恢復此路由的流量比例。",
+			"healthy": "此路由已恢復正常服務。",
+			"failed": "此路由多次失敗。",
+			"degraded": "此路由正在傳回錯誤。",
+			"no_longer_observed": "不再觀測此路由。尚未確認恢復。",
+			"waiting_for_traffic": "正在等待實際流量以確認恢復。"
+		},
+		"actions": {
+			"held": "此金鑰將保持暫停，直到實際請求對其進行檢查。",
+			"check_credentials": "請在供應商設定中檢查憑證或配額，或解除暫停以立即檢查。",
+			"recovering": "成功的實際請求會恢復其流量比例。",
+			"failed": "檢查此路由期間，流量將傳送至健康的替代路由。",
+			"degraded": "在觀測結果改善之前，其流量比例將保持降低。"
+		},
+		"eventMessages": {
+			"configuration_changed": "設定已變更，不再觀測先前的路由。",
+			"manual_release": "操作人員已解除暫停，需要實際請求來確認恢復。",
+			"check_started": "實際請求已檢查暫停的金鑰，結果記錄於此次狀態轉換中。",
+			"hold_released": "檢查顯示先前的拒絕已不再適用。",
+			"held_again": "檢查未能確認恢復，此金鑰仍處於暫停狀態。",
+			"held": "供應商拒絕了此金鑰，一般流量會略過它。",
+			"telemetry_removed": "遙測資料遭移除或閒置後，不再觀測此路由。",
+			"history_disabled": "在確認恢復之前，已停用選用的健康狀態歷程記錄。",
+			"waiting_for_traffic": "一小時內沒有實際流量確認恢復。",
+			"state_changed": "觀測到的路由狀態已變為{{state}}。"
+		},
 		"providerSelection": "自適應供應商選擇",
 		"providerSelectionHelp": "請求未指定供應商時，根據運作狀態和延遲選擇。除非下方允許變更，否則保留已指定的供應商與備援路由。關閉後不再變更供應商或備援路由。",
 		"keySelection": "自適應金鑰選擇",

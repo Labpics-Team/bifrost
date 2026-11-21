@@ -67,8 +67,11 @@ function AdaptiveRoutingSettingsForm({ config, configured }: { config: AdaptiveR
 	const [save, { isLoading: isSaving }] = useUpdateAdaptiveRoutingConfigMutation();
 	const form = useForm<AdaptiveRoutingConfig>({
 		resolver: zodResolver(adaptiveRoutingConfigSchema),
-		defaultValues: config,
+		values: config,
+		resetOptions: { keepDirtyValues: true, keepErrors: true },
 	});
+	// Subscribe to dirty fields so server refreshes preserve the current draft.
+	const hasChanges = Object.keys(form.formState.dirtyFields).length > 0;
 	const directionEnabled = form.watch("direction_selection_enabled");
 	const redirectEnabled = form.watch("reroute_failed_directions");
 
@@ -205,11 +208,7 @@ function AdaptiveRoutingSettingsForm({ config, configured }: { config: AdaptiveR
 					<Button asChild variant="outline">
 						<Link to="/workspace/adaptive-routing">{shell("nav.adaptiveRoutingDashboard")}</Link>
 					</Button>
-					<Button
-						type="submit"
-						disabled={!canUpdate || isSaving || (configured && !form.formState.isDirty)}
-						data-testid="adaptive-routing-save"
-					>
+					<Button type="submit" disabled={!canUpdate || isSaving || (configured && !hasChanges)} data-testid="adaptive-routing-save">
 						{isSaving ? common("loading") : common("save")}
 					</Button>
 				</div>

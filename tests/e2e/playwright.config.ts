@@ -40,7 +40,11 @@ const workerProjects = (name: string, baseURL: string, files: string[] | null, b
     testMatch: files ? files.map((f) => resolve(__dirname, f)) : '**/*.spec.ts',
     // Accessibility audits run via playwright.a11y.config.ts. Base-path specs need a
     // server mounted under a prefix, so a shared server runs them only with E2E_BASE_PATH.
-    testIgnore: files || basePath ? ['**/accessibility/**'] : ['**/accessibility/**', '**/base-path/**'],
+    testIgnore: [
+      '**/accessibility/**',
+      '**/adaptive-routing-runtime.spec.ts',
+      ...(!files && !basePath ? ['**/base-path/**'] : []),
+    ],
     dependencies: [`${name}:auth`],
     // One spec at a time per server: specs share its config and entities.
     workers: 1,

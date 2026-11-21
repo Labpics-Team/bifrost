@@ -1,5 +1,33 @@
 {
 	"adaptiveRouting": {
+		"summaries": {
+			"held": "Le fournisseur a refusé cette clé.",
+			"recovering": "La route récupère progressivement sa part du trafic.",
+			"healthy": "La route fonctionne à nouveau normalement.",
+			"failed": "La route a échoué à plusieurs reprises.",
+			"degraded": "La route renvoie des erreurs.",
+			"no_longer_observed": "La route n’est plus observée. Le rétablissement n’a pas été confirmé.",
+			"waiting_for_traffic": "Le rétablissement attend du trafic réel."
+		},
+		"actions": {
+			"held": "La clé reste suspendue jusqu’à ce qu’une requête réelle la vérifie.",
+			"check_credentials": "Vérifiez les identifiants ou le quota dans les paramètres du fournisseur, ou libérez la clé pour la vérifier maintenant.",
+			"recovering": "Les requêtes réelles réussies rétablissent sa part du trafic.",
+			"failed": "Les alternatives saines reçoivent le trafic pendant la vérification de cette route.",
+			"degraded": "Sa part du trafic est réduite jusqu’à l’amélioration des observations."
+		},
+		"eventMessages": {
+			"configuration_changed": "La configuration a changé ; l’ancienne route n’est plus observée.",
+			"manual_release": "Un opérateur a levé la suspension ; des requêtes réelles doivent confirmer le rétablissement.",
+			"check_started": "Une requête réelle a vérifié la clé suspendue ; son résultat est enregistré dans cette transition.",
+			"hold_released": "La vérification a montré que le refus précédent ne s’applique plus.",
+			"held_again": "La vérification n’a pas confirmé le rétablissement ; la clé reste suspendue.",
+			"held": "Le fournisseur a refusé la clé ; le trafic ordinaire l’évite.",
+			"telemetry_removed": "La route n’est plus observée après la suppression de sa télémétrie ou une période d’inactivité.",
+			"history_disabled": "L’historique d’état facultatif a été désactivé avant la confirmation du rétablissement.",
+			"waiting_for_traffic": "Aucun trafic réel n’a confirmé le rétablissement depuis une heure.",
+			"state_changed": "L’état observé de la route est passé à {{state}}."
+		},
 		"providerSelection": "Sélection adaptative du fournisseur",
 		"providerSelectionHelp": "Choisir selon l'état et la latence si la requête ne précise aucun fournisseur. Les fournisseurs et replis indiqués sont conservés sauf autorisation ci-dessous. Désactiver empêche de modifier fournisseurs et replis.",
 		"keySelection": "Sélection adaptative de la clé",

@@ -1,7 +1,7 @@
 import { expect, test } from '../../core/fixtures/base.fixture'
-import type { AdaptiveRoutingConfig } from '../../../../ui/lib/types/adaptiveRouting'
+import type { AdaptiveRoutingConfig, AdaptiveRoutingIncident } from '../../../../ui/lib/types/adaptiveRouting'
 
-test.use({ skipAutoLogin: true })
+test.use({ skipAutoLogin: true, storageState: { cookies: [], origins: [] } })
 
 const initialConfig: AdaptiveRoutingConfig = {
   direction_selection_enabled: true,
@@ -13,6 +13,14 @@ const initialConfig: AdaptiveRoutingConfig = {
   history_enabled: true,
   history_retention_days: 7,
   snapshot_persist_interval_seconds: 300,
+}
+
+const heldIncident: AdaptiveRoutingIncident = {
+  id: 'held-incident', scope: 'key_model', provider: 'openai', model: 'test-model', key_id: 'test-key', key_name: 'Test key',
+  state: 'held', worst_state: 'held', status: 'mitigated', failure_class: 'rate_limit',
+  opened_at: '2026-11-21T10:00:00Z', updated_at: '2026-11-21T10:00:01Z', last_seen: '2026-11-21T10:00:01Z',
+  summary: 'The provider refused this key.', action: 'The key is held until a real request checks it.',
+  checks: 1, failed_checks: 0, refused_again: 0,
 }
 
 test.beforeEach(async ({ page }) => {
@@ -85,7 +93,7 @@ test('resolved incidents retain visible causes independently of generic summarie
   } }))
   await page.goto('/workspace/adaptive-routing/incidents')
   await expect(page.getByTestId('adaptive-incident-cause')).toHaveText('Rate limit reached')
-  await expect(page.getByTestId('adaptive-incident-row')).toContainText('The route recovered.')
+  await expect(page.getByTestId('adaptive-incident-row')).toContainText('The route serves normally again.')
   await page.getByTestId('adaptive-incident-open').click()
   const detail = page.getByTestId('adaptive-incident-detail')
   await expect(detail.locator('dd').filter({ hasText: 'Rate limit reached' })).toBeVisible()
@@ -106,7 +114,7 @@ test('initial settings save the full profile and a late refresh preserves the ne
       return route.fulfill({ json: saved })
     }
     if (writes.length) await refreshReady
-    return route.fulfill({ json: writes[0] ?? initialConfig })
+    return route.fulfill({ json: writes.length ? { ...writes.at(-1), snapshot_persist_interval_seconds: 600 } : initialConfig })
   })
   await page.goto('/workspace/adaptive-routing/settings')
   await expect(page.getByTestId('adaptive-routing-settings')).toBeVisible()
@@ -120,10 +128,136 @@ test('initial settings save the full profile and a late refresh preserves the ne
   releaseRefresh()
   await refreshed
   await expect(retention).toHaveValue('14')
+  await expect(page.getByTestId('adaptive-routing-snapshot_persist_interval_seconds')).toHaveValue('600')
   await expect(page.getByTestId('adaptive-routing-save')).toBeEnabled()
   await page.getByTestId('adaptive-routing-save').click()
   await expect.poll(() => writes.length).toBe(2)
-  expect(writes[1]).toEqual({ ...initialConfig, history_retention_days: 14 })
+  expect(writes[1]).toEqual({ ...initialConfig, history_retention_days: 14, snapshot_persist_interval_seconds: 600 })
+  await expect(retention).toHaveValue('14')
+})
+
+test('a failed settings save retains the draft and a successful retry adopts the server values', async ({ page }) => {
+  let config = initialConfig
+  let rejectSave = true
+  await page.route('**/api/adaptive-routing/status', route => route.fulfill({ json: { enabled: true, routes: [] } }))
+  await page.route('**/api/adaptive-routing/config', route => {
+    if (route.request().method() === 'PUT') {
+      if (rejectSave) return route.fulfill({ status: 503, json: { error: { message: 'Save unavailable' } } })
+      // The server response is authoritative, including normalized values.
+      config = { ...route.request().postDataJSON(), snapshot_persist_interval_seconds: 600 }
+    }
+    return route.fulfill({ json: config })
+  })
+  await page.goto('/workspace/adaptive-routing/settings')
+  const save = page.getByTestId('adaptive-routing-save')
+  const retention = page.getByTestId('adaptive-routing-history_retention_days')
+  await expect(save).toBeDisabled()
+  await retention.fill('14')
+  await save.click()
+  await expect(page.getByRole('alert')).toContainText('Save unavailable')
+  await expect(retention).toHaveValue('14')
+  await expect(save).toBeEnabled()
+  rejectSave = false
+  await save.click()
+  await expect(page.getByTestId('adaptive-routing-snapshot_persist_interval_seconds')).toHaveValue('600')
+  await expect(retention).toHaveValue('14')
+  await expect(save).toBeDisabled()
+  await expect(page.getByTestId('adaptive-routing-settings').getByRole('alert')).toHaveCount(0)
+})
+
+test('route refresh clamps a removed page and a later polling failure retains the observed rows', async ({ page }) => {
+  const routes = Array.from({ length: 26 }, (_, index) => ({
+    provider: 'openai', key_id: `key-${index}`, key_name: `Route ${index}`, model: 'test-model',
+    state: 'healthy', score: 100, samples: 1, error_rate: 0, latency_ms: 40, inflight: 0,
+    last_seen: '2026-11-21T10:00:00Z',
+  }))
+  let count = 26
+  let fail = false
+  await page.route('**/api/adaptive-routing/status', route => fail
+    ? route.fulfill({ status: 503, json: { error: { message: 'Status unavailable' } } })
+    : route.fulfill({ json: { enabled: true, routes: routes.slice(0, count) } }))
+  await page.goto('/workspace/adaptive-routing?live=false')
+  await page.getByRole('button', { name: 'Next page', exact: true }).click()
+  await expect(page.getByText('Page 2 of 2', { exact: true })).toBeVisible()
+  count = 1
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+  await expect(page.getByText('Page 1 of 1', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('adaptive-routing-table')).toContainText('Route 0')
+  fail = true
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+  await expect(page.getByRole('alert')).toContainText('Status unavailable')
+  await expect(page.getByTestId('adaptive-routing-table')).toContainText('Route 0')
+})
+
+for (const view of ['list', 'events'] as const) {
+  test(`${view} pagination keeps Previous available when a new page fails and supports retry`, async ({ page }) => {
+    let fail = true
+    let releasePage!: () => void
+    const pendingPage = new Promise<void>(resolve => { releasePage = resolve })
+    await page.route('**/api/adaptive-routing/incidents?*', route => route.fulfill({ json: {
+      incidents: [heldIncident], total: 1, next_cursor: view === 'list' ? 'page-two' : undefined,
+    } }))
+    const endpoint = view === 'list' ? '**/api/adaptive-routing/incidents?*' : '**/api/adaptive-routing/incidents/held-incident?*'
+    await page.route(endpoint, async route => {
+      const second = new URL(route.request().url()).searchParams.get('cursor') === 'page-two'
+      if (second) {
+        await pendingPage
+        if (fail) return route.fulfill({ status: 503, json: { error: { message: 'Page unavailable' } } })
+      }
+      return route.fulfill({ json: view === 'list'
+        ? { incidents: [{ ...heldIncident, key_name: second ? 'Older key' : 'Test key' }], total: 2, next_cursor: second ? undefined : 'page-two' }
+        : { incident: heldIncident, events: [{ id: second ? 'older' : 'newer', kind: 'provider_note', message: second ? 'Older event' : 'Newer event', timestamp: heldIncident.opened_at }], next_cursor: second ? undefined : 'page-two' }
+      })
+    })
+    await page.goto('/workspace/adaptive-routing/incidents?live=false')
+    if (view === 'events') await page.getByTestId('adaptive-incident-open').click()
+    const surface = view === 'events' ? page.getByTestId('adaptive-incident-detail') : page.locator('body')
+    const previous = surface.getByRole('button', { name: 'Previous page', exact: true })
+    const next = surface.getByRole('button', { name: 'Next page', exact: true })
+    await next.click()
+    await expect(previous).toBeEnabled()
+    releasePage()
+    await expect(surface.getByRole('alert')).toContainText('Page unavailable')
+    await expect(previous).toBeEnabled()
+    await previous.click()
+    await expect(surface).toContainText(view === 'events' ? 'Newer event' : 'Test key')
+    await next.click()
+    await expect(surface.getByRole('alert')).toContainText('Page unavailable')
+    fail = false
+    await surface.getByRole('button', { name: 'Try again', exact: true }).click()
+    await expect(surface).toContainText(view === 'events' ? 'Older event' : 'Older key')
+    await expect(previous).toBeEnabled()
+    await expect(next).toBeDisabled()
+  })
+}
+
+test('Russian incident text follows system codes and preserves provider text and request links', async ({ page }, testInfo) => {
+  await page.addInitScript(() => localStorage.setItem('bifrost.locale', 'ru'))
+  const incident: AdaptiveRoutingIncident = {
+    ...heldIncident, status: 'no_longer_observed', closed_at: '2026-11-21T11:00:00Z',
+    summary: 'An old English summary', action: 'An old English action', first_request_id: 'request-evidence', last_request_id: 'request-evidence',
+  }
+  await page.route('**/api/adaptive-routing/incidents?*', route => route.fulfill({ json: { incidents: [incident], total: 1 } }))
+  await page.route('**/api/adaptive-routing/incidents/held-incident?*', route => route.fulfill({ json: {
+    incident, events: [
+      ...['telemetry_removed', 'history_disabled', 'waiting_for_traffic', 'configuration_changed', 'manual_release', 'check_started', 'hold_released', 'held_again', 'held', 'state_changed'].map(kind => ({
+        id: kind, kind, state: 'held', timestamp: incident.opened_at, message: 'Untranslated system fallback', request_id: 'request-evidence',
+      })),
+      { id: 'provider', kind: 'provider_note', timestamp: incident.opened_at, message: 'Provider diagnostic in original language' },
+    ],
+  } }))
+  await page.goto('/workspace/adaptive-routing/incidents?live=false')
+  await expect(page.getByTestId('adaptive-incident-row')).toContainText('Маршрут больше не наблюдается. Восстановление не подтверждено.')
+  await page.getByTestId('adaptive-incident-open').click()
+  const detail = page.getByTestId('adaptive-incident-detail')
+  await expect(detail).toContainText('В течение часа реальный трафик не подтвердил восстановление.')
+  await expect(detail).toContainText('Наблюдаемое состояние маршрута изменилось:')
+  await expect(detail).toContainText('Provider diagnostic in original language')
+  await expect(detail).not.toContainText('Untranslated system fallback')
+  await expect(detail).not.toContainText('An old English')
+  await expect(detail.getByTestId('adaptive-routing-release')).toHaveCount(0)
+  await expect(detail.getByTestId('adaptive-incident-request')).toHaveAttribute('href', /selected_log=request-evidence/)
+  await page.screenshot({ path: testInfo.outputPath('russian-incident.png'), fullPage: true })
 })
 
 test('release respects whole-key and model-scoped holds', async ({ page, dashboardPage }) => {

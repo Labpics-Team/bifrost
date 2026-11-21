@@ -221,8 +221,11 @@ func (c *Controller) Route(ctx *schemas.BifrostContext, req *schemas.BifrostRequ
 			chain = append(chain, fb)
 		}
 	}
+	// A due check can add healthy alternatives without changing the native
+	// permission to prune a named request's explicitly configured fallbacks.
+	prune := cfg.PruneFailedFallbacks && (!named || cfg.AppendFallbacksToPinned || redirected)
 	for _, fb := range fallbacks {
-		if cfg.PruneFailedFallbacks && c.direction(ctx, fb.Provider, fb.Model, fb.KeyID).score == 0 {
+		if prune && c.direction(ctx, fb.Provider, fb.Model, fb.KeyID).score == 0 {
 			continue
 		}
 		appendUnique(fb)

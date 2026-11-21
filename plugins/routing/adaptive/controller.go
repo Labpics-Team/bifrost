@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	maxRoutes = 8192
-	idleTTL   = 24 * time.Hour
-	decay     = 0.2
+	maxRoutes            = 8192
+	maxOptionalIncidents = 2 * maxRoutes
+	idleTTL              = 24 * time.Hour
+	decay                = 0.2
 )
 
 type routeID struct {
@@ -166,7 +167,7 @@ func (c *Controller) weightLocked(id routeID, now time.Time) float64 {
 	if r == nil {
 		return 1
 	}
-	if r.FailedUntil.After(now) {
+	if !r.FailedUntil.IsZero() {
 		return 0
 	}
 	// Success probability dominates latency and queueing. A usable route keeps
@@ -211,10 +212,15 @@ func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, 
 		}
 	}
 	var due []routeID
+	var recovering []*route
 	for _, key := range keys {
 		id := routeID{provider, model, key.ID}
 		if h := c.holdLocked(id, now); h != nil && !h.HoldUntil.After(now) && !h.ProbeUntil.After(now) {
 			due = append(due, id)
+		} else if h == nil && c.config.load().RouteSelectionEnabled {
+			if r := c.routes[id]; r != nil && !r.FailedUntil.IsZero() && !r.FailedUntil.After(now) && !r.ProbeUntil.After(now) {
+				recovering = append(recovering, r)
+			}
 		}
 	}
 	c.mu.Unlock()
@@ -222,6 +228,15 @@ func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, 
 		if c.reserveCondition(ctx, id, false) {
 			for _, key := range keys {
 				if key.ID == id.KeyID {
+					return key, nil
+				}
+			}
+		}
+	}
+	for _, r := range recovering {
+		if c.reserveProbe(ctx, direction{provider: provider, model: model, recover: r}) {
+			for _, key := range keys {
+				if key.ID == r.KeyID {
 					return key, nil
 				}
 			}
@@ -342,8 +357,12 @@ func (c *Controller) BeginProviderAttempt(ctx *schemas.BifrostContext, info sche
 			}
 		}
 	}
-	if !keyless && !c.syncKey(info.Provider, key) {
-		return nil
+	var accepted *keyState
+	if !keyless {
+		accepted = c.syncKeyState(info.Provider, key)
+		if accepted == nil {
+			return nil
+		}
 	}
 	now := c.now()
 	id := routeID{info.Provider, info.Model, info.KeyID}
@@ -352,20 +371,26 @@ func (c *Controller) BeginProviderAttempt(ctx *schemas.BifrostContext, info sche
 	if info.ProviderRevision != c.providerRevisions[info.Provider] {
 		return nil
 	}
+	k := c.keyStates[routeID{Provider: id.Provider, KeyID: id.KeyID}]
+	if !keyless && k != accepted {
+		return nil
+	}
+	if keyless {
+		k = c.keyLocked(id)
+		k.revision = keylessRevision(info.ProviderRevision)
+	}
 	r := c.routeLocked(id, info.KeyName, now)
 	if r == nil {
 		return nil
-	}
-	k := c.keyLocked(id)
-	if keyless {
-		k.revision = "keyless"
 	}
 	r.KeyRevision = k.revision
 	r.Inflight++
 	r.LastSeen = now
 	a := &attempt{controller: c, ctx: ctx, route: r, start: now, key: k, keyEpoch: k.epoch, modelEpoch: r.Epoch, providerRevision: info.ProviderRevision}
-	if i := c.incidentLocked(routeID{Provider: id.Provider, KeyID: id.KeyID}); i != nil && i.State == "recovering" && r.Samples == 0 {
-		r.Recovering = true
+	for _, scope := range []routeID{{Provider: id.Provider, KeyID: id.KeyID}, id} {
+		if i := c.incidentLocked(scope); i != nil && i.State == "recovering" && r.Samples == 0 {
+			r.Recovering = true
+		}
 	}
 	if h := c.holdLocked(id, now); h != nil {
 		a.holdID = h.ID
@@ -467,7 +492,7 @@ func (c *Controller) complete(a *attempt, failure schemas.FailureClass, retryAft
 	r := a.route
 	c.mu.Lock()
 	r.Inflight--
-	if c.routes[r.routeID] != r || c.keyLocked(r.routeID) != a.key || a.key.epoch != a.keyEpoch || r.Epoch != a.modelEpoch || c.providerRevisions[r.Provider] != a.providerRevision {
+	if !c.attemptCurrentLocked(a) {
 		c.mu.Unlock()
 		return
 	}
@@ -529,18 +554,19 @@ func (c *Controller) complete(a *attempt, failure schemas.FailureClass, retryAft
 			}
 		}
 	}
+	keyName := r.KeyName
 	c.mu.Unlock()
 	if r.KeyID != "" && (failure.IsPerKey() || a.holdID != "") {
 		c.completeConditions(a, failure, retryAfter, now)
 	}
 	if before != after || incidentNeedsUpdate {
-		c.updateHealthIncident(r, requestID(a.ctx), now)
+		c.updateHealthIncident(a, requestID(a.ctx), now)
 	}
 	if r.KeyID != "" && (before != after || incidentNeedsUpdate || failure.IsPerKey() || a.holdID != "") {
-		c.updateProviderIncident(r.Provider, r.Model, requestID(a.ctx), now)
+		c.updateProviderIncident(a, requestID(a.ctx), now)
 	}
 	if failure != "" {
-		a.ctx.AppendRoutingEngineLog(schemas.RoutingEngineLoadbalancing, schemas.LogLevelInfo, fmt.Sprintf("Attempt on %s/%s key %s failed as %s.", r.Provider, r.Model, r.KeyName, failure))
+		a.ctx.AppendRoutingEngineLog(schemas.RoutingEngineLoadbalancing, schemas.LogLevelInfo, fmt.Sprintf("Attempt on %s/%s key %s failed as %s.", r.Provider, r.Model, keyName, failure))
 	}
 }
 
@@ -548,7 +574,7 @@ func (c *Controller) stateLocked(r *route, now time.Time) string {
 	switch {
 	case c.holdLocked(r.routeID, now) != nil:
 		return "held"
-	case r.FailedUntil.After(now):
+	case !r.FailedUntil.IsZero():
 		return "failed"
 	case r.Recovering && r.Recoveries < 5:
 		return "recovering"

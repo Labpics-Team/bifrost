@@ -151,12 +151,21 @@ A one-hour gap in recovery traffic is **Waiting for traffic**, not a recovery.
 Key/provider removal ends the old observation as **No longer observed**;
 `closed_at` records that end, while `resolved_at` is set only for confirmed
 recovery. Maintenance deletes closed incidents and their events after the
-configured retention, in batches of at most 1,000. Open incidents are retained.
+configured retention, in batches of at most 1,000. Incidents that have held a key
+remain open until recovery or a configuration change ends that observation.
+Optional health observations close as **No longer observed** when their telemetry
+is evicted or becomes idle; disabling history also closes only these optional
+observations. New optional observations stop when 16,384 open incidents already
+exist. Required hold history is never dropped to meet that limit. Maintenance
+does not rewrite unchanged incidents or invalidate an unchanged checkpoint.
 The incident retains its recorded refusal cause after recovery; showing that
 cause does not depend on retaining the request log or loading a particular event page.
 If a model refusal changes into a whole-key refusal, or the reverse, successful
 requests advance all related open incidents together. A configuration edit
-still ends the old observation without claiming recovery.
+still ends the old observation without claiming recovery. Incident identity
+survives independently of telemetry checkpoints, so an unchanged credential
+continues recovery after restart. Duration pagination keeps the first page's
+reference time even when an incident closes while later pages are loaded.
 
 **Record Routing History** controls optional health diagnostics. Required
 condition lifecycle records remain durable while it is off, and native request
@@ -196,7 +205,13 @@ go test ./plugins/routing/adaptive ./core -run '^$' -bench 'BenchmarkAdaptive|Be
 
 The real HTTP/SSE and browser fixture is
 `tests/e2e/features/adaptive-routing/runtime-fixture.py --binary tmp/bifrost-http`.
-Run its companion `adaptive-routing-runtime.spec.ts` with
-`ADAPTIVE_RUNTIME_FIXTURE_URL=http://127.0.0.1:18862`. It uses an isolated native
-SQLite database and a controlled provider to check refusal, incident/request-log
-links, crash/restart, recovery and streaming fallbacks without mocked APIs.
+Once that fixture is ready, run from `tests/e2e`:
+
+```sh
+ADAPTIVE_RUNTIME_FIXTURE_URL=http://127.0.0.1:18862 npx playwright test --config=playwright.adaptive-runtime.config.ts
+```
+
+The dedicated configuration has no shared authentication setup or saved session.
+It uses an isolated native SQLite database and a controlled provider to check
+refusal, incident/request-log links, crash/restart, recovery and streaming
+fallbacks without mocked APIs. The normal E2E configuration excludes this spec.

@@ -79,16 +79,15 @@ func (c *Controller) transition(ctx context.Context, build func() transition) er
 	defer c.lifeMu.Unlock()
 	c.mu.Lock()
 	t = build()
-	revision := c.revision
-	c.mu.Unlock()
 	if !t.durable() {
 		if t.publish != nil {
-			c.mu.Lock()
 			t.publish()
-			c.mu.Unlock()
 		}
+		c.mu.Unlock()
 		return nil
 	}
+	revision := c.revision
+	c.mu.Unlock()
 	m := configstore.AdaptiveMutation{ExpectedRevision: revision, Revision: revision + 1}
 	for _, h := range t.remove {
 		m.DeleteConditionIDs = append(m.DeleteConditionIDs, h.ID)
@@ -194,7 +193,11 @@ func (c *Controller) newIncidentLocked(id routeID, name string, now time.Time, r
 	if id.KeyID == "" {
 		scope = "provider_model"
 	}
-	return &Incident{ID: uuid.NewString(), Scope: scope, Provider: string(id.Provider), ProviderRevision: c.providerRevisions[id.Provider], Model: id.Model, KeyID: id.KeyID, KeyName: name, OpenedAt: now, UpdatedAt: now, LastSeen: now, FirstRequestID: request, LastRequestID: request}
+	keyRevision := ""
+	if key := c.keyStates[routeID{Provider: id.Provider, KeyID: id.KeyID}]; key != nil {
+		keyRevision = key.revision
+	}
+	return &Incident{ID: uuid.NewString(), Scope: scope, Provider: string(id.Provider), ProviderRevision: c.providerRevisions[id.Provider], Model: id.Model, KeyID: id.KeyID, KeyRevision: keyRevision, KeyName: name, OpenedAt: now, UpdatedAt: now, LastSeen: now, FirstRequestID: request, LastRequestID: request}
 }
 
 func incidentEvent(i *Incident, kind, request, message string, now time.Time) IncidentEvent {
@@ -274,12 +277,45 @@ func requestID(ctx *schemas.BifrostContext) string {
 	return id
 }
 
+func (c *Controller) attemptCurrentLocked(a *attempt) bool {
+	r := a.route
+	return c.routes[r.routeID] == r && c.keyStates[routeID{Provider: r.Provider, KeyID: r.KeyID}] == a.key && a.key.epoch == a.keyEpoch && r.Epoch == a.modelEpoch && c.providerRevisions[r.Provider] == a.providerRevision
+}
+
+func (c *Controller) releaseCompletedLeaseLocked(a *attempt) {
+	if !c.attemptCurrentLocked(a) || a.probeID == 0 {
+		return
+	}
+	h := c.holdLocked(a.route.routeID, c.now())
+	if h == nil || h.ID != a.holdID || h.ProbeID != a.probeID {
+		return
+	}
+	copy := *h
+	copy.ProbeID = 0
+	copy.ProbeUntil = time.Time{}
+	c.conditions[h.routeID] = &copy
+}
+
+// Only this attempt's committed transition may advance its observation fence.
+// A concurrent release/reset must invalidate all later incident updates too.
+func followAttemptTransition(t transition, a *attempt) transition {
+	publish := t.publish
+	t.publish = func() {
+		if publish != nil {
+			publish()
+		}
+		a.keyEpoch = a.key.epoch
+		a.modelEpoch = a.route.Epoch
+	}
+	return t
+}
+
 func (c *Controller) completeConditions(a *attempt, failure schemas.FailureClass, retryAfter int64, now time.Time) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	err := c.transition(ctx, func() transition {
 		r := a.route
-		if c.routes[r.routeID] != r || c.keyLocked(r.routeID) != a.key || a.key.epoch != a.keyEpoch || r.Epoch != a.modelEpoch {
+		if !c.attemptCurrentLocked(a) {
 			return transition{}
 		}
 		h := c.holdLocked(r.routeID, now)
@@ -330,7 +366,7 @@ func (c *Controller) completeConditions(a *attempt, failure schemas.FailureClass
 				t.remove = append(t.remove, h)
 				t.upsert = append(t.upsert, &copy)
 				t.events = append(t.events, incidentEvent(i, "held_again", request, "The check did not establish recovery; the key remains held.", now))
-				return t
+				return followAttemptTransition(t, a)
 			}
 		}
 		if failure.IsPerKey() {
@@ -345,22 +381,31 @@ func (c *Controller) completeConditions(a *attempt, failure schemas.FailureClass
 			}
 			i.FailureClass = string(failure)
 			setIncidentState(i, "held", now, request)
+			// A broader hold may mask an older model hold. Replacing that scope
+			// deletes its prior identity in the same transaction as the new refusal.
+			if previous := c.conditions[id]; previous != nil && previous != h {
+				t.remove = append(t.remove, previous)
+			}
 			next := &condition{routeID: id, ID: uuid.NewString(), KeyRevision: r.KeyRevision, IncidentID: i.ID, KeyName: r.KeyName, HoldUntil: now.Add(holdDuration(failure, 1, retryAfter)), HeldAt: now, Rung: 1, HoldClass: failure}
 			t.upsert = append(t.upsert, next)
 			t.events = append(t.events, incidentEvent(i, "held", request, "The provider refused the key; ordinary traffic skips it.", now))
 		}
-		return t
+		return followAttemptTransition(t, a)
 	})
 	if err != nil {
+		c.mu.Lock()
+		c.releaseCompletedLeaseLocked(a)
+		c.mu.Unlock()
 		a.ctx.AppendRoutingEngineLog(schemas.RoutingEngineLoadbalancing, schemas.LogLevelWarn, "Adaptive routing could not commit the condition; the last committed state remains in effect.")
 	}
 }
 
-func (c *Controller) updateHealthIncident(r *route, request string, now time.Time) {
+func (c *Controller) updateHealthIncident(a *attempt, request string, now time.Time) {
+	r := a.route
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = c.transition(ctx, func() transition {
-		if c.routes[r.routeID] != r || c.holdLocked(r.routeID, now) != nil {
+		if !c.attemptCurrentLocked(a) || c.holdLocked(r.routeID, now) != nil {
 			return transition{}
 		}
 		state := c.stateLocked(r, now)
@@ -373,7 +418,7 @@ func (c *Controller) updateHealthIncident(r *route, request string, now time.Tim
 			}
 		}
 		if len(incidents) == 0 {
-			if !c.config.load().HistoryEnabled || state == "unknown" || state == "healthy" {
+			if !c.config.load().HistoryEnabled || state == "unknown" || state == "healthy" || len(c.incidents) >= maxOptionalIncidents {
 				return transition{}
 			}
 			incidents = append(incidents, c.newIncidentLocked(r.routeID, r.KeyName, now, request))
@@ -399,10 +444,19 @@ func (c *Controller) updateHealthIncident(r *route, request string, now time.Tim
 	})
 }
 
-func (c *Controller) updateProviderIncident(provider schemas.ModelProvider, model, request string, now time.Time) {
+func (c *Controller) updateProviderIncident(a *attempt, request string, now time.Time) {
 	if c.keys == nil || c.supports == nil {
 		return
 	}
+	provider, model := a.route.Provider, a.route.Model
+	c.mu.Lock()
+	if !c.attemptCurrentLocked(a) {
+		c.mu.Unlock()
+		return
+	}
+	revision, generation := c.revision, c.resetSequence
+	providerRevision := c.providerRevisions[provider]
+	c.mu.Unlock()
 	keys, err := c.keys(context.Background(), provider)
 	if err != nil {
 		return
@@ -410,9 +464,12 @@ func (c *Controller) updateProviderIncident(provider schemas.ModelProvider, mode
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = c.transition(ctx, func() transition {
+		if c.revision != revision || c.resetSequence != generation || c.providerRevisions[provider] != providerRevision || !c.attemptCurrentLocked(a) {
+			return transition{}
+		}
 		id := routeID{Provider: provider, Model: model}
 		i := c.incidentLocked(id)
-		if !c.config.load().HistoryEnabled && i == nil {
+		if i == nil && (!c.config.load().HistoryEnabled || len(c.incidents) >= maxOptionalIncidents) {
 			return transition{}
 		}
 		eligible, unavailable := 0, 0

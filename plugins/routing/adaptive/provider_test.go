@@ -139,18 +139,137 @@ func TestAdaptiveProviderRecoversFromTransientFailureOnRealTraffic(t *testing.T)
 	}
 }
 
+func TestAdaptiveProviderRecoveryProbeKeepsOtherRequestsOnHealthyAlternative(t *testing.T) {
+	for _, provider := range []schemas.ModelProvider{"", "p1"} {
+		name := "bare model"
+		if provider != "" {
+			name = "named provider"
+		}
+		t.Run(name, func(t *testing.T) {
+			c, now := providerController()
+			keys := testKeys[:1]
+			c.SetCatalog(func(string) []schemas.ModelProvider { return []schemas.ModelProvider{"p1", "p2"} }, func(context.Context, schemas.ModelProvider) ([]schemas.Key, error) { return keys, nil }, func(schemas.ModelProvider, schemas.Key, string) bool { return true })
+			cfg := c.Config()
+			cfg.RerouteFailedDirections = true
+			c.Apply(cfg)
+			for range 3 {
+				observe(c, "p1", "m", keys[0].ID, responseError(503))
+			}
+			*now = now.Add(31 * time.Second)
+
+			ctx := testContext()
+			probe := routeRequest(provider)
+			if err := c.Route(ctx, probe); err != nil {
+				t.Fatal(err)
+			}
+			p, model, fallbacks := probe.GetRequestFields()
+			if p != "p1" || len(fallbacks) != 1 || fallbacks[0].Provider != "p2" {
+				t.Fatalf("due check lost its healthy fallback: %s %+v", p, fallbacks)
+			}
+			key, err := c.SelectKey(ctx, keys, p, model)
+			if err != nil {
+				t.Fatal(err)
+			}
+			attempt := c.BeginProviderAttempt(ctx, schemas.ProviderAttemptInfo{Provider: p, Model: model, KeyID: key.ID, KeyName: key.Name})
+			if attempt == nil {
+				t.Fatal("recovery attempt was not observed")
+			}
+			defer attempt.End()
+
+			other := routeRequest(provider)
+			if err := c.Route(testContext(), other); err != nil {
+				t.Fatal(err)
+			}
+			p, _, fallbacks = other.GetRequestFields()
+			if p != "p2" {
+				t.Fatalf("provider received ordinary traffic while its recovery check was in flight: %s", p)
+			}
+			if provider == "" && len(fallbacks) != 0 {
+				t.Fatalf("in-flight check was offered as a healthy fallback: %+v", fallbacks)
+			}
+
+			attempt.Observe(&schemas.BifrostResponse{}, nil)
+			attempt.End()
+			recovered := routeRequest(provider)
+			if err := c.Route(testContext(), recovered); err != nil {
+				t.Fatal(err)
+			}
+			p, _, fallbacks = recovered.GetRequestFields()
+			if p != "p1" && (len(fallbacks) != 1 || fallbacks[0].Provider != "p1") {
+				t.Fatalf("successful check did not return the provider to ordinary traffic: %s %+v", p, fallbacks)
+			}
+		})
+	}
+}
+
+func TestAdaptiveProviderUnavailablePoolStillSendsNativeAttempt(t *testing.T) {
+	for _, status := range []int{401, 503} {
+		for _, provider := range []schemas.ModelProvider{"", "p1"} {
+			name := "bare model"
+			if provider != "" {
+				name = "named provider"
+			}
+			if status == 401 {
+				name += "/held"
+			} else {
+				name += "/failed"
+			}
+			t.Run(name, func(t *testing.T) {
+				c, now := providerController()
+				keys := testKeys[:1]
+				c.SetCatalog(func(string) []schemas.ModelProvider { return []schemas.ModelProvider{"p1"} }, func(context.Context, schemas.ModelProvider) ([]schemas.Key, error) { return keys, nil }, func(schemas.ModelProvider, schemas.Key, string) bool { return true })
+				cfg := c.Config()
+				cfg.RerouteFailedDirections = true
+				c.Apply(cfg)
+				for range 3 {
+					observe(c, "p1", "m", keys[0].ID, responseError(status))
+				}
+				*now = now.Add(time.Minute)
+				probe := routeRequest(provider)
+				if err := c.Route(testContext(), probe); err != nil {
+					t.Fatal(err)
+				}
+				// Even while the only direction's check is reserved, the native
+				// fail-open path must still send an attempt instead of refusing it.
+				ctx := testContext()
+				r := routeRequest(provider)
+				if err := c.Route(ctx, r); err != nil {
+					t.Fatal(err)
+				}
+				p, model, _ := r.GetRequestFields()
+				if p != "p1" {
+					t.Fatalf("all-unavailable pool lost its provider: %s", p)
+				}
+				key, err := c.SelectKey(ctx, keys, p, model)
+				if err != nil || key.ID != keys[0].ID {
+					t.Fatalf("all-unavailable pool refused native key selection: %s %v", key.ID, err)
+				}
+				attempt := c.BeginProviderAttempt(ctx, schemas.ProviderAttemptInfo{Provider: p, Model: model, KeyID: key.ID, KeyName: key.Name})
+				if attempt == nil {
+					t.Fatal("native fail-open attempt was not observed")
+				}
+				attempt.Observe(nil, responseError(status))
+				attempt.End()
+			})
+		}
+	}
+}
+
 func TestAdaptivePruningFollowsNativeNamedProviderSettings(t *testing.T) {
 	for _, test := range []struct {
 		name                                  string
 		append, redirect, failPrimary, pruned bool
+		due                                   bool
 	}{
-		{"only prune keeps named fallback", false, false, false, false},
-		{"no redirect keeps named fallback", false, true, false, false},
-		{"append allows prune", true, false, false, true},
-		{"actual redirect allows prune", false, true, true, true},
+		{"only prune keeps named fallback", false, false, false, false, false},
+		{"no redirect keeps named fallback", false, true, false, false, false},
+		{"append allows prune", true, false, false, true, false},
+		{"actual redirect allows prune", false, true, true, true, false},
+		{"due check keeps named fallback", false, true, true, false, true},
+		{"due check with append allows prune", true, true, true, true, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			c, _ := providerController()
+			c, now := providerController()
 			cfg := c.Config()
 			cfg.PruneFailedFallbacks = true
 			cfg.AppendFallbacksToPinned = test.append
@@ -160,17 +279,27 @@ func TestAdaptivePruningFollowsNativeNamedProviderSettings(t *testing.T) {
 			if test.failPrimary {
 				failProvider(c, "p1")
 			}
+			if test.due {
+				*now = now.Add(time.Minute)
+			}
 			r := routeRequest("p1", schemas.Fallback{Provider: "failed", Model: "m"})
 			c.Route(testContext(), r)
-			_, _, fallbacks := r.GetRequestFields()
+			provider, _, fallbacks := r.GetRequestFields()
 			hasFailed := false
+			hasHealthy := false
 			for _, fb := range fallbacks {
 				if fb.Provider == "failed" {
 					hasFailed = true
 				}
+				if fb.Provider == "p2" {
+					hasHealthy = true
+				}
 			}
 			if hasFailed == test.pruned {
 				t.Fatalf("fallback pruning contradicted named-provider policy: %+v", fallbacks)
+			}
+			if test.due && (provider != "p1" || !hasHealthy) {
+				t.Fatalf("named provider check lost its healthy alternative: %s %+v", provider, fallbacks)
 			}
 		})
 	}

@@ -77,7 +77,7 @@ func (c *Controller) Save(ctx context.Context, config Config) error {
 // Restore restores all unresolved conditions, including ones due for a
 // check. The native configuration validates their captured credential revisions.
 func (c *Controller) Restore(ctx context.Context) error {
-	if !c.Enabled() || c.stateStore == nil {
+	if c.stateStore == nil {
 		return nil
 	}
 	state, err := c.stateStore.Load(ctx)
@@ -89,6 +89,9 @@ func (c *Controller) Restore(ctx context.Context) error {
 	for _, source := range state.OpenIncidents {
 		i := source
 		c.incidents[incidentRoute(&i)] = &i
+		if i.KeyID != "" && i.KeyRevision != "" {
+			c.keyStates[routeID{Provider: schemas.ModelProvider(i.Provider), KeyID: i.KeyID}] = &keyState{revision: i.KeyRevision}
+		}
 	}
 	for _, h := range state.Conditions {
 		id := routeID{schemas.ModelProvider(h.Provider), h.Model, h.KeyID}
@@ -117,11 +120,31 @@ func (c *Controller) Restore(ctx context.Context) error {
 	}
 	// Reconcile with one live snapshot per provider. No saved refusal is rebound
 	// to whatever credential happens to exist when a checkpoint is written.
-	providers := map[schemas.ModelProvider]bool{}
-	for _, h := range state.Conditions {
-		providers[schemas.ModelProvider(h.Provider)] = true
+	providers := map[schemas.ModelProvider]map[string]bool{}
+	addKey := func(provider schemas.ModelProvider, keyID string) {
+		if keyID == "" || changedProviders[provider] {
+			return
+		}
+		if providers[provider] == nil {
+			providers[provider] = map[string]bool{}
+		}
+		providers[provider][keyID] = true
 	}
-	for provider := range providers {
+	for _, h := range state.Conditions {
+		addKey(schemas.ModelProvider(h.Provider), h.KeyID)
+	}
+	for _, i := range state.OpenIncidents {
+		provider := schemas.ModelProvider(i.Provider)
+		addKey(provider, i.KeyID)
+		// Older schemas can lack the identity of a released hold. Without a
+		// condition, that observation cannot safely be rebound to a live key.
+		if i.KeyID != "" && !changedProviders[provider] && c.keyStates[routeID{Provider: provider, KeyID: i.KeyID}] == nil {
+			if err := c.ResetKey(provider, i.KeyID); err != nil {
+				return err
+			}
+		}
+	}
+	for provider, savedKeys := range providers {
 		if c.keys == nil {
 			return fmt.Errorf("adaptive routing catalog unavailable")
 		}
@@ -142,9 +165,9 @@ func (c *Controller) Restore(ctx context.Context) error {
 				return fmt.Errorf("could not reconcile adaptive credential state")
 			}
 		}
-		for _, h := range state.Conditions {
-			if h.Provider == string(provider) && !live[h.KeyID] {
-				if err := c.ResetKey(provider, h.KeyID); err != nil {
+		for keyID := range savedKeys {
+			if !live[keyID] {
+				if err := c.ResetKey(provider, keyID); err != nil {
 					return err
 				}
 			}
@@ -159,22 +182,25 @@ func (c *Controller) Restore(ctx context.Context) error {
 			if len(c.routes) >= maxRoutes {
 				break
 			}
-			if c.keys == nil {
-				continue
-			}
-			keys, err := c.keys(ctx, r.Provider)
-			if err != nil {
-				if c.providerExists != nil && !c.providerExists(r.Provider) {
+			valid := r.KeyID == "" && c.keyless != nil && c.keyless(r.Provider) && r.KeyRevision == keylessRevision(c.providerRevisions[r.Provider])
+			if valid {
+				c.keyLocked(r.routeID).revision = r.KeyRevision
+			} else {
+				if c.keys == nil {
 					continue
 				}
-				return err
-			}
-			valid := false
-			for _, key := range keys {
-				if key.ID == r.KeyID && credentialRevision(key, c.providerRevisions[r.Provider]) == r.KeyRevision {
-					valid = true
-					c.syncKey(r.Provider, key)
-					break
+				keys, err := c.keys(ctx, r.Provider)
+				if err != nil {
+					if c.providerExists != nil && !c.providerExists(r.Provider) {
+						continue
+					}
+					return err
+				}
+				for _, key := range keys {
+					if key.ID == r.KeyID && credentialRevision(key, c.providerRevisions[r.Provider]) == r.KeyRevision {
+						valid = c.syncKey(r.Provider, key)
+						break
+					}
 				}
 			}
 			if !valid {
@@ -243,27 +269,38 @@ func (c *Controller) maintain(ctx context.Context) error {
 	now := c.now()
 	err := c.transition(ctx, func() transition {
 		t := transition{}
+		observed := make(map[routeID]bool, len(c.routes))
 		for id, r := range c.routes {
 			if r.Inflight == 0 && now.Sub(r.LastSeen) > idleTTL {
 				delete(c.routes, id)
+				continue
 			}
+			observed[id] = true
+			observed[routeID{Provider: id.Provider, KeyID: id.KeyID}] = true
+			observed[routeID{Provider: id.Provider, Model: id.Model}] = true
 		}
 		for _, source := range c.incidents {
 			i := *source
-			if !c.Config().HistoryEnabled && i.WorstState != "held" {
+			if i.WorstState != "held" && (!c.Config().HistoryEnabled || !observed[incidentRoute(&i)]) {
+				kind, message := "telemetry_removed", "The route is no longer observed after its telemetry was evicted or became idle."
+				if !c.Config().HistoryEnabled {
+					kind, message = "history_disabled", "Optional health history was disabled before confirmed recovery."
+				}
 				i.Status = "no_longer_observed"
 				i.ClosedAt = &now
 				i.UpdatedAt = now
+				i.Summary = message
+				i.Action = ""
 				t.incidents = append(t.incidents, &i)
-				t.events = append(t.events, incidentEvent(&i, "history_disabled", "", "Optional health history was disabled before confirmed recovery.", now))
+				t.events = append(t.events, incidentEvent(&i, kind, "", message, now))
 				continue
 			}
 			if i.Status == "recovering" && now.Sub(i.LastSeen) >= time.Hour {
 				i.Status = "waiting_for_traffic"
 				i.UpdatedAt = now
+				t.incidents = append(t.incidents, &i)
 				t.events = append(t.events, incidentEvent(&i, "waiting_for_traffic", "", "No real traffic has established recovery for an hour.", now))
 			}
-			t.incidents = append(t.incidents, &i)
 		}
 		return t
 	})

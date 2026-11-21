@@ -20,7 +20,7 @@ import { parseAsBoolean, parseAsStringLiteral, useQueryStates } from "nuqs";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { IncidentDetail } from "./incidentDetail";
-import { IncidentCause, incidentDuration, IncidentStatus } from "./incidentDisplay";
+import { IncidentAction, IncidentCause, incidentDuration, IncidentStatus, IncidentSummary } from "./incidentDisplay";
 import { RoutingQueryState } from "./routingQueryState";
 
 // The cursor stack changes only on navigation. Polling refreshes the same page.
@@ -104,9 +104,13 @@ function IncidentTable({
 											<div className="font-medium" data-testid="adaptive-incident-cause">
 												<IncidentCause cause={incident.failure_class} />
 											</div>
-											{incident.summary && <div className="text-muted-foreground mt-1 text-xs">{incident.summary}</div>}
+											<div className="text-muted-foreground mt-1 text-xs">
+												<IncidentSummary incident={incident} />
+											</div>
 										</TableCell>
-										<TableCell className="text-muted-foreground max-w-64 text-sm whitespace-normal">{incident.action}</TableCell>
+										<TableCell className="text-muted-foreground max-w-64 text-sm whitespace-normal">
+											<IncidentAction incident={incident} />
+										</TableCell>
 										<TableCell className={`bg-card sticky right-0 z-10 ${PIN_SHADOW_RIGHT}`}>
 											<Button
 												variant="ghost"
@@ -129,30 +133,32 @@ function IncidentTable({
 							</TableBody>
 						</Table>
 					</div>
-					<div className="flex items-center justify-end gap-3 text-sm">
-						<Button
-							variant="outline"
-							size="icon"
-							aria-label={t("labels.previousPage")}
-							disabled={cursors.length === 1 || query.isFetching}
-							onClick={() => setCursors((pages) => pages.slice(0, -1))}
-						>
-							<ChevronLeft />
-						</Button>
-						<span className="tabular-nums" data-testid="adaptive-incidents-page">
-							{t("adaptiveRouting.currentPage", { page: cursors.length.toLocaleString(locale) })}
-						</span>
-						<Button
-							variant="outline"
-							size="icon"
-							aria-label={t("labels.nextPage")}
-							disabled={!data.next_cursor || query.isFetching}
-							onClick={() => setCursors((pages) => [...pages, data.next_cursor!])}
-						>
-							<ChevronRight />
-						</Button>
-					</div>
 				</>
+			)}
+			{(data || cursors.length > 1) && (
+				<div className="flex items-center justify-end gap-3 text-sm">
+					<Button
+						variant="outline"
+						size="icon"
+						aria-label={t("labels.previousPage")}
+						disabled={cursors.length === 1}
+						onClick={() => setCursors((pages) => pages.slice(0, -1))}
+					>
+						<ChevronLeft />
+					</Button>
+					<span className="tabular-nums" data-testid="adaptive-incidents-page">
+						{t("adaptiveRouting.currentPage", { page: cursors.length.toLocaleString(locale) })}
+					</span>
+					<Button
+						variant="outline"
+						size="icon"
+						aria-label={t("labels.nextPage")}
+						disabled={!data?.next_cursor || query.isFetching}
+						onClick={() => data?.next_cursor && setCursors((pages) => [...pages, data.next_cursor!])}
+					>
+						<ChevronRight />
+					</Button>
+				</div>
 			)}
 		</div>
 	);

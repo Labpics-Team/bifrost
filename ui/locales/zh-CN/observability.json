@@ -1,5 +1,33 @@
 {
 	"adaptiveRouting": {
+		"summaries": {
+			"held": "提供商拒绝了此密钥。",
+			"recovering": "正在逐步恢复此路由的流量份额。",
+			"healthy": "此路由已恢复正常服务。",
+			"failed": "此路由多次失败。",
+			"degraded": "此路由正在返回错误。",
+			"no_longer_observed": "不再观测此路由。尚未确认恢复。",
+			"waiting_for_traffic": "正在等待实际流量以确认恢复。"
+		},
+		"actions": {
+			"held": "此密钥将保持暂停，直到实际请求对其进行检查。",
+			"check_credentials": "请在提供商设置中检查凭据或配额，或解除暂停以立即检查。",
+			"recovering": "成功的实际请求会恢复其流量份额。",
+			"failed": "检查此路由期间，流量将发送到健康的替代路由。",
+			"degraded": "在观测结果改善之前，其流量份额将保持降低。"
+		},
+		"eventMessages": {
+			"configuration_changed": "配置已更改，不再观测此前的路由。",
+			"manual_release": "操作人员已解除暂停，需要实际请求来确认恢复。",
+			"check_started": "实际请求已检查暂停的密钥，结果记录在此次状态转换中。",
+			"hold_released": "检查表明此前的拒绝已不再适用。",
+			"held_again": "检查未能确认恢复，此密钥仍处于暂停状态。",
+			"held": "提供商拒绝了此密钥，常规流量会跳过它。",
+			"telemetry_removed": "遥测数据被移除或闲置后，不再观测此路由。",
+			"history_disabled": "在确认恢复之前，已禁用可选的健康状态历史记录。",
+			"waiting_for_traffic": "一小时内没有实际流量确认恢复。",
+			"state_changed": "观测到的路由状态已变为{{state}}。"
+		},
 		"providerSelection": "自适应提供商选择",
 		"providerSelectionHelp": "请求未指定提供商时，根据运行状态和延迟选择。除非下方允许更改，否则保留已指定的提供商及回退路由。关闭后不再更改提供商或回退路由。",
 		"keySelection": "自适应密钥选择",

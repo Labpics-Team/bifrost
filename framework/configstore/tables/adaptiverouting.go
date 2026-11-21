@@ -40,6 +40,7 @@ type TableAdaptiveIncident struct {
 	ProviderRevision string     `json:"-"`
 	Model            string     `gorm:"index" json:"model,omitempty"`
 	KeyID            string     `gorm:"index" json:"key_id,omitempty"`
+	KeyRevision      string     `json:"-"`
 	KeyName          string     `json:"key_name,omitempty"`
 	Status           string     `gorm:"index" json:"status"`
 	State            string     `json:"state"`

@@ -1,5 +1,33 @@
 {
 	"adaptiveRouting": {
+		"summaries": {
+			"held": "The provider refused this key.",
+			"recovering": "The route is earning its traffic back.",
+			"healthy": "The route serves normally again.",
+			"failed": "The route failed repeatedly.",
+			"degraded": "The route is returning errors.",
+			"no_longer_observed": "The route is no longer observed. Recovery was not confirmed.",
+			"waiting_for_traffic": "Recovery is waiting for real traffic."
+		},
+		"actions": {
+			"held": "The key is held until a real request checks it.",
+			"check_credentials": "Check the credential or quota in the provider settings, or release it to check now.",
+			"recovering": "Successful real requests restore its share.",
+			"failed": "Healthy alternatives receive traffic while this route is checked.",
+			"degraded": "Its traffic share is reduced while observations recover."
+		},
+		"eventMessages": {
+			"configuration_changed": "The configuration changed; the previous route is no longer observed.",
+			"manual_release": "An operator released the hold; real requests must establish recovery.",
+			"check_started": "A real request checked the held key; its outcome is recorded in this transition.",
+			"hold_released": "The check showed the previous refusal no longer applies.",
+			"held_again": "The check did not establish recovery; the key remains held.",
+			"held": "The provider refused the key; ordinary traffic skips it.",
+			"telemetry_removed": "The route is no longer observed after its telemetry was evicted or became idle.",
+			"history_disabled": "Optional health history was disabled before confirmed recovery.",
+			"waiting_for_traffic": "No real traffic has established recovery for an hour.",
+			"state_changed": "Observed route state changed to {{state}}."
+		},
 		"providerSelection": "Adaptive Provider Selection",
 		"providerSelectionHelp": "Choose providers for requests that name none using live health and latency. Named providers and their fallbacks stay unchanged unless enabled below. Turning this off stops provider and fallback changes.",
 		"keySelection": "Adaptive Key Selection",

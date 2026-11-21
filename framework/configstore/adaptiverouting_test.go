@@ -2,6 +2,7 @@ package configstore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -117,6 +118,89 @@ func TestAdaptiveStoreConcurrentMutationHasOneWinner(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, state.Conditions, 1)
 	require.Len(t, state.OpenIncidents, 1)
+}
+
+func TestAdaptiveIncidentIdentityMigrationPreservesLifecycle(t *testing.T) {
+	ctx := context.Background()
+	s, db := adaptiveTestStore(t, filepath.Join(t.TempDir(), "config.db"))
+	m := adaptiveOpening("held-before-upgrade", time.Now().UTC())
+	require.NoError(t, s.Apply(ctx, m))
+	require.NoError(t, s.Checkpoint(ctx, 1, []byte("existing-telemetry")))
+	// Recreate the actual pre-identity schema while keeping its data and indexes.
+	// Neither additive migration may rebuild or clear lifecycle tables.
+	require.NoError(t, db.Exec("ALTER TABLE adaptive_routing_incidents DROP COLUMN provider_revision").Error)
+	require.NoError(t, db.Exec("ALTER TABLE adaptive_routing_incidents DROP COLUMN key_revision").Error)
+	for range 2 {
+		require.NoError(t, migrationAddAdaptiveProviderRevision(ctx, db, testMigrationLogger))
+		require.NoError(t, migrationAddAdaptiveKeyRevision(ctx, db, testMigrationLogger))
+	}
+	state, err := s.Load(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), state.Revision)
+	require.Equal(t, []byte("existing-telemetry"), state.Checkpoint)
+	require.Len(t, state.Conditions, 1)
+	require.Equal(t, "credential-v1", state.Conditions[0].KeyRevision)
+	require.Len(t, state.OpenIncidents, 1)
+	incident := state.OpenIncidents[0]
+	require.Empty(t, incident.ProviderRevision)
+	require.Empty(t, incident.KeyRevision)
+	incident.ProviderRevision = "provider-config-v2"
+	incident.KeyRevision = "credential-v1"
+	require.NoError(t, s.Apply(ctx, AdaptiveMutation{ExpectedRevision: 1, Revision: 2, UpsertIncidents: []Incident{incident}}))
+	detail, err := s.GetIncident(ctx, incident.ID, "", 25)
+	require.NoError(t, err)
+	require.Equal(t, incident, detail.Incident)
+	require.Len(t, detail.Events, 1)
+	require.Equal(t, "request-1", detail.Events[0].RequestID)
+	data, err := json.Marshal(detail.Incident)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "provider-config-v2")
+	require.NotContains(t, string(data), "credential-v1")
+	require.NotContains(t, string(data), "revision")
+}
+
+func TestAdaptiveStoreLongestPaginationSurvivesClosure(t *testing.T) {
+	s, _ := adaptiveTestStore(t, filepath.Join(t.TempDir(), "config.db"))
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Hour)
+	m := AdaptiveMutation{Revision: 1}
+	for i, id := range []string{"a", "b", "c"} {
+		at := base.Add(time.Duration(i) * time.Second)
+		m.UpsertIncidents = append(m.UpsertIncidents, Incident{ID: id, Provider: "p", Scope: "key", Status: "open", OpenedAt: at, UpdatedAt: at})
+	}
+	require.NoError(t, s.Apply(ctx, m))
+	q := IncidentQuery{Sort: "longest", Limit: 1}
+	first, err := s.ListIncidents(ctx, q)
+	require.NoError(t, err)
+	require.Len(t, first.Incidents, 1)
+	require.Equal(t, "a", first.Incidents[0].ID)
+	q.Cursor = first.NextCursor
+	cursor, err := decodeIncidentCursor(q.Cursor)
+	require.NoError(t, err)
+	// Close B and C after page one's reference time. A duration computed at
+	// closure would move them ahead of A and silently omit them from page two.
+	closed := time.Unix(0, cursor.AsOf).Add(time.Minute).UTC()
+	for i := 1; i < len(m.UpsertIncidents); i++ {
+		m.UpsertIncidents[i].Status = "resolved"
+		m.UpsertIncidents[i].ClosedAt = &closed
+		m.UpsertIncidents[i].ResolvedAt = &closed
+	}
+	require.NoError(t, s.Apply(ctx, AdaptiveMutation{ExpectedRevision: 1, Revision: 2, UpsertIncidents: m.UpsertIncidents[1:]}))
+	for _, id := range []string{"b", "c"} {
+		page, err := s.ListIncidents(ctx, q)
+		require.NoError(t, err)
+		require.Len(t, page.Incidents, 1)
+		require.Equal(t, id, page.Incidents[0].ID)
+		require.Equal(t, int64(3), page.Total)
+		q.Cursor = page.NextCursor
+		if id == "b" {
+			next, err := decodeIncidentCursor(q.Cursor)
+			require.NoError(t, err)
+			require.Equal(t, cursor.AsOf, next.AsOf)
+			require.Equal(t, cursor.AsOf-m.UpsertIncidents[1].OpenedAt.UnixNano(), next.Value)
+		}
+	}
+	require.Empty(t, q.Cursor)
 }
 
 func TestAdaptiveStoreCrashHelper(t *testing.T) {

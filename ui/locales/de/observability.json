@@ -1,5 +1,33 @@
 {
 	"adaptiveRouting": {
+		"summaries": {
+			"held": "Der Anbieter hat diesen Schlüssel abgelehnt.",
+			"recovering": "Die Route erhält ihren Datenverkehr schrittweise zurück.",
+			"healthy": "Die Route funktioniert wieder normal.",
+			"failed": "Die Route ist wiederholt fehlgeschlagen.",
+			"degraded": "Die Route liefert Fehler.",
+			"no_longer_observed": "Die Route wird nicht mehr beobachtet. Eine Wiederherstellung wurde nicht bestätigt.",
+			"waiting_for_traffic": "Die Wiederherstellung wartet auf echte Anfragen."
+		},
+		"actions": {
+			"held": "Der Schlüssel bleibt gesperrt, bis eine echte Anfrage ihn prüft.",
+			"check_credentials": "Prüfen Sie Zugangsdaten oder Kontingent in den Anbietereinstellungen, oder geben Sie den Schlüssel zur sofortigen Prüfung frei.",
+			"recovering": "Erfolgreiche echte Anfragen stellen seinen Anteil wieder her.",
+			"failed": "Während diese Route geprüft wird, erhalten funktionierende Alternativen den Datenverkehr.",
+			"degraded": "Ihr Verkehrsanteil bleibt reduziert, bis sich die beobachteten Werte erholen."
+		},
+		"eventMessages": {
+			"configuration_changed": "Die Konfiguration wurde geändert; die bisherige Route wird nicht mehr beobachtet.",
+			"manual_release": "Ein Bediener hat die Sperre aufgehoben; echte Anfragen müssen die Wiederherstellung bestätigen.",
+			"check_started": "Eine echte Anfrage hat den gesperrten Schlüssel geprüft; das Ergebnis ist in diesem Übergang erfasst.",
+			"hold_released": "Die Prüfung zeigte, dass die vorherige Ablehnung nicht mehr gilt.",
+			"held_again": "Die Prüfung hat keine Wiederherstellung bestätigt; der Schlüssel bleibt gesperrt.",
+			"held": "Der Anbieter hat den Schlüssel abgelehnt; normale Anfragen umgehen ihn.",
+			"telemetry_removed": "Die Route wird nicht mehr beobachtet, nachdem ihre Telemetrie entfernt wurde oder inaktiv war.",
+			"history_disabled": "Der optionale Zustandsverlauf wurde vor Bestätigung der Wiederherstellung deaktiviert.",
+			"waiting_for_traffic": "Seit einer Stunde haben keine echten Anfragen die Wiederherstellung bestätigt.",
+			"state_changed": "Der beobachtete Routenzustand wurde zu {{state}} geändert."
+		},
 		"providerSelection": "Adaptive Anbieterauswahl",
 		"providerSelectionHelp": "Anbieter für Anfragen ohne Anbieterangabe anhand von Zustand und Latenz wählen. Angegebene Anbieter und Fallbacks bleiben unverändert, sofern unten nicht erlaubt. Ausschalten verhindert Änderungen an Anbietern und Fallbacks.",
 		"keySelection": "Adaptive Schlüsselauswahl",

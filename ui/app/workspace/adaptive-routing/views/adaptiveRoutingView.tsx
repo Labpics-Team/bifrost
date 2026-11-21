@@ -9,7 +9,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { getProviderLabel } from "@/lib/constants/logs";
 import { useLocale } from "@/lib/i18n/useLocale";
 import { parseAsSafeArrayOf, parseAsSafeString } from "@/lib/queryParamsParser";
-import { useClearAdaptiveRoutingConditionMutation, useGetAdaptiveRoutingStatusQuery } from "@/lib/store/apis/adaptiveRoutingApi";
+import { useGetAdaptiveRoutingStatusQuery } from "@/lib/store/apis/adaptiveRoutingApi";
 import { type AdaptiveRouteStatus, ROUTE_STATES, type RouteState } from "@/lib/types/adaptiveRouting";
 import { withBasePath } from "@/lib/utils/basePath";
 import { Link } from "@tanstack/react-router";
@@ -20,6 +20,7 @@ import { useEffect, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { RoutingQueryState } from "./routingQueryState";
 import { ReleaseHoldButton } from "./releaseHoldButton";
+import { IncidentCause } from "./incidentDisplay";
 
 const stateTones: Record<RouteState, PageTagTone> = {
 	unknown: "neutral",
@@ -197,8 +198,7 @@ export default function AdaptiveRoutingView() {
 			{
 				id: "failure",
 				header: t("adaptiveRouting.cause"),
-				cell: ({ row }) =>
-					row.original.failure_class ? <code className="text-muted-foreground text-xs">{row.original.failure_class}</code> : t("labels.nA"),
+				cell: ({ row }) => <IncidentCause cause={row.original.failure_class} />,
 			},
 			{
 				id: "actions",
@@ -219,6 +219,10 @@ export default function AdaptiveRoutingView() {
 	useEffect(() => {
 		table.setPageIndex(0);
 	}, [filters.q, filters.provider, filters.state, table]);
+	const lastPageIndex = Math.max(0, table.getPageCount() - 1);
+	useEffect(() => {
+		table.setPageIndex((pageIndex) => Math.min(pageIndex, lastPageIndex));
+	}, [lastPageIndex, table]);
 	const canFilter = source.length > 0 || Boolean(filters.q || filters.provider || filters.state !== "all");
 	const heldKeys = new Set(routes.filter((row) => row.state === "held").map((row) => JSON.stringify([row.provider, row.key_id]))).size;
 	const summary = [
@@ -340,7 +344,7 @@ export default function AdaptiveRoutingView() {
 					</Select>
 				</div>
 			)}
-			{!query.isLoading && !query.error && (
+			{query.data && (
 				<div className="overflow-hidden rounded-sm border" data-testid="adaptive-routing-table">
 					<Table>
 						<TableHeader>

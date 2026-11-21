@@ -50,6 +50,13 @@ func credentialRevision(key schemas.Key, providerRevision string) string {
 	return hex.EncodeToString(digest[:])
 }
 
+func keylessRevision(providerRevision string) string {
+	if providerRevision == "" {
+		return "keyless"
+	}
+	return "keyless:" + providerRevision
+}
+
 // ProviderConfigured runs only when core publishes newly constructed provider
 // workers. The identity covers resolved connection/request behavior; UI logging
 // and concurrency settings do not change which credential a refusal describes.
@@ -137,8 +144,14 @@ func cloneKeyValue(v reflect.Value) reflect.Value {
 // syncKey only adopts a revision that still belongs to the live catalog. A
 // delayed attempt carrying a previous configuration cannot rotate it backwards.
 func (c *Controller) syncKey(provider schemas.ModelProvider, key schemas.Key) bool {
+	return c.syncKeyState(provider, key) != nil
+}
+
+// Return the accepted state itself so admission can reject replacement between
+// synchronization and acquiring the attempt's telemetry/probe generations.
+func (c *Controller) syncKeyState(provider schemas.ModelProvider, key schemas.Key) *keyState {
 	if key.ID == "" {
-		return false
+		return nil
 	}
 	key = normalizeKey(key)
 	id := routeID{Provider: provider, KeyID: key.ID}
@@ -148,14 +161,14 @@ func (c *Controller) syncKey(provider schemas.ModelProvider, key schemas.Key) bo
 	same := current != nil && current.snapshot != nil && current.providerRevision == providerRevision && reflect.DeepEqual(current.snapshot, &key)
 	c.mu.Unlock()
 	if same {
-		return true
+		return current
 	}
 	revision := credentialRevision(key, providerRevision)
 	if revision == "" {
-		return false
+		return nil
 	}
 	frozen := cloneKey(key)
-	accepted := false
+	var accepted *keyState
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	err := c.transition(ctx, func() transition {
@@ -182,22 +195,25 @@ func (c *Controller) syncKey(provider schemas.ModelProvider, key schemas.Key) bo
 			}
 		}
 		if k := c.keyStates[id]; k != nil && k.revision == revision {
-			return transition{publish: func() { k.snapshot = frozen; k.providerRevision = providerRevision; accepted = true }}
+			return transition{publish: func() { k.snapshot = frozen; k.providerRevision = providerRevision; accepted = k }}
 		}
 		t := c.retireKeyLocked(provider, key.ID, "The configured credential changed; previous observations no longer apply.")
 		t.advance = c.keyStates[id] != nil
 		t.publish = func() {
-			c.keyStates[id] = &keyState{revision: revision, snapshot: frozen, providerRevision: providerRevision}
+			accepted = &keyState{revision: revision, snapshot: frozen, providerRevision: providerRevision}
+			c.keyStates[id] = accepted
 			for rid := range c.routes {
 				if rid.Provider == provider && rid.KeyID == key.ID {
 					delete(c.routes, rid)
 				}
 			}
-			accepted = true
 		}
 		return t
 	})
-	return err == nil && accepted
+	if err != nil {
+		return nil
+	}
+	return accepted
 }
 
 func (c *Controller) retireKeyLocked(provider schemas.ModelProvider, keyID, message string) transition {

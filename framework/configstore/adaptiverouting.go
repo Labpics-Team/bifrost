@@ -13,6 +13,7 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/migrator"
+	"github.com/maximhq/bifrost/framework/postgresconn"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -88,9 +89,27 @@ func migrationAddAdaptiveRoutingState(ctx context.Context, db *gorm.DB, logger s
 }
 
 func migrationAddAdaptiveProviderRevision(ctx context.Context, db *gorm.DB, logger schemas.Logger) error {
+	return migrationAddAdaptiveIncidentColumn(ctx, db, logger, "add_adaptive_provider_revision", "provider_revision")
+}
+
+func migrationAddAdaptiveKeyRevision(ctx context.Context, db *gorm.DB, logger schemas.Logger) error {
+	return migrationAddAdaptiveIncidentColumn(ctx, db, logger, "add_adaptive_key_revision", "key_revision")
+}
+
+func migrationAddAdaptiveIncidentColumn(ctx context.Context, db *gorm.DB, logger schemas.Logger, id, column string) error {
 	return RunSingleMigration(ctx, nil, db, logger, &migrator.Migration{
-		ID:       "add_adaptive_provider_revision",
-		Migrate:  func(tx *gorm.DB) error { return tx.WithContext(ctx).AutoMigrate(&Incident{}) },
+		ID: id,
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			if tx.Dialector.Name() == "postgres" {
+				return postgresconn.ExecWithBoundedLock(tx, id,
+					"ALTER TABLE adaptive_routing_incidents ADD COLUMN IF NOT EXISTS "+column+" TEXT")
+			}
+			if tx.Migrator().HasColumn(&Incident{}, column) {
+				return nil
+			}
+			return tx.Migrator().AddColumn(&Incident{}, column)
+		},
 		Rollback: func(*gorm.DB) error { return errors.New("adaptive incident configuration identity must be preserved") },
 	})
 }
@@ -334,7 +353,7 @@ func (s *AdaptiveRoutingStore) ListIncidents(ctx context.Context, q IncidentQuer
 		op = ">"
 	}
 	if q.Sort == "longest" {
-		expr = fmt.Sprintf("(COALESCE(closed_ns, %d) - opened_ns)", c.AsOf)
+		expr = fmt.Sprintf("(CASE WHEN closed_ns IS NULL OR closed_ns > %d THEN %d ELSE closed_ns END - opened_ns)", c.AsOf, c.AsOf)
 	}
 	if q.Sort == "attention" {
 		rank := "CASE WHEN closed_ns IS NULL THEN 0 ELSE 1 END"
@@ -359,7 +378,7 @@ func (s *AdaptiveRoutingStore) ListIncidents(ctx context.Context, q IncidentQuer
 		}
 		if q.Sort == "longest" {
 			end := c.AsOf
-			if last.ClosedNS != nil {
+			if last.ClosedNS != nil && *last.ClosedNS < end {
 				end = *last.ClosedNS
 			}
 			c.Value = end - last.OpenedNS

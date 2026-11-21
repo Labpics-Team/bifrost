@@ -1,5 +1,33 @@
 {
 	"adaptiveRouting": {
+		"summaries": {
+			"held": "El proveedor rechazó esta clave.",
+			"recovering": "La ruta está recuperando su parte del tráfico.",
+			"healthy": "La ruta vuelve a funcionar con normalidad.",
+			"failed": "La ruta ha fallado repetidamente.",
+			"degraded": "La ruta está devolviendo errores.",
+			"no_longer_observed": "La ruta ya no se observa. No se ha confirmado la recuperación.",
+			"waiting_for_traffic": "La recuperación está a la espera de tráfico real."
+		},
+		"actions": {
+			"held": "La clave permanece retenida hasta que una solicitud real la compruebe.",
+			"check_credentials": "Revise la credencial o la cuota en los ajustes del proveedor, o libere la clave para comprobarla ahora.",
+			"recovering": "Las solicitudes reales exitosas restablecen su parte del tráfico.",
+			"failed": "Las alternativas en buen estado reciben tráfico mientras se comprueba esta ruta.",
+			"degraded": "Su parte del tráfico se reduce hasta que mejoren las observaciones."
+		},
+		"eventMessages": {
+			"configuration_changed": "La configuración cambió; la ruta anterior ya no se observa.",
+			"manual_release": "Un operador levantó la retención; las solicitudes reales deben confirmar la recuperación.",
+			"check_started": "Una solicitud real comprobó la clave retenida; su resultado se registra en esta transición.",
+			"hold_released": "La comprobación mostró que el rechazo anterior ya no se aplica.",
+			"held_again": "La comprobación no confirmó la recuperación; la clave sigue retenida.",
+			"held": "El proveedor rechazó la clave; el tráfico habitual la omite.",
+			"telemetry_removed": "La ruta ya no se observa tras eliminar su telemetría o quedar inactiva.",
+			"history_disabled": "El historial de estado opcional se desactivó antes de confirmar la recuperación.",
+			"waiting_for_traffic": "Ningún tráfico real ha confirmado la recuperación durante una hora.",
+			"state_changed": "El estado observado de la ruta cambió a {{state}}."
+		},
 		"providerSelection": "Selección adaptativa de proveedores",
 		"providerSelectionHelp": "Elegir proveedores por estado y latencia cuando la solicitud no indica uno. Los proveedores y alternativas indicados se conservan salvo que se permita cambiarlos abajo. Al desactivarlo no se modifican proveedores ni alternativas.",
 		"keySelection": "Selección adaptativa de claves",
