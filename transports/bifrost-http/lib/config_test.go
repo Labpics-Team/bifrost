@@ -27008,11 +27008,14 @@ func TestGrantableRelayNames(t *testing.T) {
 // the full LoadConfig a restarted pod runs, and returns each key's relay grants as stored.
 func loadRelayGrantsConfig(t *testing.T, dir, sourceOfTruth, relays, virtualKeys string) map[string][]string {
 	t.Helper()
+	frameworkJSON, err := json.Marshal(catalogFixtureConfig())
+	require.NoError(t, err)
 	sot := ""
 	if sourceOfTruth != "" {
 		sot = `"source_of_truth":"` + sourceOfTruth + `",`
 	}
 	raw := `{` + sot + `
+		"framework": ` + string(frameworkJSON) + `,
 		"client": {"initial_pool_size": 10, "allowed_origins": ["*"]},
 		"config_store": {"enabled": true, "type": "sqlite", "config": {"path": ` + fmt.Sprintf("%q", filepath.Join(dir, "config.db")) + `}},
 		` + relays + `

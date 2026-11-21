@@ -2,6 +2,7 @@ package lib
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,9 +14,9 @@ import (
 // not rerun the migration chain and initial catalog seeding for every case.
 // Each test gets an independent file copy; subsequent LoadConfig calls still
 // exercise normal opening, config reconciliation, and catalog initialization.
-// The catalog HTTP responses are fixed by catalogfixture_test.go.
+// The catalog URLs point to the local server in catalogfixture_test.go.
 //
-// Build without config.json so no test-specific providers, credentials, or
+// Configure only those URLs so no test-specific providers, credentials, or
 // governance settings leak into another test's initial state.
 
 var (
@@ -47,9 +48,16 @@ func buildTemplateConfigDB() {
 	// migration chain - is what dominates a first boot. A template missing it
 	// would leave every test paying for it again.
 	//
-	// Deliberately no config.json: the template must hold exactly what a default
-	// boot produces and nothing else, or tests asserting fresh-start defaults
-	// would read whatever config the template was built from instead.
+	// Every unrelated default remains native; only the feed locations differ.
+	data, err := json.Marshal(&ConfigData{FrameworkConfig: catalogFixtureConfig()})
+	if err != nil {
+		templateConfigDBErr = err
+		return
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), data, 0o644); err != nil {
+		templateConfigDBErr = err
+		return
+	}
 	config, err := LoadConfig(ctx, dir)
 	if err != nil {
 		templateConfigDBErr = err
