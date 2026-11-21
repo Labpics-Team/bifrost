@@ -55,7 +55,7 @@ test('real requests produce durable incidents and native request logs across res
 
   await page.goto(`${gateway}/workspace/adaptive-routing/incidents?incident=${incident.id}`)
   await expect(page.getByTestId('adaptive-incident-detail')).toBeVisible()
-  await expect(page.getByTestId('adaptive-incident-cause').first()).toHaveText('Rate limit reached')
+  await expect(page.getByTestId('adaptive-incident-row').filter({ hasText: 'Failure key' }).getByTestId('adaptive-incident-cause')).toHaveText('Rate limit reached')
   await expect(page.getByTestId('adaptive-incident-detail').locator('dd').filter({ hasText: 'Rate limit reached' })).toBeVisible()
   await expect(page.getByTestId('adaptive-incident-events')).toContainText(/./)
   await page.screenshot({ path: testInfo.outputPath('durable-incident.png'), fullPage: true })
@@ -124,7 +124,7 @@ test('real requests produce durable incidents and native request logs across res
   await expect(page.getByTestId('adaptive-incident-detail').locator('dd').filter({ hasText: 'Rate limit reached' })).toBeVisible()
   await expect(page.getByTestId('adaptive-incident-event-cause').first()).toContainText('Rate limit reached')
   await page.setViewportSize({ width: 390, height: 844 })
-  await page.screenshot({ path: testInfo.outputPath('incident-mobile.png'), fullPage: true })
+  await page.screenshot({ path: testInfo.outputPath('incident-mobile.png'), fullPage: true, animations: 'disabled' })
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy()
   expect(javascriptErrors).toEqual([])
   await testInfo.attach('runtime-receipt', { body: JSON.stringify({ refusedId, healthyId, streamId, incident: resolved, fixture: await (await page.request.get(`${fixtureURL}/_fixture/status`)).json() }, null, 2), contentType: 'application/json' })
