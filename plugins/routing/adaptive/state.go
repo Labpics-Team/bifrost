@@ -171,6 +171,21 @@ func (c *Controller) incidentLocked(id routeID) *Incident {
 	return nil
 }
 
+// Each scope has one mutable incident copy within a lifecycle transaction.
+// A change of refusal class can visit that same scope more than once.
+func (t *transition) incidentLocked(c *Controller, id routeID) *Incident {
+	for _, i := range t.incidents {
+		if incidentRoute(i) == id {
+			return i
+		}
+	}
+	i := c.incidentLocked(id)
+	if i != nil {
+		t.incidents = append(t.incidents, i)
+	}
+	return i
+}
+
 func (c *Controller) newIncidentLocked(id routeID, name string, now time.Time, request string) *Incident {
 	scope := "key_model"
 	if id.Model == "" {
@@ -286,7 +301,7 @@ func (c *Controller) completeConditions(a *attempt, failure schemas.FailureClass
 			if failure != "" && h.HoldUntil.After(a.start) && a.probeID == 0 {
 				return transition{}
 			}
-			i := c.incidentLocked(h.routeID)
+			i := t.incidentLocked(c, h.routeID)
 			if i == nil {
 				return transition{}
 			}
@@ -295,7 +310,6 @@ func (c *Controller) completeConditions(a *attempt, failure schemas.FailureClass
 			if failure == "" || failure.IsPerKey() && failure != h.HoldClass {
 				t.remove = append(t.remove, h)
 				setIncidentState(i, "recovering", now, request)
-				t.incidents = append(t.incidents, i)
 				t.events = append(t.events, incidentEvent(i, "hold_released", request, "The check showed the previous refusal no longer applies.", now))
 				t.publish = func() { r.Recovering = true; r.Recoveries = 0 }
 			} else {
@@ -315,7 +329,6 @@ func (c *Controller) completeConditions(a *attempt, failure schemas.FailureClass
 				setIncidentState(i, "held", now, request)
 				t.remove = append(t.remove, h)
 				t.upsert = append(t.upsert, &copy)
-				t.incidents = append(t.incidents, i)
 				t.events = append(t.events, incidentEvent(i, "held_again", request, "The check did not establish recovery; the key remains held.", now))
 				return t
 			}
@@ -325,15 +338,15 @@ func (c *Controller) completeConditions(a *attempt, failure schemas.FailureClass
 			if failure.CoversAllModels() {
 				id.Model = ""
 			}
-			i := c.incidentLocked(id)
+			i := t.incidentLocked(c, id)
 			if i == nil {
 				i = c.newIncidentLocked(id, r.KeyName, now, request)
+				t.incidents = append(t.incidents, i)
 			}
 			i.FailureClass = string(failure)
 			setIncidentState(i, "held", now, request)
 			next := &condition{routeID: id, ID: uuid.NewString(), KeyRevision: r.KeyRevision, IncidentID: i.ID, KeyName: r.KeyName, HoldUntil: now.Add(holdDuration(failure, 1, retryAfter)), HeldAt: now, Rung: 1, HoldClass: failure}
 			t.upsert = append(t.upsert, next)
-			t.incidents = append(t.incidents, i)
 			t.events = append(t.events, incidentEvent(i, "held", request, "The provider refused the key; ordinary traffic skips it.", now))
 		}
 		return t
@@ -373,7 +386,11 @@ func (c *Controller) updateHealthIncident(r *route, request string, now time.Tim
 				c.incidents[incidentRoute(i)] = i
 				continue
 			}
-			i.FailureClass = string(r.FailureClass)
+			// Health recovery is evidence about the outcome, not a new cause.
+			// Keep each scope's recorded refusal when several scopes recover together.
+			if i.FailureClass == "" {
+				i.FailureClass = string(r.FailureClass)
+			}
 			setIncidentState(i, state, now, request)
 			t.incidents = append(t.incidents, i)
 			t.events = append(t.events, incidentEvent(i, "state_changed", request, fmt.Sprintf("Observed route state changed to %s.", state), now))

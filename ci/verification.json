@@ -188,6 +188,8 @@
       "TestAdaptiveDueKeyCheckDoesNotBlockHealthyTraffic",
       "TestAdaptiveDueProviderCheckDoesNotBlockHealthyTraffic",
       "TestAdaptiveScopeChangeResolvesAllRecoveredIncidents",
+      "TestAdaptiveSameScopeRefusalKeepsCompletedCheck",
+      "TestAdaptiveResolvedIncidentKeepsFailureCauseAfterRestart",
       "TestAdaptiveProbeAdmissionIsVolatileUntilCompletion",
       "TestAdaptiveFrozenRevisionDetectsNestedSecretRotation",
       "TestAdaptiveHistoryOffKeepsDurableConditions",

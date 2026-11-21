@@ -394,6 +394,13 @@ func TestAdaptiveScopeChangeResolvesAllRecoveredIncidents(t *testing.T) {
 					continue
 				}
 				seen[incident.Scope] = true
+				cause := string(schemas.FailureClassRateLimit)
+				if incident.Scope == "key" {
+					cause = string(schemas.FailureClassCredential)
+				}
+				if incident.FailureClass != cause {
+					t.Fatalf("recovery replaced scope's historical cause: %+v", incident)
+				}
 				if incident.Status != "resolved" || incident.ClosedAt == nil || incident.ResolvedAt == nil {
 					t.Fatalf("recovered scope remained open: %+v", incident)
 				}
@@ -402,6 +409,79 @@ func TestAdaptiveScopeChangeResolvesAllRecoveredIncidents(t *testing.T) {
 				t.Fatalf("lost a related incident: %+v", seen)
 			}
 		})
+	}
+}
+
+func TestAdaptiveSameScopeRefusalKeepsCompletedCheck(t *testing.T) {
+	c, now := providerController()
+	s := newSettingsStore(t)
+	attachStore(t, c, s)
+	observe(c, "p1", "m", "a", responseError(401))
+	*now = now.Add(time.Minute)
+	ctx := testContext()
+	key, err := c.SelectKey(ctx, testKeys, "p1", "m")
+	if err != nil || key.ID != "a" {
+		t.Fatalf("due check was not selected: %s %v", key.ID, err)
+	}
+	observeWithContext(c, ctx, "p1", "m", "a", responseError(402))
+	loaded, _ := providerController()
+	attachStore(t, loaded, s)
+	if err := loaded.Restore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	page, err := loaded.ListIncidents(context.Background(), IncidentQuery{Scope: "key"})
+	if err != nil || len(page.Incidents) != 1 {
+		t.Fatalf("scope changed its incident identity: %+v %v", page, err)
+	}
+	i := page.Incidents[0]
+	if i.Checks != 1 || i.FailureClass != string(schemas.FailureClassQuota) || i.ClosedAt != nil {
+		t.Fatalf("same-scope transition lost its completed check: %+v", i)
+	}
+	detail, err := loaded.GetIncident(context.Background(), i.ID, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := 0
+	for _, event := range detail.Events {
+		if event.Kind == "check_started" {
+			checks++
+		}
+	}
+	if checks != 1 {
+		t.Fatalf("expected one recorded check, got %d", checks)
+	}
+}
+
+func TestAdaptiveResolvedIncidentKeepsFailureCauseAfterRestart(t *testing.T) {
+	c, _ := providerController()
+	s := newSettingsStore(t)
+	attachStore(t, c, s)
+	observe(c, "p1", "m", "a", responseError(429))
+	if err := c.Release(context.Background(), "p1", "a", "m"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 30; i++ {
+		observe(c, "p1", "m", "a", nil)
+	}
+	if err := c.Checkpoint(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, _ := providerController()
+	attachStore(t, loaded, s)
+	if err := loaded.Restore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	page, err := loaded.ListIncidents(context.Background(), IncidentQuery{Scope: "key_model"})
+	if err != nil || len(page.Incidents) != 1 {
+		t.Fatalf("resolved history lost: %+v %v", page, err)
+	}
+	i := page.Incidents[0]
+	if i.Status != "resolved" || i.ClosedAt == nil || i.FailureClass != string(schemas.FailureClassRateLimit) {
+		t.Fatalf("resolved incident lost its historical cause: %+v", i)
+	}
+	detail, err := loaded.GetIncident(context.Background(), i.ID, "", 1)
+	if err != nil || detail.Incident.FailureClass != string(schemas.FailureClassRateLimit) {
+		t.Fatalf("detail cause depends on the event page: %+v %v", detail, err)
 	}
 }
 

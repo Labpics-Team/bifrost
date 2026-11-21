@@ -152,6 +152,8 @@ Key/provider removal ends the old observation as **No longer observed**;
 `closed_at` records that end, while `resolved_at` is set only for confirmed
 recovery. Maintenance deletes closed incidents and their events after the
 configured retention, in batches of at most 1,000. Open incidents are retained.
+The incident retains its recorded refusal cause after recovery; showing that
+cause does not depend on retaining the request log or loading a particular event page.
 If a model refusal changes into a whole-key refusal, or the reverse, successful
 requests advance all related open incidents together. A configuration edit
 still ends the old observation without claiming recovery.
