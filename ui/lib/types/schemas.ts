@@ -523,6 +523,9 @@ export const isHTTPSOrLoopbackURL = (raw: string): boolean => {
 	return hasHTTPSOrLoopbackScheme(raw);
 };
 
+// Keep the form permissive; Go net/mail is authoritative for stored addresses.
+const oidcEmailSchema = z.email({ pattern: z.regexes.unicodeEmail });
+
 export const oidcConfigSchema = z
 	.object({
 		enabled: z.boolean(),
@@ -551,7 +554,7 @@ export const oidcConfigSchema = z
 		if (config.allowed_subjects?.some((subject) => !subject.trim())) {
 			ctx.addIssue({ code: "custom", path: ["allowed_subjects"], message: i18n.t("validation.fieldRequired") });
 		}
-		if (config.allowed_emails?.some((email) => !z.email().safeParse(email).success)) {
+		if (config.allowed_emails?.some((email) => !oidcEmailSchema.safeParse(email).success)) {
 			ctx.addIssue({ code: "custom", path: ["allowed_emails"], message: i18n.t("validation.validEmail") });
 		}
 	});

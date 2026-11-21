@@ -56,4 +56,20 @@ describe("oidcConfigSchema", () => {
 	it("allows OIDC to be disabled before the form is complete", () => {
 		expect(oidcConfigSchema.safeParse({ enabled: false, issuer_url: "", client_id: "", redirect_url: "" }).success).toBe(true);
 	});
+	it.each(["ops!admin@example.com", "team$ops@example.com", "user@localhost", "почта@пример.рф"])(
+		"allows other settings to change while retaining the server-supported address %s",
+		(email) => {
+			const result = oidcConfigSchema.safeParse({ ...config, client_id: "updated-client", allowed_emails: [email] });
+			expect(result.success).toBe(true);
+			expect(result.data?.allowed_emails).toEqual([email]);
+		},
+	);
+	it.each(["", "invalid-email", "a@@example.com", "Name <user@example.com>", "user@example.com trailing", "user@", "@example.com"])(
+		"reports an inline email error for %s",
+		(email) => {
+			const result = oidcConfigSchema.safeParse({ ...config, allowed_emails: [email] });
+			expect(result.success).toBe(false);
+			expect(result.error?.flatten().fieldErrors.allowed_emails).toHaveLength(1);
+		},
+	);
 });
