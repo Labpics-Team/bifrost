@@ -3,6 +3,8 @@ package handlers
 import (
 	"context"
 	"crypto/subtle"
+	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -30,13 +32,14 @@ type oidcFlow struct {
 // OIDC is used only to establish an ordinary dashboard session. Transient
 // authorization requests are single-use and bounded; restarts cancel them.
 type oidcSignIn struct {
-	mu         sync.Mutex
-	flows      map[string]oidcFlow
-	providerMu sync.Mutex
-	provider   *oidc.Provider
-	issuer     string
-	discovered time.Time
-	client     *http.Client
+	mu           sync.Mutex
+	flows        map[string]oidcFlow
+	providerMu   sync.Mutex
+	provider     *oidc.Provider
+	issuer       string
+	discovered   time.Time
+	discoveryErr error
+	client       *http.Client
 }
 
 func newOIDCSignIn() *oidcSignIn {
@@ -46,17 +49,93 @@ func newOIDCSignIn() *oidcSignIn {
 func (s *oidcSignIn) getProvider(issuer string) (*oidc.Provider, error) {
 	s.providerMu.Lock()
 	defer s.providerMu.Unlock()
-	if s.provider != nil && s.issuer == issuer && time.Since(s.discovered) < time.Hour {
-		return s.provider, nil
+	if s.issuer == issuer {
+		if s.provider != nil && time.Since(s.discovered) < time.Hour {
+			return s.provider, nil
+		}
+		// Share a failed attempt with its waiters instead of making each one
+		// hold the lock for another network timeout during an issuer outage.
+		if s.discoveryErr != nil && time.Since(s.discovered) < 5*time.Second {
+			return nil, s.discoveryErr
+		}
 	}
 	// The HTTP client's timeout also bounds JWKS requests made later by the
 	// cached provider; a discovery-only context must not outlive its cancellation.
-	provider, err := oidc.NewProvider(oidc.ClientContext(context.Background(), s.client), issuer)
-	if err != nil {
-		return nil, err
+	provider, err := oidc.NewProvider(oidc.ClientContext(context.Background(), s.clientForIssuer(issuer)), issuer)
+	if err == nil {
+		var metadata struct {
+			JWKSURL string `json:"jwks_uri"`
+		}
+		err = provider.Claims(&metadata)
+		if err == nil {
+			for _, endpoint := range []string{provider.Endpoint().AuthURL, provider.Endpoint().TokenURL, metadata.JWKSURL} {
+				u, parseErr := url.Parse(endpoint)
+				if parseErr != nil || !allowedOIDCEndpoint(u, oidcLoopbackHTTP(issuer)) {
+					err = fmt.Errorf("OIDC provider endpoints require HTTPS (HTTP is allowed only with a loopback development issuer)")
+					break
+				}
+			}
+		}
 	}
-	s.provider, s.issuer, s.discovered = provider, issuer, time.Now()
-	return provider, nil
+	if err != nil {
+		provider = nil
+	}
+	s.provider, s.discoveryErr, s.issuer, s.discovered = provider, err, issuer, time.Now()
+	return provider, err
+}
+
+func oidcLoopbackHTTP(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "http" && allowedOIDCEndpoint(u, true)
+}
+
+func allowedOIDCEndpoint(u *url.URL, allowLoopbackHTTP bool) bool {
+	if u == nil || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
+		return false
+	}
+	if u.Scheme == "https" {
+		return true
+	}
+	ip := net.ParseIP(u.Hostname())
+	return allowLoopbackHTTP && u.Scheme == "http" &&
+		(strings.EqualFold(u.Hostname(), "localhost") || (ip != nil && ip.IsLoopback()))
+}
+
+type oidcTransport struct {
+	base              http.RoundTripper
+	allowLoopbackHTTP bool
+}
+
+func (t oidcTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !allowedOIDCEndpoint(req.URL, t.allowLoopbackHTTP) {
+		return nil, fmt.Errorf("OIDC request requires HTTPS")
+	}
+	return t.base.RoundTrip(req)
+}
+
+// The same policy covers discovery, code exchange, JWKS, and every redirect.
+// Copy the client so test/proxy transports and its timeout remain intact.
+func (s *oidcSignIn) clientForIssuer(issuer string) *http.Client {
+	client := *s.client
+	base := client.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	client.Transport = oidcTransport{base: base, allowLoopbackHTTP: oidcLoopbackHTTP(issuer)}
+	checkRedirect := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) > 0 && via[len(via)-1].URL.Scheme == "https" && req.URL.Scheme != "https" {
+			return fmt.Errorf("OIDC redirect cannot downgrade HTTPS")
+		}
+		if checkRedirect != nil {
+			return checkRedirect(req, via)
+		}
+		if len(via) >= 10 {
+			return fmt.Errorf("stopped after 10 redirects")
+		}
+		return nil
+	}
+	return &client
 }
 
 func oidcOAuthConfig(c *configstore.OIDCConfig, p *oidc.Provider) oauth2.Config {
@@ -78,10 +157,10 @@ func safeOIDCGoto(path string) string {
 	return "/workspace"
 }
 
-func setOIDCFlowCookie(ctx *fasthttp.RequestCtx, value string, expires time.Time, secure bool) {
+func setOIDCFlowCookie(ctx *fasthttp.RequestCtx, state, value string, expires time.Time, secure bool) {
 	cookie := fasthttp.AcquireCookie()
 	defer fasthttp.ReleaseCookie(cookie)
-	cookie.SetKey(oidcFlowCookie)
+	cookie.SetKey(oidcFlowCookie + "_" + state)
 	cookie.SetValue(value)
 	cookie.SetPath("/")
 	cookie.SetHTTPOnly(true)
@@ -136,7 +215,7 @@ func (h *SessionHandler) oidcLogin(ctx *fasthttp.RequestCtx) {
 	}
 	h.oidc.flows[state] = flow
 	h.oidc.mu.Unlock()
-	setOIDCFlowCookie(ctx, flow.cookie, flow.expires, strings.HasPrefix(flow.config.RedirectURL, "https://"))
+	setOIDCFlowCookie(ctx, state, flow.cookie, flow.expires, strings.HasPrefix(flow.config.RedirectURL, "https://"))
 	conf := oidcOAuthConfig(flow.config, provider)
 	markLocationExternal(ctx)
 	ctx.Redirect(conf.AuthCodeURL(state, oauth2.S256ChallengeOption(flow.verifier), oidc.Nonce(flow.nonce)), fasthttp.StatusSeeOther)
@@ -144,9 +223,13 @@ func (h *SessionHandler) oidcLogin(ctx *fasthttp.RequestCtx) {
 
 func (h *SessionHandler) oidcCallback(ctx *fasthttp.RequestCtx) {
 	ctx.Response.Header.Set("Cache-Control", "no-store")
-	state, cookie := string(ctx.QueryArgs().Peek("state")), string(ctx.Request.Header.Cookie(oidcFlowCookie))
+	state := string(ctx.QueryArgs().Peek("state"))
 	h.oidc.mu.Lock()
 	flow, found := h.oidc.flows[state]
+	var cookie string
+	if found {
+		cookie = string(ctx.Request.Header.Cookie(oidcFlowCookie + "_" + state))
+	}
 	valid := found && cookie != "" && subtle.ConstantTimeCompare([]byte(cookie), []byte(flow.cookie)) == 1
 	if valid {
 		delete(h.oidc.flows, state)
@@ -156,11 +239,11 @@ func (h *SessionHandler) oidcCallback(ctx *fasthttp.RequestCtx) {
 		oidcFailure(ctx, "")
 		return
 	}
+	setOIDCFlowCookie(ctx, state, "", time.Now().Add(-time.Hour), strings.HasPrefix(flow.config.RedirectURL, "https://"))
 	if time.Now().After(flow.expires) {
 		oidcFailure(ctx, flow.gotoPath)
 		return
 	}
-	setOIDCFlowCookie(ctx, "", time.Now().Add(-time.Hour), strings.HasPrefix(flow.config.RedirectURL, "https://"))
 	if h.configStore == nil || len(ctx.QueryArgs().Peek("error")) > 0 || len(ctx.QueryArgs().Peek("code")) == 0 {
 		oidcFailure(ctx, flow.gotoPath)
 		return
@@ -170,7 +253,7 @@ func (h *SessionHandler) oidcCallback(ctx *fasthttp.RequestCtx) {
 		oidcFailure(ctx, flow.gotoPath)
 		return
 	}
-	networkCtx, cancel := context.WithTimeout(oidc.ClientContext(ctx, h.oidc.client), 10*time.Second)
+	networkCtx, cancel := context.WithTimeout(oidc.ClientContext(ctx, h.oidc.clientForIssuer(flow.config.IssuerURL)), 10*time.Second)
 	defer cancel()
 	conf := oidcOAuthConfig(flow.config, flow.provider)
 	token, err := conf.Exchange(networkCtx, string(ctx.QueryArgs().Peek("code")), oauth2.VerifierOption(flow.verifier))

@@ -94,6 +94,7 @@ export default function LoginView() {
 					)}
 					{authState?.oidc_enabled && (
 						<Button
+							data-testid="oidc-signin-button"
 							className="h-9 w-full text-sm"
 							onClick={() => {
 								const goto = getLoginGotoFromSearch(window.location.search) ?? DEFAULT_POST_LOGIN_PATH;

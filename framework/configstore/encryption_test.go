@@ -33,6 +33,7 @@ func setupEncryptionTestStore(t testing.TB) (*RDBConfigStore, *gorm.DB) {
 	require.NoError(t, err)
 
 	err = db.AutoMigrate(
+		&tables.TableGovernanceConfig{},
 		&tables.TableKey{},
 		&tables.TableProvider{},
 		&tables.TableMCPClient{},

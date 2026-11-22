@@ -65,7 +65,6 @@ func TestLoadConfigServesCatalogFeedsFromFixture(t *testing.T) {
 		"openai": makeProviderConfigWithNetwork("openai-key-1", "sk-test-123", "https://api.openai.com"),
 	}
 	data := makeConfigDataWithProvidersAndDir(providers, tempDir)
-	data.FrameworkConfig = catalogFixtureConfig()
 	createConfigFile(t, tempDir, data)
 
 	before := make(map[string]int64, len(catalogFixtureFeeds))

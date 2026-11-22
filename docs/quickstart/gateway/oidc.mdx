@@ -102,8 +102,10 @@ Logging out invalidates the Bifrost session; it does not sign the user out of
 the identity provider or other applications.
 
 Pending sign-ins expire after ten minutes and are held in process memory.
-Restarting Bifrost requires starting sign-in again. For multiple replicas, route
-the login and callback to the same replica using ingress session affinity.
+Restarting Bifrost requires starting sign-in again. The Labpics deployment uses
+one active process, Recreate updates and SQLite on RWO storage. Session affinity
+does not make independently active replicas safe for adaptive routing; retain
+the single-writer deployment described in [adaptive routing](/features/adaptive-routing).
 There are at most 4096 pending sign-ins per process.
 
 OIDC dashboard login does not grant an inference key and does not change

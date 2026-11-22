@@ -3098,6 +3098,7 @@ func makeConfigDataWithProviders(providers map[string]configstore.ProviderConfig
 func makeConfigDataWithProvidersAndDir(providers map[string]configstore.ProviderConfig, tempDir string) *ConfigData {
 	dbPath := filepath.Join(tempDir, "config.db")
 	return &ConfigData{
+		FrameworkConfig: catalogFixtureConfig(),
 		Client: &configstore.ClientConfig{
 			InitialPoolSize:      10,
 			EnableLogging:        new(true),
@@ -3124,6 +3125,7 @@ func makeConfigDataWithVirtualKeys(providers map[string]configstore.ProviderConf
 func makeConfigDataWithVirtualKeysAndDir(providers map[string]configstore.ProviderConfig, vks []tables.TableVirtualKey, tempDir string) *ConfigData {
 	dbPath := filepath.Join(tempDir, "config.db")
 	return &ConfigData{
+		FrameworkConfig: catalogFixtureConfig(),
 		Client: &configstore.ClientConfig{
 			InitialPoolSize:      10,
 			EnableLogging:        new(true),
@@ -3169,8 +3171,9 @@ func makeConfigDataFullWithDir(client *configstore.ClientConfig, providers map[s
 				Path: dbPath,
 			},
 		},
-		Providers:  providers,
-		Governance: governance,
+		Providers:       providers,
+		Governance:      governance,
+		FrameworkConfig: catalogFixtureConfig(),
 	}
 }
 

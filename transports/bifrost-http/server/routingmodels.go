@@ -2,7 +2,6 @@ package server
 
 import (
 	"sort"
-	"strings"
 
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
@@ -59,11 +58,11 @@ func (s *BifrostHTTPServer) ListAllModels(ctx *schemas.BifrostContext, req *sche
 	return response.ApplyPagination(req.PageSize, req.PageToken), nil
 }
 
-// Native list-model helpers declare fault attribution where the provider poll
-// fails. Provider metadata alone is not evidence: core also adds it to policy
-// short-circuits. Do not infer provenance from a status code here.
+// Core marks errors returned by Provider.ListModels before post-hooks. Neither
+// provider metadata nor fault classification distinguishes that origin from a
+// policy short-circuit or another request failure.
 func isProviderDiscoveryFailure(err *schemas.BifrostError) bool {
-	return strings.HasPrefix(string(err.ExtraFields.ErrorType), "provider_")
+	return err.ExtraFields.ProviderModelDiscoveryFailure
 }
 
 // ListRoutingModels admits a catalog read through the same governance hook as

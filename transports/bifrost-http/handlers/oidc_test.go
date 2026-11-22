@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -72,20 +74,34 @@ func TestOIDCSignIn(t *testing.T) {
 	SetLogger(&mockLogger{})
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
-	for _, test := range []string{"success", "verified-email", "cookie", "state", "nonce", "audience", "issuer", "expiry", "signature", "unapproved", "unverified-email", "reconfigured", "reconfigured-on-insert", "expired-flow", "provider-error", "token-error", "encrypted-session"} {
+	for _, test := range []string{"success", "https", "parallel-tabs", "equivalent-policy", "verified-email", "cookie", "state", "nonce", "audience", "issuer", "expiry", "signature", "unapproved", "unverified-email", "reconfigured", "reconfigured-on-insert", "expired-flow", "provider-error", "token-error", "token-redirect", "keys-redirect", "encrypted-session"} {
 		t.Run(test, func(t *testing.T) {
 			lib.SetBasePath("/bifrost")
 			t.Cleanup(func() { lib.SetBasePath("") })
 			var issuer *httptest.Server
 			var nonce, challenge string
-			issuer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var insecureRequests atomic.Int32
+			insecure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				insecureRequests.Add(1)
+				http.Error(w, "unexpected plaintext request", http.StatusBadRequest)
+			}))
+			defer insecure.Close()
+			issuer = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				switch r.URL.Path {
 				case "/.well-known/openid-configuration":
 					json.NewEncoder(w).Encode(map[string]any{"issuer": issuer.URL, "authorization_endpoint": issuer.URL + "/authorize", "token_endpoint": issuer.URL + "/token", "jwks_uri": issuer.URL + "/keys", "id_token_signing_alg_values_supported": []string{"RS256"}})
 				case "/keys":
+					if test == "keys-redirect" {
+						http.Redirect(w, r, insecure.URL+"/keys", http.StatusTemporaryRedirect)
+						return
+					}
 					json.NewEncoder(w).Encode(map[string]any{"keys": []any{map[string]any{"kty": "RSA", "kid": "test", "alg": "RS256", "use": "sig", "n": base64.RawURLEncoding.EncodeToString(key.N.Bytes()), "e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.E)).Bytes())}}})
 				case "/token":
+					if test == "token-redirect" {
+						http.Redirect(w, r, insecure.URL+"/token", http.StatusTemporaryRedirect)
+						return
+					}
 					if test == "token-error" {
 						http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
 						return
@@ -125,6 +141,11 @@ func TestOIDCSignIn(t *testing.T) {
 					http.NotFound(w, r)
 				}
 			}))
+			if test == "https" || test == "token-redirect" || test == "keys-redirect" {
+				issuer.StartTLS()
+			} else {
+				issuer.Start()
+			}
 			defer issuer.Close()
 			conf := &configstore.OIDCConfig{Enabled: true, IssuerURL: issuer.URL, ClientID: "bifrost", ClientSecret: schemas.NewSecretVar("test-secret"), RedirectURL: "https://ai.example/bifrost/api/session/oidc/callback", AllowedSubjects: []string{"admin"}}
 			if test == "verified-email" || test == "unverified-email" {
@@ -149,6 +170,8 @@ func TestOIDCSignIn(t *testing.T) {
 				}
 			}
 			h := NewSessionHandler(store, nil)
+			h.oidc.client = issuer.Client()
+			h.oidc.client.Timeout = 10 * time.Second
 			authMiddleware, err := InitAuthMiddleware(store, nil, nil, "")
 			require.NoError(t, err)
 			routes := router.New()
@@ -178,11 +201,42 @@ func TestOIDCSignIn(t *testing.T) {
 			nonce, challenge = authorize.Query().Get("nonce"), authorize.Query().Get("code_challenge")
 			state := authorize.Query().Get("state")
 			flowCookie := &fasthttp.Cookie{}
-			flowCookie.SetKey(oidcFlowCookie)
+			flowCookie.SetKey(oidcFlowCookie + "_" + state)
 			require.True(t, login.Response.Header.Cookie(flowCookie))
 			require.True(t, flowCookie.Secure())
 			require.True(t, flowCookie.HTTPOnly())
 			cookie := string(flowCookie.Value())
+			if test == "parallel-tabs" {
+				firstNonce, firstChallenge := nonce, challenge
+				secondLogin := &fasthttp.RequestCtx{}
+				secondLogin.Request.SetRequestURI("https://ai.example/api/session/oidc/login")
+				secondLogin.Request.Header.SetCookie(string(flowCookie.Key()), cookie)
+				routes.Handler(secondLogin)
+				require.Equal(t, fasthttp.StatusSeeOther, secondLogin.Response.StatusCode())
+				secondAuthorize, err := url.Parse(string(secondLogin.Response.Header.Peek("Location")))
+				require.NoError(t, err)
+				secondState := secondAuthorize.Query().Get("state")
+				nonce, challenge = secondAuthorize.Query().Get("nonce"), secondAuthorize.Query().Get("code_challenge")
+				secondCookie := &fasthttp.Cookie{}
+				secondCookie.SetKey(oidcFlowCookie + "_" + secondState)
+				require.True(t, secondLogin.Response.Header.Cookie(secondCookie))
+				require.NotEqual(t, string(flowCookie.Key()), string(secondCookie.Key()))
+				secondCallback := &fasthttp.RequestCtx{}
+				secondCallback.Init(&fasthttp.Request{}, nil, nil)
+				secondCallback.Request.SetRequestURI("https://ai.example/api/session/oidc/callback?state=" + secondState + "&code=code")
+				secondCallback.Request.Header.SetCookie(string(flowCookie.Key()), cookie)
+				secondCallback.Request.Header.SetCookie(string(secondCookie.Key()), string(secondCookie.Value()))
+				routes.Handler(secondCallback)
+				require.Equal(t, "/bifrost/workspace", string(secondCallback.Response.Header.Peek("Location")))
+				require.True(t, secondCallback.Response.Header.Cookie(secondCookie))
+				require.Empty(t, secondCookie.Value(), "callback consumes only its own browser binding")
+				require.False(t, secondCallback.Response.Header.Cookie(flowCookie), "the first tab's cookie must remain intact")
+				secondSession := &fasthttp.Cookie{}
+				secondSession.SetKey("token")
+				require.True(t, secondCallback.Response.Header.Cookie(secondSession))
+				require.NoError(t, store.DeleteSession(context.Background(), string(secondSession.Value())))
+				nonce, challenge = firstNonce, firstChallenge
+			}
 			if test == "cookie" {
 				cookie = "other"
 			}
@@ -193,6 +247,10 @@ func TestOIDCSignIn(t *testing.T) {
 				store.auth.OIDC = conf.Clone()
 				store.auth.OIDC.AllowedSubjects = []string{"other"}
 			}
+			if test == "equivalent-policy" {
+				store.auth.OIDC = conf.Clone()
+				store.auth.OIDC.AllowedSubjects = []string{"admin", "admin"}
+			}
 			if test == "expired-flow" {
 				flow := h.oidc.flows[state]
 				flow.expires = time.Now().Add(-time.Second)
@@ -202,15 +260,16 @@ func TestOIDCSignIn(t *testing.T) {
 			callback.Init(&fasthttp.Request{}, nil, nil)
 			callback.Request.SetRequestURI("https://ai.example/api/session/oidc/callback?state=" + state + "&code=code")
 			callback.Request.Header.Set("X-Forwarded-Proto", "https")
-			callback.Request.Header.SetCookie(oidcFlowCookie, cookie)
+			callback.Request.Header.SetCookie(oidcFlowCookie+"_"+state, cookie)
 			callback.QueryArgs().Set("goto", "/workspace/untrusted")
 			if test == "provider-error" {
 				callback.QueryArgs().Set("error", "access_denied")
 			}
 			routes.Handler(callback)
+			require.Zero(t, insecureRequests.Load(), "code exchange and JWKS redirects must never reach plaintext HTTP")
 			sessionCookie := &fasthttp.Cookie{}
 			sessionCookie.SetKey("token")
-			if test != "success" && test != "verified-email" && test != "encrypted-session" {
+			if test != "success" && test != "https" && test != "parallel-tabs" && test != "equivalent-policy" && test != "verified-email" && test != "encrypted-session" {
 				require.Empty(t, store.sessions)
 				require.False(t, callback.Response.Header.Cookie(sessionCookie))
 				failureURL, err := url.Parse(string(callback.Response.Header.Peek("Location")))
@@ -259,4 +318,77 @@ func TestOIDCGoto(t *testing.T) {
 		require.Equal(t, "/workspace", safeOIDCGoto(path), path)
 	}
 	require.Equal(t, "/oauth/consent?client_id=x", safeOIDCGoto("/oauth/consent?client_id=x"))
+}
+
+func TestOIDCDiscoverySharesFailureAndRetries(t *testing.T) {
+	var calls atomic.Int32
+	entered, release := make(chan struct{}), make(chan struct{})
+	var issuer *httptest.Server
+	issuer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"issuer": issuer.URL, "authorization_endpoint": issuer.URL + "/authorize", "token_endpoint": issuer.URL + "/token", "jwks_uri": issuer.URL + "/keys"})
+	}))
+	defer issuer.Close()
+	signIn := newOIDCSignIn()
+	const attempts = 12
+	errs := make(chan error, attempts)
+	var started sync.WaitGroup
+	started.Add(attempts)
+	for i := 0; i < attempts; i++ {
+		go func() {
+			started.Done()
+			_, err := signIn.getProvider(issuer.URL)
+			errs <- err
+		}()
+	}
+	started.Wait()
+	<-entered
+	close(release)
+	for i := 0; i < attempts; i++ {
+		require.Error(t, <-errs)
+	}
+	require.Equal(t, int32(1), calls.Load(), "concurrent failed logins must share one discovery attempt")
+	signIn.providerMu.Lock()
+	signIn.discovered = time.Now().Add(-6 * time.Second)
+	signIn.providerMu.Unlock()
+	provider, err := signIn.getProvider(issuer.URL)
+	require.NoError(t, err)
+	require.NotNil(t, provider)
+	cached, err := signIn.getProvider(issuer.URL)
+	require.NoError(t, err)
+	require.Same(t, provider, cached)
+	require.Equal(t, int32(2), calls.Load(), "recovery retries once, then caches the discovered provider")
+}
+
+func TestOIDCDiscoveryRequiresSecureEndpoints(t *testing.T) {
+	for _, field := range []string{"authorization_endpoint", "token_endpoint", "jwks_uri", "discovery_redirect"} {
+		t.Run(field, func(t *testing.T) {
+			var insecureRequests atomic.Int32
+			insecure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				insecureRequests.Add(1)
+			}))
+			defer insecure.Close()
+			var issuer *httptest.Server
+			issuer = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if field == "discovery_redirect" {
+					http.Redirect(w, r, insecure.URL, http.StatusFound)
+					return
+				}
+				metadata := map[string]any{"issuer": issuer.URL, "authorization_endpoint": issuer.URL + "/authorize", "token_endpoint": issuer.URL + "/token", "jwks_uri": issuer.URL + "/keys"}
+				metadata[field] = insecure.URL
+				json.NewEncoder(w).Encode(metadata)
+			}))
+			defer issuer.Close()
+			signIn := newOIDCSignIn()
+			signIn.client = issuer.Client()
+			_, err := signIn.getProvider(issuer.URL)
+			require.Error(t, err)
+			require.Zero(t, insecureRequests.Load(), "HTTPS issuers must not expose authorization data over HTTP, including loopback")
+		})
+	}
 }

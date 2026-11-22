@@ -838,7 +838,7 @@ func (bifrost *Bifrost) ListAllModels(ctx *schemas.BifrostContext, req *schemas.
 			// A fast discovery outage must not mask a later policy or unknown
 			// failure when every provider failed. Only explicitly attributed
 			// provider failures can support the transport's aliases-only result.
-			if firstError == nil || (strings.HasPrefix(string(firstError.ExtraFields.ErrorType), "provider_") && !strings.HasPrefix(string(result.err.ExtraFields.ErrorType), "provider_")) {
+			if firstError == nil || (firstError.ExtraFields.ProviderModelDiscoveryFailure && !result.err.ExtraFields.ProviderModelDiscoveryFailure) {
 				firstError = result.err
 			}
 		}
@@ -9430,6 +9430,7 @@ func (bifrost *Bifrost) handleProviderRequest(provider schemas.Provider, config 
 	case schemas.ListModelsRequest:
 		listModelsResponse, bifrostError := provider.ListModels(req.Context, keys, req.BifrostRequest.ListModelsRequest)
 		if bifrostError != nil {
+			bifrostError.ExtraFields.ProviderModelDiscoveryFailure = true
 			return nil, bifrostError
 		}
 		response.ListModelsResponse = listModelsResponse
@@ -10034,6 +10035,15 @@ func (p *PluginPipeline) RunPreRequestHooks(ctx *schemas.BifrostContext, req *sc
 // For streams the hooks run per chunk on the provider goroutine, which has nothing else
 // to catch a panic before it ends the process.
 func (p *PluginPipeline) callPostLLMHook(plugin schemas.LLMPlugin, pluginName string, ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bifrostErr *schemas.BifrostError) (outResp *schemas.BifrostResponse, outErr *schemas.BifrostError, err error) {
+	if bifrostErr != nil && bifrostErr.ExtraFields.ProviderModelDiscoveryFailure {
+		before := discoveryErrorIdentity(bifrostErr)
+		// Run after panic recovery too: a hook can mutate the input before it panics.
+		defer func() {
+			if outErr != nil && (outErr != bifrostErr || discoveryErrorIdentity(outErr) != before) {
+				outErr.ExtraFields.ProviderModelDiscoveryFailure = false
+			}
+		}()
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			summary := providerUtils.PanicSummary(r)
@@ -10043,6 +10053,34 @@ func (p *PluginPipeline) callPostLLMHook(plugin schemas.LLMPlugin, pluginName st
 		}
 	}()
 	return plugin.PostLLMHook(ctx, resp, bifrostErr)
+}
+
+// A hook may annotate diagnostics, replace an error or mutate it in place. Only
+// an unchanged provider error retains discovery provenance. Snapshot values,
+// not their pointers; this runs only for failed model discovery, never inference.
+func discoveryErrorIdentity(err *schemas.BifrostError) (id struct {
+	status                                int
+	isBifrost                             bool
+	kind, fieldType, code, message, cause string
+	classification                        schemas.ErrorType
+}) {
+	id.status, id.isBifrost, id.classification = err.EffectiveHTTPStatus(), err.IsBifrostError, err.ExtraFields.ErrorType
+	if err.Type != nil {
+		id.kind = *err.Type
+	}
+	if field := err.Error; field != nil {
+		id.message = field.Message
+		if field.Type != nil {
+			id.fieldType = *field.Type
+		}
+		if field.Code != nil {
+			id.code = *field.Code
+		}
+		if field.Error != nil {
+			id.cause = field.Error.Error()
+		}
+	}
+	return
 }
 
 func (p *PluginPipeline) RunPostLLMHooks(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bifrostErr *schemas.BifrostError, runFrom int) (*schemas.BifrostResponse, *schemas.BifrostError) {

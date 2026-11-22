@@ -2548,6 +2548,10 @@ type BifrostErrorExtraFields struct {
 	// client prefix), so a hook can tell which call failed. In-process only.
 	MCPClientName string `json:"-"`
 	MCPToolName   string `json:"-"`
+	// ProviderModelDiscoveryFailure records an error returned by Provider.ListModels,
+	// before post-hooks. Catalog readers use its origin independently of fault
+	// classification; an upstream 404 can still mean discovery is unavailable.
+	ProviderModelDiscoveryFailure bool `json:"-"`
 	// A2ARequestType and A2AAgentName are stamped by the Agent Gateway plugin gate
 	// on every wrapped error so PostA2AHook can discriminate the operation and its
 	// authorization resource from the failure path too, exactly as MCPRequestType does.

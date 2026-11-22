@@ -498,9 +498,9 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 	updatedConfig := &copied
 	before := lib.AuditSnapshot(currentConfig.Redacted())
 
-	// Validate first-admin setup before any live mutation or persistence below.
+	// Validate enabled dashboard authentication before any live mutation or persistence below.
 	var existingAuthConfig *configstore.AuthConfig
-	var initialPasswordHash string
+	var validatedPasswordHash string
 	if payload.AuthConfig != nil {
 		var err error
 		existingAuthConfig, err = h.store.ConfigStore.GetAuthConfig(ctx)
@@ -527,32 +527,43 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 				SendError(ctx, fasthttp.StatusForbidden, "a valid setup token is required to create the initial admin account")
 				return
 			}
-			if !payload.AuthConfig.OIDCEnabled() && (payload.AuthConfig.AdminUserName == nil || payload.AuthConfig.AdminUserName.GetValue() == "" ||
-				payload.AuthConfig.AdminPassword == nil || payload.AuthConfig.AdminPassword.GetValue() == "" || payload.AuthConfig.AdminPassword.ShouldPreserveStored()) {
+		}
+		if payload.AuthConfig.IsEnabled {
+			// Validate external references before any settings can be persisted.
+			if payload.AuthConfig.AdminUserName.IsFromSecret() && payload.AuthConfig.AdminUserName.GetValue() == "" {
+				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("external reference %s for admin_username resolved to an empty value", payload.AuthConfig.AdminUserName.GetRawRef()))
+				return
+			}
+			if payload.AuthConfig.AdminPassword.IsFromSecret() && payload.AuthConfig.AdminPassword.GetValue() == "" {
+				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("external reference %s for admin_password resolved to an empty value", payload.AuthConfig.AdminPassword.GetRawRef()))
+				return
+			}
+			// OIDC may omit local credentials entirely, but a submitted fallback
+			// must be complete before any client settings are changed below.
+			username := payload.AuthConfig.AdminUserName.GetValue()
+			password := payload.AuthConfig.AdminPassword.GetValue()
+			preservePassword := payload.AuthConfig.AdminPassword.ShouldPreserveStored()
+			if preservePassword {
+				password = ""
+				if username != "" && existingAuthConfig != nil {
+					password = existingAuthConfig.AdminPassword.GetValue()
+				}
+			}
+			wantsPassword := !payload.AuthConfig.OIDCEnabled() || username != "" || !preservePassword
+			if wantsPassword && (username == "" || password == "") {
 				SendError(ctx, fasthttp.StatusBadRequest, "auth username and password must be provided")
 				return
 			}
-			if failures := getPasswordPolicyFailures(payload.AuthConfig.AdminPassword.GetValue()); payload.AuthConfig.HasPassword() && len(failures) > 0 {
-				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("auth password must include %s", strings.Join(failures, ", ")))
-				return
-			}
-			if payload.AuthConfig.HasPassword() {
-				initialPasswordHash, err = encrypt.Hash(payload.AuthConfig.AdminPassword.GetValue())
+			if wantsPassword && !preservePassword {
+				if failures := getPasswordPolicyFailures(password); len(failures) > 0 {
+					SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("auth password must include %s", strings.Join(failures, ", ")))
+					return
+				}
+				validatedPasswordHash, err = encrypt.Hash(password)
 				if err != nil {
 					SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("invalid auth password: %v", err))
 					return
 				}
-			}
-		}
-		if payload.AuthConfig.IsEnabled && !payload.AuthConfig.OIDCEnabled() {
-			username := payload.AuthConfig.AdminUserName.GetValue()
-			password := payload.AuthConfig.AdminPassword.GetValue()
-			if existingAuthConfig != nil && payload.AuthConfig.AdminPassword.ShouldPreserveStored() {
-				password = existingAuthConfig.AdminPassword.GetValue()
-			}
-			if username == "" || password == "" {
-				SendError(ctx, fasthttp.StatusBadRequest, "password credentials or OIDC are required when auth is enabled")
-				return
 			}
 		}
 	}
@@ -1186,21 +1197,6 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 				payload.AuthConfig.AdminPassword = &schemas.SecretVar{}
 			}
 
-			// Validate env variables are set if referenced
-			if payload.AuthConfig.AdminUserName.IsFromSecret() && payload.AuthConfig.AdminUserName.GetValue() == "" {
-				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("external reference %s for admin_username resolved to an empty value", payload.AuthConfig.AdminUserName.GetRawRef()))
-				return
-			}
-			if payload.AuthConfig.AdminPassword.IsFromSecret() && payload.AuthConfig.AdminPassword.GetValue() == "" {
-				SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("external reference %s for admin_password resolved to an empty value", payload.AuthConfig.AdminPassword.GetRawRef()))
-				return
-			}
-
-			if authConfig == nil && !payload.AuthConfig.OIDCEnabled() && (payload.AuthConfig.AdminUserName.GetValue() == "" || payload.AuthConfig.AdminPassword.GetValue() == "") {
-				SendError(ctx, fasthttp.StatusBadRequest, "auth username and password must be provided")
-				return
-			}
-
 			// Creating the very first admin account is the one config write this
 			// endpoint allows while genuinely unauthenticated (no admin exists yet to
 			// authenticate as). Require the operator-configured setup token (config.json
@@ -1220,23 +1216,12 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 			// Fetching current Auth config
 			if payload.AuthConfig.AdminUserName.GetValue() != "" {
 				if payload.AuthConfig.AdminPassword.ShouldPreserveStored() {
-					if authConfig == nil || authConfig.AdminPassword.GetValue() == "" {
-						SendError(ctx, fasthttp.StatusBadRequest, "auth password must be provided")
-						return
-					}
 					// Assuming that password hasn't been changed
 					payload.AuthConfig.AdminPassword = authConfig.AdminPassword
 				} else {
-					hashed, ok := h.hashAdminPassword(ctx, payload.AuthConfig.AdminPassword)
-					if !ok {
-						return
-					}
-					// First-time setup pre-hashed the password while validating the request
-					// (initialPasswordHash); reuse that hash rather than computing a second one.
-					if initialPasswordHash != "" {
-						hashed.Val = initialPasswordHash
-					}
-					payload.AuthConfig.AdminPassword = hashed
+					// Reuse preflight's hash, retaining any reference metadata.
+					payload.AuthConfig.AdminPassword = payload.AuthConfig.AdminPassword.Clone()
+					payload.AuthConfig.AdminPassword.Val = validatedPasswordHash
 				}
 			} else if payload.AuthConfig.OIDCEnabled() {
 				// An OIDC-only configuration has no local password to preserve.

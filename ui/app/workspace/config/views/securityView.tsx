@@ -313,7 +313,7 @@ export default function SecurityView() {
 			}
 			const hasUsername = authConfig.admin_username?.value || authConfig.admin_username?.ref;
 			const hasPassword = authConfig.admin_password?.value || authConfig.admin_password?.ref;
-			if (authConfig.is_enabled && !authConfig.oidc?.enabled && !(hasUsername && hasPassword)) {
+			if (showPasswordSection && authConfig.is_enabled && !authConfig.oidc?.enabled && !(hasUsername && hasPassword)) {
 				toast.error(t("security.oidc.authRequired"));
 				return;
 			}

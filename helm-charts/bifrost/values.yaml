@@ -277,6 +277,7 @@ bifrost:
 
   # Authentication configuration (top-level)
   # This controls authentication for Bifrost API and dashboard
+  # For OIDC, prefer governance.authConfig below. The same oidc fields work here.
   authConfig:
     adminUsername: ""
     adminPassword: ""
@@ -1341,6 +1342,18 @@ bifrost:
       existingSecret: ""
       usernameKey: "username"
       passwordKey: "password"
+      # To manage sign-in in the dashboard, leave both authConfig blocks at their
+      # defaults and omit oidc so no auth_config is rendered. A rendered
+      # auth_config replaces the complete saved policy, including OIDC, at startup.
+      # Keep working local credentials while a previous image lacks OIDC support.
+      # oidc:
+      #   enabled: true
+      #   issuerUrl: "https://identity.example.com"
+      #   clientId: "bifrost"
+      #   clientSecret: "env.BIFROST_OIDC_CLIENT_SECRET" # Supply through envFrom or env; omit for a public client
+      #   redirectUrl: "https://ai.example.com/api/session/oidc/callback"
+      #   allowedSubjects: ["administrator-subject"]
+      #   allowedEmails: []
 
   # Cluster mode configuration for distributed deployments
   cluster:

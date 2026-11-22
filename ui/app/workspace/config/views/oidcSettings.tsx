@@ -29,7 +29,13 @@ export default function OIDCSettings({
 					<Label htmlFor="oidc-enabled">{t("security.oidc.title")}</Label>
 					<p className="text-muted-foreground text-sm">{t("security.oidc.description")}</p>
 				</div>
-				<Switch id="oidc-enabled" checked={config.enabled} disabled={disabled} onCheckedChange={(enabled) => update({ enabled })} />
+				<Switch
+					id="oidc-enabled"
+					data-testid="oidc-enabled-switch"
+					checked={config.enabled}
+					disabled={disabled}
+					onCheckedChange={(enabled) => update({ enabled })}
+				/>
 			</div>
 			{config.enabled && (
 				<fieldset disabled={disabled} className="space-y-4">
@@ -38,6 +44,7 @@ export default function OIDCSettings({
 							<Label htmlFor="oidc-issuer">{t("security.oidc.issuer")}</Label>
 							<Input
 								id="oidc-issuer"
+								data-testid="oidc-issuer-input"
 								type="url"
 								value={config.issuer_url}
 								aria-invalid={!!errors.issuer_url}
@@ -54,6 +61,7 @@ export default function OIDCSettings({
 							<Label htmlFor="oidc-client">{t("security.oidc.clientId")}</Label>
 							<Input
 								id="oidc-client"
+								data-testid="oidc-client-input"
 								value={config.client_id}
 								aria-invalid={!!errors.client_id}
 								aria-describedby={errors.client_id ? "oidc-client-error" : undefined}
@@ -70,6 +78,7 @@ export default function OIDCSettings({
 						<Label htmlFor="oidc-secret">{t("security.oidc.clientSecret")}</Label>
 						<SecretVarInput
 							id="oidc-secret"
+							data-testid="oidc-secret-input"
 							type="password"
 							value={config.client_secret}
 							disabled={disabled}
@@ -81,6 +90,7 @@ export default function OIDCSettings({
 						<Label htmlFor="oidc-redirect">{t("security.oidc.redirect")}</Label>
 						<Input
 							id="oidc-redirect"
+							data-testid="oidc-redirect-input"
 							type="url"
 							value={config.redirect_url}
 							aria-invalid={!!errors.redirect_url}
@@ -99,6 +109,7 @@ export default function OIDCSettings({
 							<Label htmlFor="oidc-subjects">{t("security.oidc.subjects")}</Label>
 							<Textarea
 								id="oidc-subjects"
+								data-testid="oidc-subjects-input"
 								aria-invalid={!!errors.allowed_subjects}
 								aria-describedby={errors.allowed_subjects ? "oidc-subjects-error" : undefined}
 								value={(config.allowed_subjects ?? []).join("\n")}
@@ -115,6 +126,7 @@ export default function OIDCSettings({
 							<Label htmlFor="oidc-emails">{t("security.oidc.emails")}</Label>
 							<Textarea
 								id="oidc-emails"
+								data-testid="oidc-emails-input"
 								aria-invalid={!!errors.allowed_emails}
 								aria-describedby={errors.allowed_emails ? "oidc-emails-error" : undefined}
 								value={(config.allowed_emails ?? []).join("\n")}

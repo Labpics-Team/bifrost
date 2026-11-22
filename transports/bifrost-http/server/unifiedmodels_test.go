@@ -123,38 +123,45 @@ func TestUnifiedModelCatalogHTTP(t *testing.T) {
 }
 
 func TestUnifiedModelCatalogProviderFailure(t *testing.T) {
-	s, _, r := newUnifiedModelCatalog(t, http.StatusServiceUnavailable)
-	for _, path := range []string{"/v1/models", "/openai/v1/models"} {
-		request := &fasthttp.RequestCtx{}
-		request.Request.Header.SetMethod("GET")
-		request.Request.SetRequestURI(path)
-		request.Request.Header.Set("x-bf-vk", "sk-bf-reader")
-		r.Handler(request)
-		require.Equal(t, http.StatusOK, request.Response.StatusCode(), string(request.Response.Body()))
-		var catalog schemas.BifrostListModelsResponse
-		require.NoError(t, json.Unmarshal(request.Response.Body(), &catalog))
-		require.Len(t, catalog.Data, 1)
-		require.Equal(t, "Frontier", catalog.Data[0].ID)
-	}
-	httpCtx := &fasthttp.RequestCtx{}
-	httpCtx.Request.Header.Set("x-bf-vk", "sk-bf-reader")
-	ctx, cancel := lib.ConvertToBifrostContext(httpCtx, s.Config)
-	defer cancel()
-	response, err := s.ListAllModels(ctx, nil)
-	require.Nil(t, err, "%v", err)
-	require.Equal(t, []schemas.Model{{ID: "Frontier"}}, response.Data)
+	for _, status := range []int{http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			s, _, r := newUnifiedModelCatalog(t, status)
+			for _, path := range []string{"/v1/models", "/openai/v1/models"} {
+				request := &fasthttp.RequestCtx{}
+				request.Request.Header.SetMethod("GET")
+				request.Request.SetRequestURI(path)
+				request.Request.Header.Set("x-bf-vk", "sk-bf-reader")
+				r.Handler(request)
+				require.Equal(t, http.StatusOK, request.Response.StatusCode(), string(request.Response.Body()))
+				var catalog schemas.BifrostListModelsResponse
+				require.NoError(t, json.Unmarshal(request.Response.Body(), &catalog))
+				require.Len(t, catalog.Data, 1)
+				require.Equal(t, "Frontier", catalog.Data[0].ID)
+			}
+			httpCtx := &fasthttp.RequestCtx{}
+			httpCtx.Request.Header.Set("x-bf-vk", "sk-bf-reader")
+			ctx, cancel := lib.ConvertToBifrostContext(httpCtx, s.Config)
+			defer cancel()
+			response, err := s.ListAllModels(ctx, nil)
+			require.Nil(t, err, "%v", err)
+			require.Equal(t, []schemas.Model{{ID: "Frontier"}}, response.Data)
 
-	ctx.SetValue(schemas.BifrostContextKeyDirectKey, schemas.Key{Value: *schemas.NewSecretVar("sk-direct")})
-	_, err = s.ListAllModels(ctx, nil)
-	require.NotNil(t, err, "a direct key must still name its provider")
-	require.Equal(t, http.StatusBadRequest, *err.StatusCode)
+			ctx.SetValue(schemas.BifrostContextKeyDirectKey, schemas.Key{Value: *schemas.NewSecretVar("sk-direct")})
+			_, err = s.ListAllModels(ctx, nil)
+			require.NotNil(t, err, "a direct key must still name its provider")
+			require.Equal(t, http.StatusBadRequest, *err.StatusCode)
+		})
+	}
 }
 
 type catalogPolicyPlugin struct {
-	status   int
-	post     bool
-	provider schemas.ModelProvider
-	delay    time.Duration
+	status             int
+	post               bool
+	copyError          bool
+	mutateError        bool
+	panicAfterMutation bool
+	provider           schemas.ModelProvider
+	delay              time.Duration
 }
 
 func (p *catalogPolicyPlugin) GetName() string { return "catalog-policy" }
@@ -178,6 +185,19 @@ func (p *catalogPolicyPlugin) PostLLMHook(_ *schemas.BifrostContext, response *s
 	if p.post {
 		refusal := p.refusal()
 		if err != nil {
+			if p.copyError || p.mutateError {
+				copy := *err
+				if p.mutateError {
+					*err.StatusCode = p.status
+					err.Error.Message = refusal.Error.Message
+					if p.panicAfterMutation {
+						panic("policy diagnostic failed")
+					}
+					return nil, err, nil
+				}
+				copy.StatusCode, copy.Error = refusal.StatusCode, refusal.Error
+				return nil, &copy, nil
+			}
 			// A post-hook can retain discovery diagnostics while rejecting the
 			// request itself. The returned error is still the policy refusal.
 			refusal.ExtraFields.KeyStatuses = err.ExtraFields.KeyStatuses
@@ -189,10 +209,10 @@ func (p *catalogPolicyPlugin) PostLLMHook(_ *schemas.BifrostContext, response *s
 
 func TestUnifiedModelCatalogPreservesPolicyFailure(t *testing.T) {
 	for _, status := range []int{http.StatusForbidden, http.StatusServiceUnavailable} {
-		for _, post := range []bool{false, true} {
-			t.Run(strconv.Itoa(status)+"/post="+strconv.FormatBool(post), func(t *testing.T) {
+		for _, mode := range []string{"pre", "post", "post_copy", "post_mutate", "post_mutate_panic"} {
+			t.Run(strconv.Itoa(status)+"/"+mode, func(t *testing.T) {
 				s, _, r := newUnifiedModelCatalog(t, http.StatusServiceUnavailable)
-				require.NoError(t, s.Client.ReloadPlugin(&catalogPolicyPlugin{status: status, post: post}, []schemas.PluginType{schemas.PluginTypeLLM}))
+				require.NoError(t, s.Client.ReloadPlugin(&catalogPolicyPlugin{status: status, post: mode != "pre", copyError: mode == "post_copy", mutateError: mode == "post_mutate" || mode == "post_mutate_panic", panicAfterMutation: mode == "post_mutate_panic"}, []schemas.PluginType{schemas.PluginTypeLLM}))
 				for _, path := range []string{"/v1/models", "/openai/v1/models"} {
 					ctx := &fasthttp.RequestCtx{}
 					ctx.Request.Header.SetMethod("GET")

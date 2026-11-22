@@ -2273,6 +2273,56 @@ done
 
 echo ""
 echo "======================================================================"
+# OIDC uses one mapping for governance and legacy top-level auth. Exercise the
+# rendered configuration, including explicit false and empty allowlists.
+for oidc_scope in governance legacy; do
+  for oidc_enabled in true false; do
+    python3 - "$TMPDIR/values-oidc.json" "$oidc_scope" "$oidc_enabled" <<'PY'
+import json, sys
+auth = {"isEnabled": True, "adminUsername": "admin", "adminPassword": "fixture-password", "oidc": {
+    "enabled": sys.argv[3] == "true", "issuerUrl": "https://identity.example.com", "clientId": "bifrost",
+    "clientSecret": "env.BIFROST_OIDC_CLIENT_SECRET", "redirectUrl": "https://ai.example.com/api/session/oidc/callback",
+    "allowedSubjects": ["administrator-subject"], "allowedEmails": []}}
+settings = {"authConfig": auth}
+if sys.argv[2] == "governance":
+    settings = {"governance": settings}
+with open(sys.argv[1], "w") as output:
+    json.dump({"bifrost": settings}, output)
+PY
+    render_config "$TMPDIR/values-oidc.json"
+    if python3 - "$TMPDIR/config.json" "$oidc_scope" "$oidc_enabled" <<'PY'
+import json, sys
+config = json.load(open(sys.argv[1]))
+auth = (config["governance"] if sys.argv[2] == "governance" else config)["auth_config"]
+assert auth["admin_username"] == "admin" and auth["admin_password"] == "fixture-password"
+assert auth["oidc"] == {
+    "enabled": sys.argv[3] == "true", "issuer_url": "https://identity.example.com", "client_id": "bifrost",
+    "client_secret": "env.BIFROST_OIDC_CLIENT_SECRET", "redirect_url": "https://ai.example.com/api/session/oidc/callback",
+    "allowed_subjects": ["administrator-subject"], "allowed_emails": []}
+PY
+    then report_result "OIDC $oidc_scope enabled=$oidc_enabled renders native fields" 0
+    else report_result "OIDC $oidc_scope enabled=$oidc_enabled renders native fields" 1
+    fi
+  done
+done
+render_config "$TMPDIR/values-warp-unset.yaml"
+if python3 - "$TMPDIR/config.json" <<'PY'
+import json, sys
+config = json.load(open(sys.argv[1]))
+assert "auth_config" not in config
+assert "auth_config" not in config.get("governance", {})
+PY
+then report_result 'OIDC omitted by default; dashboard settings preserved' 0
+else report_result 'OIDC omitted by default; dashboard settings preserved' 1
+fi
+if helm template bifrost "$CHART_DIR" --set image.tag=v1.0.0 --set bifrost.governance.authConfig.oidc.issuerTypo=x >"$TMPDIR/oidc-invalid.txt" 2>&1; then
+  report_result 'OIDC unknown field rejected' 1
+elif grep -q 'issuerTypo' "$TMPDIR/oidc-invalid.txt"; then
+  report_result 'OIDC unknown field rejected' 0
+else
+  report_result 'OIDC unknown field rejected' 1
+fi
+
 echo "🏁 Config JSON Field Validation Complete!"
 echo "======================================================================"
 echo -e "${GREEN}Passed: $TESTS_PASSED${NC}"

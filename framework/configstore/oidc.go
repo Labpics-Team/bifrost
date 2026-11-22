@@ -1,6 +1,7 @@
 package configstore
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -10,7 +11,9 @@ import (
 	"strings"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/encrypt"
+	"gorm.io/gorm"
 )
 
 // OIDCConfig uses one issuer to authenticate explicitly allowed dashboard administrators.
@@ -50,7 +53,22 @@ func (c *OIDCConfig) Equals(other *OIDCConfig) bool {
 	}
 	return c.Enabled == other.Enabled && c.IssuerURL == other.IssuerURL && c.ClientID == other.ClientID &&
 		c.ClientSecret.Equals(other.ClientSecret) && c.RedirectURL == other.RedirectURL &&
-		slices.Equal(c.AllowedSubjects, other.AllowedSubjects) && slices.Equal(c.AllowedEmails, other.AllowedEmails)
+		equalOIDCAllowlist(c.AllowedSubjects, other.AllowedSubjects, func(a, b string) bool { return a == b }) &&
+		equalOIDCAllowlist(c.AllowedEmails, other.AllowedEmails, strings.EqualFold)
+}
+
+// Match Allows' membership rules: ordering, duplicates, and email case do not
+// change access and must not revoke sessions or invalidate an in-flight login.
+func equalOIDCAllowlist(a, b []string, equal func(string, string) bool) bool {
+	containsAll := func(values, allowed []string) bool {
+		for _, value := range values {
+			if !slices.ContainsFunc(allowed, func(other string) bool { return equal(value, other) }) {
+				return false
+			}
+		}
+		return true
+	}
+	return containsAll(a, b) && containsAll(b, a)
 }
 
 func (c *OIDCConfig) Validate() error {
@@ -169,4 +187,41 @@ func decodeOIDCConfig(data string) (*OIDCConfig, error) {
 		return nil, err
 	}
 	return &config, nil
+}
+
+// Encrypt the existing envelope directly, without resolving references or
+// changing the auth policy. Reopening an encrypted store is a no-op.
+func (s *RDBConfigStore) encryptPlaintextOIDCConfig(ctx context.Context) (int, error) {
+	count := 0
+	err := s.DB().WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var rows []tables.TableGovernanceConfig
+		if err := lockRow(tx).Where("key = ?", tables.ConfigOIDCKey).Find(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 || rows[0].Value == "" {
+			return nil
+		}
+		var stored storedOIDCConfig
+		if err := json.Unmarshal([]byte(rows[0].Value), &stored); err != nil {
+			return err
+		}
+		if stored.Encrypted {
+			return nil
+		}
+		value, err := encrypt.Encrypt(stored.Value)
+		if err != nil {
+			return err
+		}
+		stored.Value, stored.Encrypted = value, true
+		data, err := json.Marshal(stored)
+		if err != nil {
+			return err
+		}
+		if err := tx.Model(&rows[0]).Update("value", string(data)).Error; err != nil {
+			return err
+		}
+		count = 1
+		return nil
+	})
+	return count, err
 }
