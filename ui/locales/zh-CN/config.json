@@ -169,6 +169,23 @@
 		}
 	},
 	"security": {
+		"oidc": {
+			"localPassword": "本地管理员密码（可选）",
+			"protectDashboard": "保护控制台",
+			"dashboardHelp": "使用 OpenID Connect 或本地管理员密码登录。",
+			"title": "OpenID Connect",
+			"description": "通过身份提供商登录此控制台。",
+			"issuer": "签发者 URL",
+			"clientId": "客户端 ID",
+			"clientSecret": "客户端密钥",
+			"secretHelp": "公共客户端可不填写。留空会保留已保存的密钥。",
+			"redirect": "重定向 URL",
+			"redirectHelp": "请在提供商处注册此完整 URL。必须以 /api/session/oidc/callback 结尾，并包含已配置的基础路径。",
+			"subjects": "允许的 subject ID",
+			"emails": "允许的已验证邮箱",
+			"allowHelp": "每行一项。至少需要一个 subject 或已验证邮箱。匹配的用户将获得管理员权限。",
+			"authRequired": "请配置 OpenID Connect 或填写管理员用户名和密码。"
+		},
 		"title": "安全设置",
 		"description": "配置安全与访问控制设置。",
 		"loadingAuth": "正在加载身份验证设置",

@@ -211,7 +211,13 @@ function scanFile(filePath) {
 		const { line, character } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
 		const tier = REVIEW_CATEGORIES.has(category) ? "review" : "untranslated";
 		const shown = ts.isTemplateExpression(node) ? node.getText(sourceFile) : value;
-		findings.push({ line: line + 1, column: character + 1, tier, category, text: shown.replace(/\s+/g, " ").trim() });
+		findings.push({
+			line: line + 1,
+			column: character + 1,
+			tier,
+			category,
+			text: shown.replace(/\s+/g, " ").trim(),
+		});
 	};
 
 	const visit = (node) => {
@@ -278,7 +284,12 @@ function walk(dir, out = []) {
 		// A link whose checkout was removed dangles; the build treats that as an OSS build, so skip it.
 		const isDir = entry.isDirectory() || (entry.isSymbolicLink() && isDirectory(full));
 		if (isDir) walk(full, out);
-		else if (/\.(tsx?|jsx?)$/.test(entry.name) && !SKIP_PATH.test(full) && !SKIP_FILES.has(path.relative(UI_ROOT, full))) out.push(full);
+		else if (
+			/\.(tsx?|jsx?)$/.test(entry.name) &&
+			!SKIP_PATH.test(full.split(path.sep).join("/")) &&
+			!SKIP_FILES.has(path.relative(UI_ROOT, full).split(path.sep).join("/"))
+		)
+			out.push(full);
 	}
 	return out;
 }
@@ -289,7 +300,7 @@ function checkLiterals() {
 	const byFile = {};
 	for (const file of files) {
 		const findings = scanFile(file);
-		if (findings.length > 0) byFile[path.relative(UI_ROOT, file)] = findings;
+		if (findings.length > 0) byFile[path.relative(UI_ROOT, file).split(path.sep).join("/")] = findings;
 	}
 	return byFile;
 }
@@ -446,7 +457,15 @@ function checkLocales() {
 function checkLocaleRoot(localesDir, report) {
 	const namespaces = fs.readdirSync(path.join(localesDir, SOURCE_LANG)).filter((name) => name.endsWith(".json"));
 	for (const lang of SUPPORTED_LANGS) {
-		const issues = (report[lang] ??= { missing: [], extra: [], shape: [], placeholders: [], tags: [], empty: [], untranslated: [] });
+		const issues = (report[lang] ??= {
+			missing: [],
+			extra: [],
+			shape: [],
+			placeholders: [],
+			tags: [],
+			empty: [],
+			untranslated: [],
+		});
 		for (const ns of namespaces) {
 			const nsName = ns.replace(/\.json$/, "");
 			const source = flatten(JSON.parse(fs.readFileSync(path.join(localesDir, SOURCE_LANG, ns), "utf8")));

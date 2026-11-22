@@ -169,6 +169,23 @@
 		}
 	},
 	"security": {
+		"oidc": {
+			"localPassword": "Local administrator password (optional)",
+			"protectDashboard": "Protect dashboard",
+			"dashboardHelp": "Sign in with OpenID Connect or a local administrator password.",
+			"title": "OpenID Connect",
+			"description": "Use your identity provider to sign in to this dashboard.",
+			"issuer": "Issuer URL",
+			"clientId": "Client ID",
+			"clientSecret": "Client secret",
+			"secretHelp": "Optional for public clients. A blank value preserves the saved secret.",
+			"redirect": "Redirect URL",
+			"redirectHelp": "Register this exact URL with your provider. End with /api/session/oidc/callback and include any base path.",
+			"subjects": "Allowed subject IDs",
+			"emails": "Allowed verified emails",
+			"allowHelp": "One entry per line. At least one subject or verified email is required. Matching users receive administrator access.",
+			"authRequired": "Configure OpenID Connect or provide an administrator username and password."
+		},
 		"title": "Security Settings",
 		"description": "Configure security and access control settings.",
 		"loadingAuth": "Loading authentication settings",

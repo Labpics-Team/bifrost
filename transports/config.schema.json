@@ -7184,6 +7184,20 @@
           "type": "boolean",
           "description": "Whether authentication is enabled"
         },
+        "oidc": {
+          "type": ["object", "null"],
+          "description": "OpenID Connect sign-in for explicitly allowed dashboard administrators.",
+          "properties": {
+            "enabled": { "type": "boolean", "default": false },
+            "issuer_url": { "type": "string", "format": "uri" },
+            "client_id": { "type": "string" },
+            "client_secret": { "type": "string", "description": "Client secret, or env.VARIABLE reference. Omit for a public client." },
+            "redirect_url": { "type": "string", "format": "uri", "description": "Registered callback URL including server.base_path and /api/session/oidc/callback." },
+            "allowed_subjects": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "allowed_emails": { "type": "array", "items": { "type": "string", "format": "email" }, "uniqueItems": true }
+          },
+          "additionalProperties": false
+        },
         "disable_auth_on_inference": {
           "type": "boolean",
           "deprecated": true,
@@ -12253,7 +12267,7 @@
     },
     "load_balancer_config": {
       "type": "object",
-      "description": "Adaptive routing settings (Enterprise). Only the keys listed are applied; omitted keys keep their defaults. Settings saved from the dashboard or API are stored in the database and take precedence over this block.",
+      "description": "Adaptive routing settings. Only the keys listed are applied; omitted keys keep their defaults. Settings saved from the dashboard or API are stored in the database and take precedence over this block.",
       "properties": {
         "direction_selection_enabled": {
           "type": "boolean",
@@ -12299,7 +12313,7 @@
           "minimum": 1,
           "maximum": 30,
           "default": 7,
-          "description": "Days of routing history to keep, separate from log retention. Read at startup. Out-of-range values are brought into range. Defaults to 7."
+          "description": "Days to retain closed incidents, separate from request-log retention. Changes apply when settings are saved. Open incidents and active restrictions are retained until their lifecycle ends. Defaults to 7."
         },
         "snapshot_persist_interval_seconds": {
           "type": "integer",

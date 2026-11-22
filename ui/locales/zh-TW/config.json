@@ -169,6 +169,23 @@
 		}
 	},
 	"security": {
+		"oidc": {
+			"localPassword": "本機管理員密碼（選填）",
+			"protectDashboard": "保護控制台",
+			"dashboardHelp": "使用 OpenID Connect 或本機管理員密碼登入。",
+			"title": "OpenID Connect",
+			"description": "透過身分提供者登入此控制台。",
+			"issuer": "簽發者 URL",
+			"clientId": "用戶端 ID",
+			"clientSecret": "用戶端密鑰",
+			"secretHelp": "公開用戶端可不填寫。留空會保留已儲存的密鑰。",
+			"redirect": "重新導向 URL",
+			"redirectHelp": "請向提供者註冊此完整 URL。必須以 /api/session/oidc/callback 結尾，並包含已設定的基礎路徑。",
+			"subjects": "允許的 subject ID",
+			"emails": "允許的已驗證電子郵件",
+			"allowHelp": "每行一項。至少需要一個 subject 或已驗證的電子郵件。符合的使用者將獲得管理員權限。",
+			"authRequired": "請設定 OpenID Connect 或填寫管理員使用者名稱與密碼。"
+		},
 		"title": "安全設定",
 		"description": "配置安全與存取控制設定。",
 		"loadingAuth": "正在載入身分驗證設定",

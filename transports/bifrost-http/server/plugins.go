@@ -15,6 +15,7 @@ import (
 	"github.com/maximhq/bifrost/plugins/otel"
 	"github.com/maximhq/bifrost/plugins/prompts"
 	"github.com/maximhq/bifrost/plugins/routing"
+	"github.com/maximhq/bifrost/plugins/routing/adaptive"
 	"github.com/maximhq/bifrost/plugins/semanticcache"
 	"github.com/maximhq/bifrost/plugins/telemetry"
 	"github.com/maximhq/bifrost/transports/v2/bifrost-http/handlers"
@@ -164,6 +165,14 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 		// session routing. The field is runtime-only and is never persisted in
 		// plugin configuration.
 		routingConfig.KVStore = bifrostConfig.KVStore
+		if bifrostConfig.AdaptiveRouter == nil {
+			controller, err := adaptive.NewFromStore(ctx, bifrostConfig.ConfigStore, bifrostConfig.LoadBalancerConfig)
+			if err != nil {
+				return nil, err
+			}
+			bifrostConfig.AdaptiveRouter = controller
+		}
+		routingConfig.AdaptiveRouter = bifrostConfig.AdaptiveRouter
 		// Routing rules read the virtual key and its live budget/rate-limit usage, so the
 		// governance plugin must already be registered when this runs.
 		governancePlugin, err := lib.FindPluginAs[governance.BaseGovernancePlugin](bifrostConfig, governancePluginNameFromContext(ctx))

@@ -171,7 +171,29 @@ class WorkspaceTests(unittest.TestCase):
             self.assertFalse((root / "external.work").exists())
 
 
-@unittest.skipUnless(shutil.which("git") and shutil.which("gofmt"), "Git and gofmt are needed for format checks")
+class FormatToolchainTests(unittest.TestCase):
+    def test_formatter_comes_from_selected_go_toolchain(self):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root = Path(directory).resolve()
+            (root / "changed.go").write_text("package fixture\n", encoding="utf-8")
+            selected_root = root / "selected toolchain"
+            formatter = selected_root / "bin" / ("gofmt.exe" if os.name == "nt" else "gofmt")
+
+            def execute(command, cwd):
+                self.assertEqual(cwd, root)
+                if command == ["go", "env", "GOROOT"]:
+                    return str(selected_root) + "\n"
+                # A bare gofmt would use the older bundled formatter on PATH.
+                self.assertEqual(command, [str(formatter), "-l", "--", "changed.go"])
+                return "changed.go\n"
+
+            with patch.object(verify, "changed_go_files", return_value=["changed.go"]), \
+                    patch.object(verify, "run", side_effect=execute):
+                with self.assertRaisesRegex(verify.VerificationError, "changed.go"):
+                    verify.check_format(root, manifest())
+
+
+@unittest.skipUnless(shutil.which("git") and shutil.which("go") and shutil.which("gofmt"), "Git and Go are needed for format checks")
 class FormatTests(unittest.TestCase):
     def initial_repository(self, root):
         root.mkdir()

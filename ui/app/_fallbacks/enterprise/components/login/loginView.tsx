@@ -3,7 +3,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useBranding } from "@/lib/hooks/useBranding";
-import { getErrorMessage, useLoginMutation } from "@/lib/store/apis";
+import { getErrorMessage, useLoginMutation, useIsAuthEnabledQuery } from "@/lib/store/apis";
+import { getApiBaseUrl } from "@/lib/utils/port";
 import { DEFAULT_POST_LOGIN_PATH, getLoginGotoFromSearch } from "@/lib/utils/loginGoto";
 import { BooksIcon, DiscordLogoIcon, GithubLogoIcon } from "@phosphor-icons/react";
 import { useNavigate } from "@tanstack/react-router";
@@ -23,6 +24,8 @@ export default function LoginView() {
 	const navigate = useNavigate();
 	const [isLoading, setIsLoading] = useState(false);
 	const [login, { isLoading: isLoggingIn }] = useLoginMutation();
+	const { data: authState } = useIsAuthEnabledQuery();
+	const oidcError = mounted && new URLSearchParams(window.location.search).has("oidc_error");
 
 	useEffect(() => {
 		setMounted(true);
@@ -84,55 +87,72 @@ export default function LoginView() {
 						<p className="text-muted-foreground text-sm">{t("welcomeSubtitle")}</p>
 					</div>
 
-					<form onSubmit={handleSubmit} className="space-y-5">
-						{errorMessage && <div className="bg-destructive/10 text-destructive rounded-sm p-3 text-sm">{errorMessage}</div>}
-
-						<div className="space-y-2">
-							<Label htmlFor="username" className="text-sm font-medium">
-								{t("username")}
-							</Label>
-							<Input
-								id="username"
-								type="text"
-								placeholder={t("usernamePlaceholder")}
-								value={username}
-								onChange={(e) => setUsername(e.target.value)}
-								required
-								className="text-sm"
-								autoComplete="username"
-							/>
+					{(errorMessage || oidcError) && (
+						<div role="alert" className="bg-destructive/10 text-destructive rounded-sm p-3 text-sm">
+							{errorMessage || t("oidcError")}
 						</div>
-
-						<div className="space-y-2">
-							<Label htmlFor="password" className="text-sm font-medium">
-								{t("password")}
-							</Label>
-							<div className="relative">
-								<Input
-									id="password"
-									type={showPassword ? "text" : "password"}
-									placeholder={t("passwordPlaceholder")}
-									value={password}
-									onChange={(e) => setPassword(e.target.value)}
-									required
-									className="pr-10 text-sm"
-									autoComplete="current-password"
-								/>
-								<button
-									type="button"
-									onClick={() => setShowPassword(!showPassword)}
-									className="text-muted-foreground hover:text-foreground absolute top-1/2 right-3 -translate-y-1/2 transition-colors"
-									aria-label={showPassword ? t("hidePassword") : t("showPassword")}
-								>
-									{showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-								</button>
-							</div>
-						</div>
-
-						<Button type="submit" className="h-9 w-full text-sm" isLoading={isLoading} disabled={isLoading}>
-							{isLoading || isLoggingIn ? t("signingIn") : t("signIn")}
+					)}
+					{authState?.oidc_enabled && (
+						<Button
+							data-testid="oidc-signin-button"
+							className="h-9 w-full text-sm"
+							onClick={() => {
+								const goto = getLoginGotoFromSearch(window.location.search) ?? DEFAULT_POST_LOGIN_PATH;
+								window.location.href = `${getApiBaseUrl()}/session/oidc/login?goto=${encodeURIComponent(goto)}`;
+							}}
+						>
+							{t("oidcSignIn")}
 						</Button>
-					</form>
+					)}
+					{authState?.password_enabled !== false && (
+						<form onSubmit={handleSubmit} className="space-y-5">
+							<div className="space-y-2">
+								<Label htmlFor="username" className="text-sm font-medium">
+									{t("username")}
+								</Label>
+								<Input
+									id="username"
+									type="text"
+									placeholder={t("usernamePlaceholder")}
+									value={username}
+									onChange={(e) => setUsername(e.target.value)}
+									required
+									className="text-sm"
+									autoComplete="username"
+								/>
+							</div>
+
+							<div className="space-y-2">
+								<Label htmlFor="password" className="text-sm font-medium">
+									{t("password")}
+								</Label>
+								<div className="relative">
+									<Input
+										id="password"
+										type={showPassword ? "text" : "password"}
+										placeholder={t("passwordPlaceholder")}
+										value={password}
+										onChange={(e) => setPassword(e.target.value)}
+										required
+										className="pr-10 text-sm"
+										autoComplete="current-password"
+									/>
+									<button
+										type="button"
+										onClick={() => setShowPassword(!showPassword)}
+										className="text-muted-foreground hover:text-foreground absolute top-1/2 right-3 -translate-y-1/2 transition-colors"
+										aria-label={showPassword ? t("hidePassword") : t("showPassword")}
+									>
+										{showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+									</button>
+								</div>
+							</div>
+
+							<Button type="submit" className="h-9 w-full text-sm" isLoading={isLoading} disabled={isLoading}>
+								{isLoading || isLoggingIn ? t("signingIn") : t("signIn")}
+							</Button>
+						</form>
+					)}
 
 					{/* Social Links */}
 					<div className="flex items-center justify-center gap-4 pt-4">

@@ -5431,6 +5431,20 @@ func TestLogRequestTargetRedactsAPIKeyQuery(t *testing.T) {
 	}
 }
 
+func TestLogRequestTargetRedactsOIDCQuery(t *testing.T) {
+	for _, path := range []string{"/api/session/oidc/callback", "/bifrost/api/session/oidc/callback"} {
+		ctx := &fasthttp.RequestCtx{}
+		uri := path + "?code=authorization-code&state=browser-state&api-key=secret&error=access_denied"
+		ctx.Request.SetRequestURI(uri)
+		if got := logRequestTarget(ctx); got != path {
+			t.Errorf("log target = %q, want callback path %q", got, path)
+		}
+		if got := string(ctx.RequestURI()); got != uri {
+			t.Errorf("logging changed the callback request: %q", got)
+		}
+	}
+}
+
 // BenchmarkLogRequestTarget measures the access log target on a request without a query string, the common case.
 func BenchmarkLogRequestTarget(b *testing.B) {
 	ctx := &fasthttp.RequestCtx{}

@@ -1,4 +1,6 @@
 {
+	"oidcSignIn": "Continue with OpenID Connect",
+	"oidcError": "Sign-in failed or access was not granted. Try again or contact your administrator.",
 	"title": "Sign in",
 	"subtitle": "Sign in to Bifrost",
 	"welcomeBack": "Welcome back",

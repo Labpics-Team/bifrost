@@ -1,3 +1,15 @@
+{{- /* Shared OIDC field mapping for governance and legacy top-level auth. */ -}}
+{{- define "bifrost.oidcConfig" -}}
+{{- $source := . -}}
+{{- $config := dict -}}
+{{- range $from, $to := dict "enabled" "enabled" "issuerUrl" "issuer_url" "clientId" "client_id" "clientSecret" "client_secret" "redirectUrl" "redirect_url" "allowedSubjects" "allowed_subjects" "allowedEmails" "allowed_emails" -}}
+{{- if hasKey $source $from -}}
+{{- $_ := set $config $to (get $source $from) -}}
+{{- end -}}
+{{- end -}}
+{{- $config | toJson -}}
+{{- end -}}
+
 {{- define "bifrost.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
@@ -794,7 +806,10 @@ false
 {{- if hasKey .Values.bifrost.governance.authConfig "disableAuthOnInference" }}
 {{- $_ := set $authConfig "disable_auth_on_inference" .Values.bifrost.governance.authConfig.disableAuthOnInference }}
 {{- end }}
-{{- if or $authConfig.admin_username $authConfig.admin_password $authConfig.is_enabled $authConfig.disable_auth_on_inference }}
+{{- if .Values.bifrost.governance.authConfig.oidc }}
+{{- $_ := set $authConfig "oidc" (include "bifrost.oidcConfig" .Values.bifrost.governance.authConfig.oidc | fromJson) }}
+{{- end }}
+{{- if or $authConfig.admin_username $authConfig.admin_password $authConfig.is_enabled $authConfig.disable_auth_on_inference $authConfig.oidc }}
 {{- $_ := set $governance "auth_config" $authConfig }}
 {{- end }}
 {{- end }}
@@ -822,7 +837,10 @@ false
 {{- if hasKey .Values.bifrost.authConfig "disableAuthOnInference" }}
 {{- $_ := set $authConfig "disable_auth_on_inference" .Values.bifrost.authConfig.disableAuthOnInference }}
 {{- end }}
-{{- if or $authConfig.admin_username $authConfig.admin_password $authConfig.is_enabled $authConfig.disable_auth_on_inference }}
+{{- if .Values.bifrost.authConfig.oidc }}
+{{- $_ := set $authConfig "oidc" (include "bifrost.oidcConfig" .Values.bifrost.authConfig.oidc | fromJson) }}
+{{- end }}
+{{- if or $authConfig.admin_username $authConfig.admin_password $authConfig.is_enabled $authConfig.disable_auth_on_inference $authConfig.oidc }}
 {{- $_ := set $config "auth_config" $authConfig }}
 {{- end }}
 {{- end }}

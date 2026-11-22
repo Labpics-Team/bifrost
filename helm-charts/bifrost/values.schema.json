@@ -7858,6 +7858,20 @@
           "type": "string",
           "description": "Admin password"
         },
+        "oidc": {
+          "type": ["object", "null"],
+          "description": "OpenID Connect dashboard sign-in. A rendered auth_config replaces the entire saved policy at startup. To manage authentication through Security settings, leave both authConfig blocks at their defaults and omit oidc.",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "issuerUrl": { "type": "string", "format": "uri" },
+            "clientId": { "type": "string" },
+            "clientSecret": { "type": "string", "description": "Client secret or env.VARIABLE reference; supply environment variables through envFrom or env." },
+            "redirectUrl": { "type": "string", "format": "uri" },
+            "allowedSubjects": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+            "allowedEmails": { "type": "array", "items": { "type": "string", "format": "email" }, "uniqueItems": true }
+          },
+          "additionalProperties": false
+        },
         "isEnabled": {
           "type": "boolean",
           "description": "Whether authentication is enabled"

@@ -25,6 +25,7 @@ type SessionHandler struct {
 	// when the gate is not installed (enterprise, or no config store), in which case
 	// is-auth-enabled never reports setup_required.
 	setupLock *AuthMiddleware
+	oidc      *oidcSignIn
 }
 
 // NewSessionHandler creates a new session handler instance
@@ -32,6 +33,7 @@ func NewSessionHandler(configStore configstore.ConfigStore, wsTicketStore *WSTic
 	return &SessionHandler{
 		configStore:   configStore,
 		wsTicketStore: wsTicketStore,
+		oidc:          newOIDCSignIn(),
 	}
 }
 
@@ -111,6 +113,8 @@ func (h *SessionHandler) setupLockState() (setupRequired bool, setupTokenConfigu
 // RegisterRoutes registers the session-related routes
 func (h *SessionHandler) RegisterRoutes(r *router.Router, middlewares ...schemas.BifrostHTTPMiddleware) {
 	r.POST("/api/session/login", lib.ChainMiddlewares(h.login, middlewares...))
+	r.GET("/api/session/oidc/login", lib.ChainMiddlewares(h.oidcLogin, middlewares...))
+	r.GET("/api/session/oidc/callback", lib.ChainMiddlewares(h.oidcCallback, middlewares...))
 	r.POST("/api/session/logout", lib.ChainMiddlewares(h.logout, middlewares...))
 	r.GET("/api/session/is-auth-enabled", lib.ChainMiddlewares(h.isAuthEnabled, middlewares...))
 	r.POST("/api/session/ws-ticket", lib.ChainMiddlewares(h.issueWSTicket, middlewares...))
@@ -173,7 +177,9 @@ func (h *SessionHandler) isAuthEnabled(ctx *fasthttp.RequestCtx) {
 	SendJSON(ctx, map[string]any{
 		"is_auth_enabled":         authConfig.IsEnabled,
 		"has_valid_token":         hasValidToken,
-		"auth_type":               dashboardAuthType(authConfig.IsEnabled),
+		"auth_type":               dashboardAuthType(authConfig),
+		"oidc_enabled":            authConfig.OIDCEnabled(),
+		"password_enabled":        authConfig.IsEnabled && authConfig.HasPassword(),
 		"inference_auth_enforced": inferenceAuthEnforced,
 		"setup_required":          setupRequired,
 		"setup_token_configured":  setupTokenConfigured,
@@ -181,8 +187,11 @@ func (h *SessionHandler) isAuthEnabled(ctx *fasthttp.RequestCtx) {
 }
 
 // dashboardAuthType reports the dashboard session auth mode for frontend flows.
-func dashboardAuthType(isEnabled bool) string {
-	if isEnabled {
+func dashboardAuthType(config *configstore.AuthConfig) string {
+	if config.OIDCEnabled() && !config.HasPassword() {
+		return "oidc"
+	}
+	if config != nil && config.IsEnabled {
 		return "password"
 	}
 	return "none"
@@ -211,7 +220,7 @@ func (h *SessionHandler) login(ctx *fasthttp.RequestCtx) {
 	}
 
 	// Check if auth is enabled
-	if authConfig == nil || !authConfig.IsEnabled {
+	if authConfig == nil || !authConfig.IsEnabled || !authConfig.HasPassword() {
 		SendError(ctx, fasthttp.StatusForbidden, "Authentication is not enabled")
 		return
 	}
@@ -239,7 +248,11 @@ func (h *SessionHandler) login(ctx *fasthttp.RequestCtx) {
 		CreatedAt: time.Now(),
 		UpdatedAt: time.Now(),
 	}
-	err = h.configStore.CreateSession(ctx, session)
+	err = h.configStore.CreateSessionIfAuthMatches(ctx, session, authConfig)
+	if errors.Is(err, configstore.ErrAuthConfigChanged) {
+		SendError(ctx, fasthttp.StatusUnauthorized, "Authentication settings changed. Please sign in again.")
+		return
+	}
 	if err != nil {
 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to create session: %v", err))
 		return

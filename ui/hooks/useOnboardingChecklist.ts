@@ -63,7 +63,9 @@ export function useOnboardingChecklist({ skip = false }: { skip?: boolean } = {}
 		[hasVirtualKeysAccess, hasGovernanceAccess, hasUserProvisioningAccess],
 	);
 
-	const { data: allKeys } = useGetAllKeysQuery(undefined, { skip: shouldSkipChecklistQueries || !access.providerKeys });
+	const { data: allKeys } = useGetAllKeysQuery(undefined, {
+		skip: shouldSkipChecklistQueries || !access.providerKeys,
+	});
 	const { data: vksResponse } = useGetVirtualKeysQuery(undefined, {
 		skip: shouldSkipChecklistQueries || !IS_ENTERPRISE || !access.virtualKeys,
 	});
@@ -121,7 +123,8 @@ export function useOnboardingChecklist({ skip = false }: { skip?: boolean } = {}
 				section: "Security",
 				complete:
 					ssoGatesDashboard ||
-					(!!authConfig?.is_enabled && authValueSet(authConfig?.admin_username) && authValueSet(authConfig?.admin_password)),
+					(!!authConfig?.is_enabled &&
+						(!!authConfig.oidc?.enabled || (authValueSet(authConfig.admin_username) && authValueSet(authConfig.admin_password)))),
 			},
 			{
 				id: "enforce-inference-auth",

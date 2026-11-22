@@ -107,8 +107,15 @@ func (s *RDBConfigStore) EncryptPlaintextRows(ctx context.Context) error {
 
 	var totalEncrypted int
 
+	// OIDC settings use an envelope in the governance key/value table.
+	count, err := s.encryptPlaintextOIDCConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt oidc config: %w", err)
+	}
+	totalEncrypted += count
+
 	// config_keys
-	count, err := s.encryptPlaintextKeys(ctx)
+	count, err = s.encryptPlaintextKeys(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to encrypt config_keys: %w", err)
 	}

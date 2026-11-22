@@ -1,4 +1,6 @@
 {
+	"oidcSignIn": "Continuar com OpenID Connect",
+	"oidcError": "Falha ao entrar ou acesso não concedido. Tente novamente ou contate seu administrador.",
 	"title": "Iniciar sessão",
 	"subtitle": "Inicie sessão no Bifrost",
 	"welcomeBack": "Bem-vindo de volta",

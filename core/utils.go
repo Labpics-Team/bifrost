@@ -339,11 +339,17 @@ func newBifrostCtxDoneError(ctx *schemas.BifrostContext, stage string) *schemas.
 	var statusCode int
 	var errorType string
 	var message string
+	var discoveryFailure bool
 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		statusCode = 504
 		errorType = schemas.RequestTimedOut
 		message = fmt.Sprintf("request timed out %s: %v", stage, ctx.Err())
+		// This is the native origin of a ListAllModels page timeout. Mark it
+		// here, never by inspecting the timer after a policy/plugin error returns.
+		if outer, _ := ctx.Value(listAllModelsFallbackKey).(*schemas.BifrostContext); outer != nil && outer.Err() == nil {
+			discoveryFailure = true
+		}
 	} else {
 		statusCode = 499
 		errorType = schemas.RequestCancelled
@@ -359,6 +365,7 @@ func newBifrostCtxDoneError(ctx *schemas.BifrostContext, stage string) *schemas.
 			Message: message,
 			Error:   ctx.Err(),
 		},
+		ExtraFields: schemas.BifrostErrorExtraFields{ProviderModelDiscoveryFailure: discoveryFailure},
 	}
 }
 

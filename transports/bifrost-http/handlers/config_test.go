@@ -181,6 +181,8 @@ func TestUpdateConfig_InferenceAuthSetup(t *testing.T) {
 		{"existing off omitted", "", "StrongPassword1!", true, false, true, false, 200},
 		{"invalid setup token", "", "StrongPassword1!", false, false, false, false, 403},
 		{"invalid setup password", "", "weak", false, false, true, false, 400},
+		{"masked setup password", "", "<REDACTED>", false, false, true, false, 400},
+		{"stars setup password", "", "********", false, false, true, false, 400},
 		{"unhashable setup password", "", strings.Repeat("StrongPassword1!", 10), false, false, true, false, 400},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -222,6 +224,59 @@ func TestUpdateConfig_InferenceAuthSetup(t *testing.T) {
 				auth, err := store.GetAuthConfig(bgCtx())
 				require.NoError(t, err)
 				assert.Nil(t, auth)
+			}
+		})
+	}
+}
+
+func TestUpdateConfig_OIDCPasswordValidationBeforeMutation(t *testing.T) {
+	SetLogger(&mockLogger{})
+	for _, tc := range []struct {
+		name, username, password string
+		status                   int
+		existing                 bool
+	}{
+		{"OIDC only", "", "", 200, false},
+		{"with local fallback", "admin", "StrongPassword1!", 200, false},
+		{"missing password", "admin", "", 400, false},
+		{"masked password", "admin", "<redacted>", 400, false},
+		{"missing username", "", "StrongPassword1!", 400, false},
+		{"weak password", "admin", "weak", 400, false},
+		{"unhashable password", "admin", strings.Repeat("StrongPassword1!", 10), 400, false},
+		{"existing OIDC only", "", "", 200, true},
+		{"add local fallback", "admin", "StrongPassword1!", 200, true},
+		{"add fallback without password", "admin", "", 400, true},
+		{"add fallback with masked password", "admin", "<redacted>", 400, true},
+		{"add fallback with weak password", "admin", "weak", 400, true},
+		{"add fallback with unhashable password", "admin", strings.Repeat("StrongPassword1!", 10), 400, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newRealOAuth2Store(t)
+			cfg := newTestOAuth2Config(store, configtables.MCPServerAuthModeHeaders, false)
+			require.NoError(t, store.UpdateClientConfig(bgCtx(), cfg.ClientConfig))
+			if tc.existing {
+				require.NoError(t, store.UpdateAuthConfig(bgCtx(), &configstore.AuthConfig{IsEnabled: true, OIDC: &configstore.OIDCConfig{Enabled: true, IssuerURL: "https://id.example", ClientID: "bifrost", RedirectURL: "https://ai.example/api/session/oidc/callback", AllowedSubjects: []string{"admin"}}}))
+			}
+			beforeAuth, err := store.GetAuthConfig(bgCtx())
+			require.NoError(t, err)
+			before, err := store.GetClientConfig(bgCtx())
+			require.NoError(t, err)
+			beforeLive := *cfg.ClientConfig
+			h := &ConfigHandler{store: cfg, configManager: setupConfigManager{store: store, validToken: true}}
+			ctx := putConfigCtx(fmt.Sprintf(`{"client_config":{"log_retention_days":7},"auth_config":{"is_enabled":true,"admin_username":%q,"admin_password":%q,"oidc":{"enabled":true,"issuer_url":"https://id.example","client_id":"bifrost","redirect_url":"https://ai.example/api/session/oidc/callback","allowed_subjects":["admin"]}}}`, tc.username, tc.password))
+			h.updateConfig(ctx)
+			require.Equal(t, tc.status, ctx.Response.StatusCode(), string(ctx.Response.Body()))
+			persisted, err := store.GetClientConfig(bgCtx())
+			require.NoError(t, err)
+			auth, err := store.GetAuthConfig(bgCtx())
+			require.NoError(t, err)
+			if tc.status != 200 {
+				require.Equal(t, before, persisted, "rejected auth setup must not persist client changes")
+				require.Equal(t, beforeLive, *cfg.ClientConfig, "rejected auth setup must not publish live client changes")
+				require.Equal(t, beforeAuth, auth)
+			} else {
+				require.True(t, auth.OIDCEnabled())
+				require.Equal(t, tc.username != "", auth.HasPassword())
 			}
 		})
 	}
@@ -1246,6 +1301,8 @@ func TestUpdateConfig_StoredCredentialsRequireProofWhenAuthBypassed(t *testing.T
 				IsEnabled:     false,
 			}))
 			cfg := newTestOAuth2Config(store, configtables.MCPServerAuthModeHeaders, false)
+			cfg.ClientConfig.LogRetentionDays = 30
+			require.NoError(t, store.UpdateClientConfig(context.Background(), cfg.ClientConfig))
 			h := &ConfigHandler{store: cfg, configManager: authConfigTestManager{store: store, setupToken: setupToken}}
 
 			ctx := putConfigCtx(tc.body)
@@ -1262,6 +1319,14 @@ func TestUpdateConfig_StoredCredentialsRequireProofWhenAuthBypassed(t *testing.T
 			assert.Equal(t, storedUser, stored.AdminUserName.GetValue())
 			ok, _ := encrypt.CompareHash(stored.AdminPassword.GetValue(), tc.wantPass)
 			assert.True(t, ok, "stored password must verify against %q", tc.wantPass)
+			persisted, err := store.GetClientConfig(context.Background())
+			require.NoError(t, err)
+			wantRetention := 7
+			if tc.wantStatus != fasthttp.StatusOK {
+				wantRetention = 30
+			}
+			assert.Equal(t, wantRetention, cfg.ClientConfig.LogRetentionDays, "rejected proof must not change live settings")
+			assert.Equal(t, wantRetention, persisted.LogRetentionDays, "rejected proof must not persist client settings")
 		})
 	}
 }

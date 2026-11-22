@@ -2,90 +2,87 @@ package lib
 
 import (
 	"context"
-	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
-	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 
+	"github.com/maximhq/bifrost/framework"
 	"github.com/maximhq/bifrost/framework/configstore"
 	"github.com/maximhq/bifrost/framework/modelcatalog"
-	"github.com/maximhq/bifrost/framework/modelcatalog/datasheet"
 )
 
 // Config tests exercise catalog initialization and persistence, not the size or
-// changing contents of the public feeds. Intercept only their default URLs;
-// custom URLs and local HTTP servers retain the normal transport behavior.
-type catalogFixtureTransport struct {
-	fallback http.RoundTripper
+// changing contents of the public feeds. Configure a local server through the
+// normal catalog URLs so URL validation, HTTP transport and parsing all run.
+// Intercepting only the transport leaves the preceding DNS lookup unisolated.
+var catalogFixtureURL string
+
+var catalogFixtureFeeds = map[string]*struct {
+	body string
+	hits atomic.Int64
+}{
+	"/pricing":     {body: `{"gpt-4o-mini":{"provider":"openai","mode":"chat","input_cost_per_token":0.00000015,"output_cost_per_token":0.0000006}}`},
+	"/parameters":  {body: `{"gpt-4o-mini":{"supports_reasoning":false,"supports_sampling_params":true}}`},
+	"/mcp-library": {body: `{"servers":[]}`},
 }
 
-// catalogFixtureHits counts requests the fixture answered, so a test can prove
-// the catalog loaders still route through it.
-var catalogFixtureHits atomic.Int64
-
-func (rt catalogFixtureTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	var body string
-	switch req.URL.String() {
-	case modelcatalog.DefaultPricingURL:
-		body = `{"gpt-4o-mini":{"provider":"openai","mode":"chat","input_cost_per_token":0.00000015,"output_cost_per_token":0.0000006}}`
-	case modelcatalog.DefaultModelParametersURL:
-		body = `{"gpt-4o-mini":{"supports_reasoning":false,"supports_sampling_params":true}}`
-	case modelcatalog.DefaultMCPLibraryURL:
-		body = `{"servers":[]}`
-	default:
-		return rt.fallback.RoundTrip(req)
-	}
-	if err := req.Context().Err(); err != nil {
-		return nil, err
-	}
-	catalogFixtureHits.Add(1)
-	return &http.Response{
-		StatusCode:    http.StatusOK,
-		Header:        http.Header{"Content-Type": {"application/json"}},
-		Body:          io.NopCloser(strings.NewReader(body)),
-		ContentLength: int64(len(body)),
-		Request:       req,
-	}, nil
+func catalogFixtureConfig() *framework.FrameworkConfig {
+	pricingURL := catalogFixtureURL + "/pricing"
+	parametersURL := catalogFixtureURL + "/parameters"
+	mcpURL := catalogFixtureURL + "/mcp-library"
+	return &framework.FrameworkConfig{Pricing: &modelcatalog.Config{
+		PricingURL:         &pricingURL,
+		ModelParametersURL: &parametersURL,
+		MCPLibraryURL:      &mcpURL,
+	}}
 }
 
 func TestMain(m *testing.M) {
-	// Install once before any test or background worker starts. Leave it in
-	// place until process exit so surviving workers cannot race a restoration.
-	// The loaders build their own guarded client (see datasheet.NewHTTPClient),
-	// so wrap that client's transport rather than http.DefaultTransport.
-	newClient := datasheet.NewHTTPClient
-	datasheet.NewHTTPClient = func(timeout time.Duration) *http.Client {
-		client := newClient(timeout)
-		client.Transport = catalogFixtureTransport{fallback: client.Transport}
-		return client
-	}
-	os.Exit(m.Run())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		feed, ok := catalogFixtureFeeds[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		feed.hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(feed.body))
+	}))
+	catalogFixtureURL = server.URL
+	code := m.Run()
+	server.Close()
+	os.Exit(code)
 }
 
-// TestLoadConfigServesCatalogFeedsFromFixture pins that LoadConfig's catalog
-// sync is answered by the fixture. When the loaders bypass it, every config
-// test downloads the full public datasheets and the package takes ~35 minutes
-// under -race in CI.
+// A fresh boot must fetch every configured feed. Using the seeded database here
+// would let an already persisted catalog hide a broken fixture or loader.
 func TestLoadConfigServesCatalogFeedsFromFixture(t *testing.T) {
 	initTestLogger()
-	tempDir := createTempDir(t)
+	tempDir := t.TempDir()
 	providers := map[string]configstore.ProviderConfig{
 		"openai": makeProviderConfigWithNetwork("openai-key-1", "sk-test-123", "https://api.openai.com"),
 	}
-	createConfigFile(t, tempDir, makeConfigDataWithProvidersAndDir(providers, tempDir))
+	data := makeConfigDataWithProvidersAndDir(providers, tempDir)
+	createConfigFile(t, tempDir, data)
 
-	before := catalogFixtureHits.Load()
+	before := make(map[string]int64, len(catalogFixtureFeeds))
+	for path, feed := range catalogFixtureFeeds {
+		before[path] = feed.hits.Load()
+	}
 	ctx := context.Background()
 	config, err := LoadConfig(ctx, tempDir)
 	if err != nil {
 		t.Fatalf("LoadConfig failed: %v", err)
 	}
 	defer config.Close(ctx)
-
-	if got := catalogFixtureHits.Load() - before; got == 0 {
-		t.Fatal("LoadConfig fetched the catalog feeds without going through the fixture; the loaders are reaching the public URLs")
+	if config.ModelCatalog == nil {
+		t.Fatal("LoadConfig did not initialize the catalog")
+	}
+	for path, feed := range catalogFixtureFeeds {
+		if feed.hits.Load() == before[path] {
+			t.Errorf("LoadConfig did not fetch the configured %s feed", path)
+		}
 	}
 }

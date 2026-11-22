@@ -1,4 +1,6 @@
 {
+	"oidcSignIn": "OpenID Connect でログイン",
+	"oidcError": "ログインに失敗したか、アクセスが許可されませんでした。再試行するか、管理者にお問い合わせください。",
 	"title": "サインイン",
 	"subtitle": "Bifrost にサインイン",
 	"welcomeBack": "おかえりなさい",
