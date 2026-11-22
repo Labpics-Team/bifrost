@@ -2000,26 +2000,24 @@ func RewriteLargePayloadModelInMultipartPrefix(reader io.Reader, fromModel, toMo
 		if lineEnd <= 2 || !bytes.HasPrefix(prefix, []byte("--")) {
 			return unchanged()
 		}
-		boundary = string(prefix[2:lineEnd])
+		boundary = string(bytes.TrimRight(prefix[2:lineEnd], " \t"))
+		if boundary == "" {
+			return unchanged()
+		}
 	}
 	delimiter := []byte("--" + boundary)
-	nextDelimiter := []byte("\r\n--" + boundary)
-	for start := bytes.Index(prefix, delimiter); start >= 0; {
-		headerStart := start + len(delimiter)
-		if !bytes.HasPrefix(prefix[headerStart:], []byte("\r\n")) {
-			break // closing delimiter or an incomplete part
-		}
-		headerStart += 2
+	atEOF := err == io.EOF || err == io.ErrUnexpectedEOF
+	for start, headerStart, closing := nextMultipartDelimiterLine(prefix, delimiter, 0, atEOF); start >= 0 && !closing; {
 		headerLength := bytes.Index(prefix[headerStart:], []byte("\r\n\r\n"))
 		if headerLength < 0 {
 			break
 		}
 		valueStart := headerStart + headerLength + 4
-		valueLength := bytes.Index(prefix[valueStart:], nextDelimiter)
-		if valueLength < 0 {
+		nextStart, nextHeaderStart, nextClosing := nextMultipartDelimiterLine(prefix, delimiter, valueStart+2, atEOF)
+		if nextStart < 0 {
 			break // no complete field within the bounded prefix
 		}
-		valueEnd := valueStart + valueLength
+		valueEnd := nextStart - 2 // the delimiter's leading CRLF is not field data
 		headers, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(prefix[headerStart:valueStart]))).ReadMIMEHeader()
 		if err != nil {
 			break
@@ -2032,9 +2030,42 @@ func RewriteLargePayloadModelInMultipartPrefix(reader io.Reader, fromModel, toMo
 			rewritten = append(rewritten, prefix[valueEnd:]...)
 			return io.MultiReader(bytes.NewReader(rewritten), reader), len(rewritten) - len(prefix)
 		}
-		start = valueEnd + 2
+		start, headerStart, closing = nextStart, nextHeaderStart, nextClosing
 	}
 	return unchanged()
+}
+
+// nextMultipartDelimiterLine follows RFC 2046 section 5.1.1: delimiters start a
+// line and may have SPACE/HTAB transport padding. Boundary prefixes in preambles
+// or field data are not delimiters. A closing line may omit its final CRLF only
+// at the body's EOF, never just at the end of the bounded scan prefix.
+func nextMultipartDelimiterLine(data, delimiter []byte, offset int, atEOF bool) (start, end int, closing bool) {
+	for offset < len(data) {
+		index := bytes.Index(data[offset:], delimiter)
+		if index < 0 {
+			break
+		}
+		start = offset + index
+		offset = start + len(delimiter)
+		if start != 0 && (start < 2 || data[start-2] != '\r' || data[start-1] != '\n') {
+			continue
+		}
+		end = offset
+		closing = bytes.HasPrefix(data[end:], []byte("--"))
+		if closing {
+			end += 2
+		}
+		for end < len(data) && (data[end] == ' ' || data[end] == '\t') {
+			end++
+		}
+		if bytes.HasPrefix(data[end:], []byte("\r\n")) {
+			return start, end + 2, closing
+		}
+		if closing && atEOF && end == len(data) {
+			return start, end, true
+		}
+	}
+	return -1, 0, false
 }
 
 // DrainLargePayloadRemainder drains any unread bytes from the large payload reader.
