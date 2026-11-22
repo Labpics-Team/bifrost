@@ -4431,6 +4431,8 @@ type deferredStreamSpan struct {
 	ends         int
 	status       schemas.SpanStatus
 	attrs        map[string]any
+	endAttrs     map[string]any
+	lateAttrs    int
 	populated    *schemas.BifrostResponse
 	populatedErr *schemas.BifrostError
 }
@@ -4457,6 +4459,9 @@ func (t *deferredStreamTracer) SetAttribute(handle schemas.SpanHandle, key strin
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if s := t.spanFor(handle); s != nil {
+		if s.ends != 0 {
+			s.lateAttrs++
+		}
 		s.attrs[key] = value
 	}
 }
@@ -4480,6 +4485,10 @@ func (t *deferredStreamTracer) EndSpan(handle schemas.SpanHandle, status schemas
 	if s := t.spanFor(handle); s != nil {
 		s.ends++
 		s.status = status
+		s.endAttrs = make(map[string]any, len(s.attrs))
+		for key, value := range s.attrs {
+			s.endAttrs[key] = value
+		}
 	}
 }
 
@@ -4684,6 +4693,10 @@ func TestExecuteRequestWithRetries_FailedStreamAttemptLeavesRetrySpanAlone(t *te
 		attempts++
 		if attempts == 1 {
 			finalizer := onceFinalizer()
+			reader := providerUtils.GetSSEDataReader(ctx, strings.NewReader(": first\n\ndata: {}\n\n: late\n\ndata: {}\n\n"))
+			if _, err := reader.ReadDataLine(); err != nil {
+				t.Fatal(err)
+			}
 			out := make(chan *schemas.BifrostStreamChunk, 1)
 			go func() {
 				defer close(firstDone)
@@ -4693,12 +4706,17 @@ func TestExecuteRequestWithRetries_FailedStreamAttemptLeavesRetrySpanAlone(t *te
 				providerUtils.CloseStream(ctx, out)
 				// The dead attempt's last defer runs only once the retry is underway.
 				<-retryStarted
+				_, _ = reader.ReadDataLine() // still bound to the ended first attempt
 				providerUtils.EnsureStreamFinalizerCalled(ctx, finalizer)
 			}()
 			return out, nil
 		}
 		close(retryStarted)
 		<-firstDone
+		reader := providerUtils.GetSSEDataReader(ctx, strings.NewReader(": retry\n\n: retry\n\ndata: {}\n\n"))
+		if _, err := reader.ReadDataLine(); err != nil {
+			t.Fatal(err)
+		}
 		out, done := startFakeProviderStream(ctx, chunks, true)
 		retryDone = done
 		return out, nil
@@ -4732,6 +4750,14 @@ func TestExecuteRequestWithRetries_FailedStreamAttemptLeavesRetrySpanAlone(t *te
 	if n := tracer.recordCount(); n != 0 {
 		t.Errorf("%d deferred span records left behind", n)
 	}
+	for i, span := range spans {
+		if got := span.endAttrs["bifrost.stream.start.sse_comments"]; got != int64(i+1) {
+			t.Errorf("attempt %d comments at EndSpan = %v, want %d", i, got, i+1)
+		}
+		if span.lateAttrs != 0 {
+			t.Errorf("attempt %d had %d late attribute writes", i, span.lateAttrs)
+		}
+	}
 }
 
 // A stream that closes before producing a chunk is the retry loop's empty stream: its
@@ -4761,8 +4787,34 @@ func TestExecuteRequestWithRetries_EmptyStreamSpanEndsOk(t *testing.T) {
 	if span := spans[0]; span.status != schemas.SpanStatusOk || span.populatedErr != nil {
 		t.Errorf("empty stream's span status %q (error recorded: %v), want %q without an error", span.status, span.populatedErr != nil, schemas.SpanStatusOk)
 	}
+	if got := spans[0].endAttrs["bifrost.stream.start.preamble_chunks"]; got != int64(0) || spans[0].lateAttrs != 0 {
+		t.Errorf("empty stream diagnostics at EndSpan = %v, late writes = %d", got, spans[0].lateAttrs)
+	}
 	if n := tracer.recordCount(); n != 0 {
 		t.Errorf("%d deferred span records left behind", n)
+	}
+}
+
+func TestExecuteRequestWithRetries_StreamSetupDiagnostics(t *testing.T) {
+	tracer := newDeferredStreamTracer()
+	ctx := newDeferredStreamContext(tracer)
+	handler := func(_ schemas.Key) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
+		return nil, createBifrostError("local setup failure", schemas.Ptr(400), nil, false)
+	}
+	_, err := executeRequestWithRetries(ctx, createTestConfig(0, time.Millisecond, time.Millisecond), handler, nil,
+		schemas.ResponsesStreamRequest, schemas.OpenAI, "test-model", nil, NewDefaultLogger(schemas.LogLevelError))
+	if err == nil {
+		t.Fatal("expected setup failure")
+	}
+	spans := tracer.llmSpans()
+	if len(spans) != 1 || spans[0].ends != 1 || spans[0].lateAttrs != 0 {
+		t.Fatalf("unexpected attempt spans: %#v", spans)
+	}
+	if got := spans[0].endAttrs["bifrost.stream.start.preamble_chunks"]; got != int64(0) {
+		t.Fatalf("diagnostics missing at EndSpan: %v", got)
+	}
+	if _, present := spans[0].endAttrs["bifrost.stream.start.http_status"]; present {
+		t.Fatal("setup failure cannot report received headers")
 	}
 }
 

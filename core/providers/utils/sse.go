@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	sseInitialBufSize = 8 * 1024        // 8KB — sufficient for >99.9% of SSE lines
+	sseInitialBufSize = 8 * 1024         // 8KB — sufficient for >99.9% of SSE lines
 	sseMaxBufSize     = 10 * 1024 * 1024 // 10MB — allow large tokens (tool calls, audio)
 )
 
@@ -108,7 +108,12 @@ func GetSSEEventReader(ctx *schemas.BifrostContext, reader io.Reader) SSEEventRe
 			return factory.NewEventReader(reader)
 		}
 	}
-	return newDefaultSSEEventReader(reader)
+	r := newDefaultSSEEventReader(reader)
+	r.diagnostics = StreamDiagnosticsFromContext(ctx)
+	if r.diagnostics != nil {
+		r.diagnostics.sseReader.Store(true)
+	}
+	return r
 }
 
 // Reusable byte prefixes for SSE field parsing.
@@ -123,9 +128,10 @@ var (
 // defaultSSEDataReader implements SSEDataReader using bufio.NewScanner.
 // Handles Format A SSE streams (data-only: OpenAI, Gemini, Cohere, etc.).
 type defaultSSEDataReader struct {
-	scanner *bufio.Scanner
-	pending []byte // line carried over from an aborted multi-line JSON accumulation
-	sawDone bool   // stream ended on "data: [DONE]" rather than a bare body EOF
+	diagnostics *StreamDiagnostics
+	scanner     *bufio.Scanner
+	pending     []byte // line carried over from an aborted multi-line JSON accumulation
+	sawDone     bool   // stream ended on "data: [DONE]" rather than a bare body EOF
 	// endOnComment is armed once the caller has seen a finish_reason; sawComment
 	// records that a comment then ended the stream with the body still open.
 	endOnComment bool
@@ -150,7 +156,11 @@ func (r *defaultSSEDataReader) EndedOnComment() bool { return r.sawComment }
 func newDefaultSSEDataReader(ctx *schemas.BifrostContext, reader io.Reader) *defaultSSEDataReader {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, sseInitialBufSize), sseMaxBufSize)
-	return &defaultSSEDataReader{scanner: scanner, ctx: ctx}
+	diagnostics := StreamDiagnosticsFromContext(ctx)
+	if diagnostics != nil {
+		diagnostics.sseReader.Store(true)
+	}
+	return &defaultSSEDataReader{scanner: scanner, ctx: ctx, diagnostics: diagnostics}
 }
 
 func (r *defaultSSEDataReader) ReadDataLine() ([]byte, error) {
@@ -178,6 +188,7 @@ func (r *defaultSSEDataReader) ReadDataLine() ([]byte, error) {
 			continue
 		}
 		if line[0] == ':' {
+			r.diagnostics.comment()
 			// Heartbeats after finish_reason mean nothing further is coming. Two are
 			// required so a keepalive that merely straddles the trailing usage chunk
 			// cannot end the stream early; that chunk resets the count below.
@@ -195,6 +206,7 @@ func (r *defaultSSEDataReader) ReadDataLine() ([]byte, error) {
 
 		// Parse "data:" lines
 		if bytes.HasPrefix(line, sseDataPrefix) {
+			r.diagnostics.dataLine()
 			data := line[5:] // len("data:") == 5
 			if len(data) > 0 && data[0] == ' ' {
 				data = data[1:]
@@ -281,9 +293,10 @@ func (r *defaultSSEDataReader) readMultilineJSON(open []byte) []byte {
 // Handles Format B SSE streams (event+data: Anthropic, Replicate, Mistral, etc.).
 // Events are delimited by empty lines; multiple "data:" lines are concatenated.
 type defaultSSEEventReader struct {
-	scanner   *bufio.Scanner
-	eventType string
-	eventData []byte
+	diagnostics *StreamDiagnostics
+	scanner     *bufio.Scanner
+	eventType   string
+	eventData   []byte
 }
 
 func newDefaultSSEEventReader(reader io.Reader) *defaultSSEEventReader {
@@ -298,6 +311,7 @@ func (r *defaultSSEEventReader) ReadEvent() (string, []byte, error) {
 
 		// Skip comments
 		if len(line) > 0 && line[0] == ':' {
+			r.diagnostics.comment()
 			continue
 		}
 
@@ -322,6 +336,7 @@ func (r *defaultSSEEventReader) ReadEvent() (string, []byte, error) {
 			}
 			r.eventType = string(field)
 		} else if bytes.HasPrefix(line, sseDataPrefix) {
+			r.diagnostics.dataLine()
 			data := line[5:] // len("data:") == 5
 			if len(data) > 0 && data[0] == ' ' {
 				data = data[1:]

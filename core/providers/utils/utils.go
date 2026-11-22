@@ -502,11 +502,16 @@ func MakeRequestWithContextFollowRedirects(ctx context.Context, client *fasthttp
 // Returns client.Do's error untouched so callers keep their own error
 // classification and latency bookkeeping.
 func DoStreamingRequest(ctx context.Context, client *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response) error {
+	diagnostics := StreamDiagnosticsFromContext(ctx)
 	unbind := bindRequestContext(req, ctx)
 	startTime := time.Now()
 	err := client.Do(req, resp)
 	unbind()
 	schemas.AddUpstreamLatency(ctx, time.Since(startTime))
+	if diagnostics != nil && err == nil && !diagnostics.frozen.Load() && diagnostics.status.Load() == 0 {
+		diagnostics.headersNs.Store(int64(time.Since(startTime)))
+		diagnostics.status.Store(int64(resp.StatusCode()))
+	}
 	return err
 }
 
@@ -4104,6 +4109,7 @@ func closeBodyStream(bodyStream io.Reader, err error) {
 // if no data arrives within the configured timeout. This unblocks any pending
 // Read() call on the wrapped reader.
 type idleTimeoutReader struct {
+	diagnostics   *StreamDiagnostics
 	ctx           *schemas.BifrostContext
 	reader        io.Reader
 	bodyStream    io.Reader // closed via type assertion to io.Closer on timeout
@@ -4145,11 +4151,15 @@ func NewIdleTimeoutReader(reader io.Reader, bodyStream io.Reader, timeout time.D
 		bodyStream = tb.inner
 	}
 	r := &idleTimeoutReader{
-		ctx:        ctx,
-		reader:     reader,
-		bodyStream: bodyStream,
-		timeout:    timeout,
-		timerDone:  make(chan struct{}),
+		diagnostics: StreamDiagnosticsFromContext(ctx),
+		ctx:         ctx,
+		reader:      reader,
+		bodyStream:  bodyStream,
+		timeout:     timeout,
+		timerDone:   make(chan struct{}),
+	}
+	if r.diagnostics != nil {
+		r.diagnostics.bodyReader.Store(true)
 	}
 	r.timer = time.AfterFunc(timeout, func() {
 		defer r.timerDoneOnce.Do(func() { close(r.timerDone) })
@@ -4230,6 +4240,7 @@ func (r *idleTimeoutReader) Read(p []byte) (n int, err error) {
 	}
 	readStart := time.Now()
 	n, err = r.reader.Read(p)
+	r.diagnostics.read(n)
 	if r.ctx != nil {
 		schemas.AddUpstreamLatency(r.ctx, time.Since(readStart))
 	}
@@ -5139,6 +5150,7 @@ func completeDeferredSpan(ctx *schemas.BifrostContext, result *schemas.BifrostRe
 	}
 
 	// Error attributes are stamped by PopulateLLMResponseAttributes above.
+	StreamDiagnosticsFromContext(ctx).Stamp()
 	if err != nil {
 		tracer.EndSpan(handle, schemas.SpanStatusError, "streaming request failed")
 	} else {

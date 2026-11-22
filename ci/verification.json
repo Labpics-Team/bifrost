@@ -101,6 +101,10 @@
       "TestPassthroughStreamTeardownPanicIsRecovered"
     ],
     "github.com/maximhq/bifrost/core": [
+      "TestStreamStartupDiagnostics",
+      "TestExecuteRequestWithRetries_FailedStreamAttemptLeavesRetrySpanAlone",
+      "TestExecuteRequestWithRetries_EmptyStreamSpanEndsOk",
+      "TestExecuteRequestWithRetries_StreamSetupDiagnostics",
       "TestConcurrentNilContextRequestsHaveIsolatedState",
       "TestNilContextFiniteStreamCompletesBeforeRead",
       "TestProviderRetryBudgetAfterLostResponse",
@@ -126,6 +130,7 @@
       "TestExplicitKeySelectionExplainsNativePin"
     ],
     "github.com/maximhq/bifrost/core/providers/utils": [
+      "TestStreamDiagnosticsCommitReason",
       "TestContextTransport_TruncatedContentLengthStreamReportsUnexpectedEOFAndDiscardsConn",
       "TestContextTransportAcceptedPooledRequestIsNotRepeated",
       "TestContextTransport_PooledStaleConnStillRetried",
