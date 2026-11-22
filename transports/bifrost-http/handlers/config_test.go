@@ -1301,6 +1301,8 @@ func TestUpdateConfig_StoredCredentialsRequireProofWhenAuthBypassed(t *testing.T
 				IsEnabled:     false,
 			}))
 			cfg := newTestOAuth2Config(store, configtables.MCPServerAuthModeHeaders, false)
+			cfg.ClientConfig.LogRetentionDays = 30
+			require.NoError(t, store.UpdateClientConfig(context.Background(), cfg.ClientConfig))
 			h := &ConfigHandler{store: cfg, configManager: authConfigTestManager{store: store, setupToken: setupToken}}
 
 			ctx := putConfigCtx(tc.body)
@@ -1317,6 +1319,14 @@ func TestUpdateConfig_StoredCredentialsRequireProofWhenAuthBypassed(t *testing.T
 			assert.Equal(t, storedUser, stored.AdminUserName.GetValue())
 			ok, _ := encrypt.CompareHash(stored.AdminPassword.GetValue(), tc.wantPass)
 			assert.True(t, ok, "stored password must verify against %q", tc.wantPass)
+			persisted, err := store.GetClientConfig(context.Background())
+			require.NoError(t, err)
+			wantRetention := 7
+			if tc.wantStatus != fasthttp.StatusOK {
+				wantRetention = 30
+			}
+			assert.Equal(t, wantRetention, cfg.ClientConfig.LogRetentionDays, "rejected proof must not change live settings")
+			assert.Equal(t, wantRetention, persisted.LogRetentionDays, "rejected proof must not persist client settings")
 		})
 	}
 }

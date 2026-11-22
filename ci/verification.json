@@ -82,6 +82,7 @@
       "TestCacheAvailabilityReadinessKeepsAdminAuthentication",
       "TestNativeBetaHeadersPreserveHookKey",
       "TestOIDCSignIn",
+      "TestOIDCTokenExchangeRedirects",
       "TestOIDCGoto",
       "TestOIDCSettings",
       "TestPasswordLoginUsesCurrentAuthPolicy"
@@ -104,6 +105,9 @@
       "TestNilContextFiniteStreamCompletesBeforeRead",
       "TestProviderRetryBudgetAfterLostResponse",
       "TestListAllModelsIncludesEveryPageOfASlowLargeProvider",
+      "TestListAllModelsPageTimeoutPreservesDiscoveryOrigin",
+      "TestListAllModelsTimeoutDoesNotHidePolicy",
+      "TestListAllModelsDeadlineOriginScope",
       "TestFixedKeyRetriesTheSameKeyAfterATransientFailure",
       "TestScenarioFailureClassLadder",
       "TestStreamFallbackAfterSilentPrimaryHeaderTimeout",

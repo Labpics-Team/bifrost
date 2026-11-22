@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +26,7 @@ import (
 	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
+	"golang.org/x/oauth2"
 )
 
 type oidcTestStore struct {
@@ -334,6 +336,8 @@ func TestOIDCDiscoverySharesFailureAndRetries(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{"issuer": issuer.URL, "authorization_endpoint": issuer.URL + "/authorize", "token_endpoint": issuer.URL + "/token", "jwks_uri": issuer.URL + "/keys"})
 	}))
 	defer issuer.Close()
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
 	signIn := newOIDCSignIn()
 	const attempts = 12
 	errs := make(chan error, attempts)
@@ -347,8 +351,12 @@ func TestOIDCDiscoverySharesFailureAndRetries(t *testing.T) {
 		}()
 	}
 	started.Wait()
-	<-entered
-	close(release)
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("discovery did not reach the issuer")
+	}
+	releaseOnce.Do(func() { close(release) })
 	for i := 0; i < attempts; i++ {
 		require.Error(t, <-errs)
 	}
@@ -363,6 +371,67 @@ func TestOIDCDiscoverySharesFailureAndRetries(t *testing.T) {
 	require.NoError(t, err)
 	require.Same(t, provider, cached)
 	require.Equal(t, int32(2), calls.Load(), "recovery retries once, then caches the discovered provider")
+}
+
+func TestOIDCTokenExchangeRedirects(t *testing.T) {
+	t.Run("canonical default port", func(t *testing.T) {
+		client := newOIDCSignIn().clientForIssuer("https://id.example")
+		original, err := http.NewRequest(http.MethodPost, "https://id.example/token", nil)
+		require.NoError(t, err)
+		canonical, err := http.NewRequest(http.MethodPost, "https://ID.example:443/final", nil)
+		require.NoError(t, err)
+		require.NoError(t, client.CheckRedirect(canonical, []*http.Request{original}))
+		canonical.URL.Host = "id.example:8443"
+		require.Error(t, client.CheckRedirect(canonical, []*http.Request{original}))
+	})
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		for _, crossOrigin := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%d/cross-origin=%t", status, crossOrigin), func(t *testing.T) {
+				var received atomic.Int32
+				tokenHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					received.Add(1)
+					require.NoError(t, r.ParseForm())
+					require.Equal(t, "test-code", r.Form.Get("code"))
+					require.Equal(t, "test-verifier", r.Form.Get("code_verifier"))
+					w.Header().Set("Content-Type", "application/json")
+					w.Write([]byte(`{"access_token":"test-access","token_type":"Bearer"}`))
+				})
+				other := httptest.NewTLSServer(tokenHandler)
+				defer other.Close()
+				issuer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/token" {
+						destination := "/final"
+						if crossOrigin {
+							destination = other.URL + "/final"
+						}
+						http.Redirect(w, r, destination, status)
+						return
+					}
+					tokenHandler.ServeHTTP(w, r)
+				}))
+				defer issuer.Close()
+				signIn := newOIDCSignIn()
+				signIn.client = issuer.Client()
+				conf := oauth2.Config{ClientID: "bifrost", ClientSecret: "test-secret", Endpoint: oauth2.Endpoint{
+					TokenURL: issuer.URL + "/token", AuthStyle: oauth2.AuthStyleInParams,
+				}}
+				ctx := context.WithValue(context.Background(), oauth2.HTTPClient, signIn.clientForIssuer(issuer.URL))
+				token, err := conf.Exchange(ctx, "test-code", oauth2.VerifierOption("test-verifier"))
+				if crossOrigin {
+					require.Error(t, err)
+					require.Zero(t, received.Load(), "code, verifier and client secret must remain on the token origin")
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, "test-access", token.AccessToken)
+					require.Equal(t, int32(1), received.Load())
+				}
+				// The issuer may advertise a separate HTTPS token origin directly.
+				conf.Endpoint.TokenURL = other.URL + "/final"
+				_, err = conf.Exchange(ctx, "test-code", oauth2.VerifierOption("test-verifier"))
+				require.NoError(t, err)
+			})
+		}
+	}
 }
 
 func TestOIDCDiscoveryRequiresSecureEndpoints(t *testing.T) {

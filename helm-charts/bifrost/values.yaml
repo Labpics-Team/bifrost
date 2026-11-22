@@ -1346,6 +1346,7 @@ bifrost:
       # defaults and omit oidc so no auth_config is rendered. A rendered
       # auth_config replaces the complete saved policy, including OIDC, at startup.
       # Keep working local credentials while a previous image lacks OIDC support.
+      # Set isEnabled above to true when enabling OIDC; false disables dashboard authentication.
       # oidc:
       #   enabled: true
       #   issuerUrl: "https://identity.example.com"

@@ -498,7 +498,7 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 	updatedConfig := &copied
 	before := lib.AuditSnapshot(currentConfig.Redacted())
 
-	// Validate enabled dashboard authentication before any live mutation or persistence below.
+	// Validate dashboard authentication before any live mutation or persistence below.
 	var existingAuthConfig *configstore.AuthConfig
 	var validatedPasswordHash string
 	if payload.AuthConfig != nil {
@@ -516,6 +516,16 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 				payload.AuthConfig.OIDC = existingAuthConfig.OIDC.Clone()
 			} else if payload.AuthConfig.OIDC != nil && payload.AuthConfig.OIDC.ClientSecret.ShouldPreserveStored() && existingAuthConfig.OIDC != nil {
 				payload.AuthConfig.OIDC.ClientSecret = existingAuthConfig.OIDC.ClientSecret.Clone()
+			}
+			// A disabled-state save keeps the existing username when omitted or empty.
+			if !payload.AuthConfig.IsEnabled && payload.AuthConfig.AdminUserName.GetValue() == "" {
+				payload.AuthConfig.AdminUserName = existingAuthConfig.AdminUserName.Clone()
+			}
+			credentialsReplaced := !payload.AuthConfig.AdminPassword.ShouldPreserveStored() ||
+				!payload.AuthConfig.AdminUserName.Equals(existingAuthConfig.AdminUserName) || !payload.AuthConfig.OIDC.Equals(existingAuthConfig.OIDC)
+			if (payload.AuthConfig.IsEnabled || credentialsReplaced) && isAuthBypassed(ctx) &&
+				!h.verifyStoredAdminCredential(ctx, existingAuthConfig, payload.AuthConfig) {
+				return
 			}
 		}
 		if err := payload.AuthConfig.OIDC.Validate(); err != nil {
@@ -565,6 +575,12 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 					return
 				}
 			}
+		} else if existingAuthConfig != nil && !payload.AuthConfig.AdminPassword.ShouldPreserveStored() {
+			hashed, ok := h.hashAdminPassword(ctx, payload.AuthConfig.AdminPassword)
+			if !ok {
+				return
+			}
+			validatedPasswordHash = hashed.Val
 		}
 	}
 
@@ -1197,22 +1213,6 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 				payload.AuthConfig.AdminPassword = &schemas.SecretVar{}
 			}
 
-			// Creating the very first admin account is the one config write this
-			// endpoint allows while genuinely unauthenticated (no admin exists yet to
-			// authenticate as). Require the operator-configured setup token (config.json
-			// setup_token or BIFROST_SETUP_TOKEN env var) so that action can't be taken by
-			// an unauthenticated network caller racing the real operator to a freshly
-			// exposed instance.
-			if authConfig == nil && !isSetupTokenAuthenticated(ctx) && !h.configManager.ValidateSetupToken(payload.AuthConfig.SetupToken) {
-				SendError(ctx, fasthttp.StatusForbidden, "a valid setup token is required to create the initial admin account; configure setup_token in config.json (or the BIFROST_SETUP_TOKEN env var) and pass it in this request")
-				return
-			}
-			// Stored credentials with auth switched off: the caller was admitted without any
-			// credential check, so switching auth back on (or replacing the credentials in
-			// the same request) must first prove control of the instance.
-			if authConfig != nil && isAuthBypassed(ctx) && !h.verifyStoredAdminCredential(ctx, authConfig, payload.AuthConfig) {
-				return
-			}
 			// Fetching current Auth config
 			if payload.AuthConfig.AdminUserName.GetValue() != "" {
 				if payload.AuthConfig.AdminPassword.ShouldPreserveStored() {
@@ -1244,18 +1244,9 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 			if payload.AuthConfig.AdminUserName == nil || payload.AuthConfig.AdminUserName.GetValue() == "" {
 				payload.AuthConfig.AdminUserName = authConfig.AdminUserName
 			}
-			// Replacing the stored credentials while auth stays off is the same exposure as
-			// re-enabling with new ones, so it needs the same proof of control.
-			credentialsReplaced := passwordReplaced || !payload.AuthConfig.AdminUserName.Equals(authConfig.AdminUserName) || !payload.AuthConfig.OIDC.Equals(authConfig.OIDC)
-			if credentialsReplaced && isAuthBypassed(ctx) && !h.verifyStoredAdminCredential(ctx, authConfig, payload.AuthConfig) {
-				return
-			}
 			if passwordReplaced {
-				hashed, ok := h.hashAdminPassword(ctx, payload.AuthConfig.AdminPassword)
-				if !ok {
-					return
-				}
-				payload.AuthConfig.AdminPassword = hashed
+				payload.AuthConfig.AdminPassword = payload.AuthConfig.AdminPassword.Clone()
+				payload.AuthConfig.AdminPassword.Val = validatedPasswordHash
 			}
 			err = h.configManager.UpdateAuthConfig(ctx, &payload.AuthConfig.AuthConfig)
 			if err != nil {

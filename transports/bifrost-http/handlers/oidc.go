@@ -106,6 +106,19 @@ type oidcTransport struct {
 	allowLoopbackHTTP bool
 }
 
+func sameOIDCOrigin(a, b *url.URL) bool {
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		if u.Scheme == "https" {
+			return "443"
+		}
+		return "80"
+	}
+	return a.Scheme == b.Scheme && strings.EqualFold(a.Hostname(), b.Hostname()) && port(a) == port(b)
+}
+
 func (t oidcTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if !allowedOIDCEndpoint(req.URL, t.allowLoopbackHTTP) {
 		return nil, fmt.Errorf("OIDC request requires HTTPS")
@@ -124,6 +137,12 @@ func (s *oidcSignIn) clientForIssuer(issuer string) *http.Client {
 	client.Transport = oidcTransport{base: base, allowLoopbackHTTP: oidcLoopbackHTTP(issuer)}
 	checkRedirect := client.CheckRedirect
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		// Token exchange carries the code, verifier and possibly client secret
+		// in its form body. A 307/308 must not replay it to another origin.
+		if len(via) > 0 && via[0].Method == http.MethodPost &&
+			!sameOIDCOrigin(req.URL, via[0].URL) {
+			return fmt.Errorf("OIDC token exchange redirect must remain on its original origin")
+		}
 		if len(via) > 0 && via[len(via)-1].URL.Scheme == "https" && req.URL.Scheme != "https" {
 			return fmt.Errorf("OIDC redirect cannot downgrade HTTPS")
 		}
@@ -194,7 +213,7 @@ func (h *SessionHandler) oidcLogin(ctx *fasthttp.RequestCtx) {
 	}
 	provider, err := h.oidc.getProvider(auth.OIDC.IssuerURL)
 	if err != nil {
-		logger.Warn("OIDC discovery failed: %v", err)
+		logger.Warn("OIDC discovery failed")
 		oidcFailure(ctx, gotoPath)
 		return
 	}

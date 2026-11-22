@@ -618,8 +618,9 @@ func (bifrost *Bifrost) lastKnownModelsFromCatalog(providerKey schemas.ModelProv
 // listModelsContextKey keys core-internal list-models state on the context.
 type listModelsContextKey string
 
-// listAllModelsFallbackKey marks a per-provider poll started by ListAllModels, the only caller
-// whose failed poll may be answered from the model catalog.
+// listAllModelsFallbackKey carries the outer ListAllModels context for a provider
+// poll. It permits catalog fallback and distinguishes a page's own deadline from
+// cancellation of the aggregate request.
 const listAllModelsFallbackKey listModelsContextKey = "list-all-models-catalog-fallback"
 
 // isExpectedListModelsError reports whether a per-provider list failure is one the aggregate
@@ -645,7 +646,7 @@ func (bifrost *Bifrost) lastKnownListModelsResponse(ctx *schemas.BifrostContext,
 	if req == nil || req.PageToken != "" || isExpectedListModelsError(err) {
 		return nil
 	}
-	if fallback, _ := ctx.Value(listAllModelsFallbackKey).(bool); !fallback {
+	if outer, _ := ctx.Value(listAllModelsFallbackKey).(*schemas.BifrostContext); outer == nil {
 		return nil
 	}
 	models := bifrost.lastKnownModelsFromCatalog(providerKey, req.Unfiltered)
@@ -773,7 +774,7 @@ func (bifrost *Bifrost) ListAllModels(ctx *schemas.BifrostContext, req *schemas.
 				// is abandoned, not cancelled) and wg.Wait() finishes.
 				pageCtx := schemas.NewBifrostContext(ctx, time.Now().Add(listAllModelsProviderTimeout))
 				pageCtx.SetValue(schemas.BifrostContextKeyRequestID, requestID)
-				pageCtx.SetValue(listAllModelsFallbackKey, true)
+				pageCtx.SetValue(listAllModelsFallbackKey, ctx)
 				response, bifrostErr := bifrost.ListModelsRequest(pageCtx, providerRequest)
 				pageCtx.Cancel()
 				if bifrostErr != nil {

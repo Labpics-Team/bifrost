@@ -58,9 +58,9 @@ func (s *BifrostHTTPServer) ListAllModels(ctx *schemas.BifrostContext, req *sche
 	return response.ApplyPagination(req.PageSize, req.PageToken), nil
 }
 
-// Core marks errors returned by Provider.ListModels before post-hooks. Neither
-// provider metadata nor fault classification distinguishes that origin from a
-// policy short-circuit or another request failure.
+// Core stamps provider errors and native per-page timeouts while the aggregate
+// remains active. Provider metadata and fault classification alone cannot
+// distinguish discovery failures from policy short-circuits or request failures.
 func isProviderDiscoveryFailure(err *schemas.BifrostError) bool {
 	return err.ExtraFields.ProviderModelDiscoveryFailure
 }

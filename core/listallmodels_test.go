@@ -2,6 +2,7 @@ package bifrost
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -430,5 +431,136 @@ func TestListModelsRequestDoesNotServeLastKnownModels(t *testing.T) {
 	resp, bfErr := client.ListModelsRequest(ctx, &schemas.BifrostListModelsRequest{Provider: schemas.Groq})
 	if bfErr == nil {
 		t.Fatalf("expected the poll error from a single-provider list call; got %v", modelIDs(resp))
+	}
+}
+
+func TestListAllModelsPageTimeoutPreservesDiscoveryOrigin(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	t.Cleanup(srv.Close)
+	defer close(release)
+	account := NewMockAccount()
+	for _, provider := range []schemas.ModelProvider{schemas.OpenAI, schemas.Groq} {
+		account.AddProviderWithBaseURL(provider, 1, 10, srv.URL)
+		account.SetKeysForProvider(provider, wildcardKey(provider))
+		tuneProviderForTest(t, account, provider)
+	}
+	oldTimeout := listAllModelsProviderTimeout
+	listAllModelsProviderTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { listAllModelsProviderTimeout = oldTimeout })
+	client := newListModelsTestClient(t, account, nil)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	defer ctx.Cancel()
+	resp, bfErr := client.ListAllModels(ctx, &schemas.BifrostListModelsRequest{})
+	if resp != nil || bfErr == nil || bfErr.EffectiveHTTPStatus() != http.StatusGatewayTimeout || !bfErr.ExtraFields.ProviderModelDiscoveryFailure || ctx.Err() != nil {
+		t.Fatalf("page timeout lost its discovery origin while aggregate is active: response=%v error=%+v outer=%v", resp, bfErr, ctx.Err())
+	}
+}
+
+type modelDeadlinePolicyPlugin struct {
+	fakeRoutingPlugin
+}
+
+func (p *modelDeadlinePolicyPlugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
+	if req.ListModelsRequest.Provider != schemas.OpenAI {
+		return req, nil, nil
+	}
+	// A policy decision is allowed to coincide with a page deadline. Its 503
+	// must not be mistaken for the other provider's native discovery timeout.
+	<-ctx.Done()
+	return req, &schemas.LLMPluginShortCircuit{Error: &schemas.BifrostError{
+		StatusCode: schemas.Ptr(http.StatusServiceUnavailable),
+		Error:      &schemas.ErrorField{Message: "catalog policy refuses this caller"},
+	}}, nil
+}
+
+func TestListAllModelsTimeoutDoesNotHidePolicy(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	t.Cleanup(srv.Close)
+	defer close(release)
+	account := NewMockAccount()
+	for _, provider := range []schemas.ModelProvider{schemas.OpenAI, schemas.Groq} {
+		account.AddProviderWithBaseURL(provider, 1, 10, srv.URL)
+		account.SetKeysForProvider(provider, wildcardKey(provider))
+		tuneProviderForTest(t, account, provider)
+	}
+	oldTimeout := listAllModelsProviderTimeout
+	listAllModelsProviderTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { listAllModelsProviderTimeout = oldTimeout })
+	client := newListModelsTestClient(t, account, nil)
+	if err := client.ReloadPlugin(&modelDeadlinePolicyPlugin{fakeRoutingPlugin{name: "deadline-policy"}}, []schemas.PluginType{schemas.PluginTypeLLM}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	defer ctx.Cancel()
+	resp, bfErr := client.ListAllModels(ctx, &schemas.BifrostListModelsRequest{})
+	if resp != nil || bfErr == nil || bfErr.EffectiveHTTPStatus() != http.StatusServiceUnavailable || bfErr.ExtraFields.ProviderModelDiscoveryFailure || bfErr.Error.Message != "catalog policy refuses this caller" {
+		t.Fatalf("page deadline hid a concurrent policy refusal: response=%v error=%+v", resp, bfErr)
+	}
+}
+
+func TestListAllModelsDeadlineOriginScope(t *testing.T) {
+	for _, mode := range []string{"page deadline", "outer deadline", "outer cancellation", "page cancellation", "standalone deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			outerDeadline := schemas.NoDeadline
+			if mode == "outer deadline" {
+				outerDeadline = time.Now().Add(-time.Second)
+			}
+			outer := schemas.NewBifrostContext(context.Background(), outerDeadline)
+			defer outer.Cancel()
+			pageDeadline := time.Now().Add(-time.Second)
+			if mode == "outer cancellation" || mode == "page cancellation" || mode == "outer deadline" {
+				pageDeadline = time.Now().Add(time.Hour)
+			}
+			page := schemas.NewBifrostContext(outer, pageDeadline)
+			defer page.Cancel()
+			if mode != "standalone deadline" {
+				page.SetValue(listAllModelsFallbackKey, outer)
+			}
+			if mode == "outer cancellation" {
+				outer.Cancel()
+			} else if mode == "page cancellation" {
+				page.Cancel()
+			}
+			<-page.Done()
+			bfErr := newBifrostCtxDoneError(page, "waiting for provider response")
+			if got, want := bfErr.ExtraFields.ProviderModelDiscoveryFailure, mode == "page deadline"; got != want {
+				t.Fatalf("discovery attribution=%t, want %t for %s", got, want, mode)
+			}
+			if !errors.Is(bfErr.Error.Error, page.Err()) {
+				t.Fatal("context error identity changed")
+			}
+			if mode == "page deadline" {
+				// A policy post-hook that changes the new native deadline error
+				// must still remove the origin, just as with a provider response.
+				plugin := &deadlinePolicyPostHook{fakeRoutingPlugin{name: "post-deadline-policy"}}
+				pipeline := &PluginPipeline{logger: NewNoOpLogger()}
+				_, changed, err := pipeline.callPostLLMHook(plugin, plugin.GetName(), page, nil, bfErr)
+				if err != nil || changed == nil || changed.ExtraFields.ProviderModelDiscoveryFailure {
+					t.Fatalf("policy mutation retained discovery origin: %+v %v", changed, err)
+				}
+			}
+		})
+	}
+}
+
+type deadlinePolicyPostHook struct{ fakeRoutingPlugin }
+
+func (p *deadlinePolicyPostHook) PostLLMHook(_ *schemas.BifrostContext, _ *schemas.BifrostResponse, err *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError, error) {
+	*err.StatusCode = http.StatusForbidden
+	err.Error.Message = "catalog policy refuses this caller"
+	return nil, err, nil
+}
+
+func BenchmarkListModelsDeadlineError(b *testing.B) {
+	outer := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	defer outer.Cancel()
+	page := schemas.NewBifrostContext(outer, time.Now().Add(-time.Second))
+	defer page.Cancel()
+	page.SetValue(listAllModelsFallbackKey, outer)
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = newBifrostCtxDoneError(page, "waiting for provider response")
 	}
 }
