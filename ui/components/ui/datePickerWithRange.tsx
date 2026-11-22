@@ -175,7 +175,7 @@ export function DateTimePickerWithRange(props: DateTimePickerWithRangeProps) {
 	}, [props.predefinedPeriod]);
 
 	return (
-		<div className={cn("grid gap-2", className)}>
+		<div className={cn("grid min-w-0 max-w-full gap-2", className)}>
 			<Popover
 				open={props.open !== undefined ? props.open : isOpen}
 				onOpenChange={(open) => {
@@ -190,7 +190,7 @@ export function DateTimePickerWithRange(props: DateTimePickerWithRangeProps) {
 						disabled={props.disabled}
 						data-testid={props.triggerTestId}
 						className={cn(
-							"justify-start text-left font-normal",
+							"h-auto min-h-7.5 min-w-0 max-w-full justify-start text-left font-normal whitespace-normal",
 							!date && "text-content-disabled",
 							buttonClassName,
 							isOpen && "border-black",
@@ -201,12 +201,12 @@ export function DateTimePickerWithRange(props: DateTimePickerWithRangeProps) {
 							// Sliding periods (last hour, last 7 days) are durations and timezone-independent,
 							// so they carry no badge. Calendar periods (today, this week) start at local
 							// midnight, so the badge says whose midnight.
-							<span>
+							<span className="min-w-0">
 								{periodLabel(props.preDefinedPeriods?.find((p) => p.value === predefinedPeriod))}
 								{props.showTimezone && tzAbbreviation && isCalendarPeriod(predefinedPeriod) ? ` · ${tzAbbreviation}` : ""}
 							</span>
 						) : (
-							<>
+							<span className="min-w-0">
 								{dateTime?.from ? (
 									dateTime.to ? (
 										<>
@@ -220,12 +220,12 @@ export function DateTimePickerWithRange(props: DateTimePickerWithRangeProps) {
 								) : (
 									<span>{t("datePicker.pickADate")}</span>
 								)}
-							</>
+							</span>
 						)}
 					</Button>
 				</PopoverTrigger>
 				<PopoverContent
-					className="max-h-[calc(100dvh-2rem)] w-[calc(100vw-2rem)] overflow-auto p-0 sm:w-auto"
+					className="w-[calc(100vw-2rem)] overflow-auto p-0 sm:w-auto"
 					align={props.popupAlignment ? props.popupAlignment : "start"}
 				>
 					<div className="flex flex-col gap-2 md:flex-row">
@@ -261,7 +261,7 @@ export function DateTimePickerWithRange(props: DateTimePickerWithRangeProps) {
 								}}
 								numberOfMonths={isMobile ? 1 : 2}
 							/>
-							<div className="-mt-1 flex flex-row items-center px-2 pb-1">
+							<div className="-mt-1 flex flex-row flex-wrap items-center px-2 pb-1">
 								<div className="m-1 flex flex-1 flex-col gap-1">
 									<Label className="ml-0.5">{t("datePicker.fromTime")}</Label>
 									<TimePicker
