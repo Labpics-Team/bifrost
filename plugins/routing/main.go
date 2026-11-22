@@ -416,34 +416,19 @@ func (p *RoutingPlugin) PreRequestHook(ctx *schemas.BifrostContext, req *schemas
 		return nil
 	}
 
-	// The transport may already have hydrated req from the extracted metadata.
-	// Update both the actual dispatch route and the selected body model, while
-	// retaining the original wire value for the bounded streaming rewrite.
+	// Large-payload mode: the body streams to the provider unparsed, so req.Model is
+	// empty for routes where the model lives in the body (OpenAI/Anthropic chat,
+	// responses, etc.). Route on LargePayloadMetadata.Model — the provider's
+	// streaming body rewriter (ApplyLargePayloadRequestBodyWithModelNormalization)
+	// reads metadata.Model when it rewrites the model field in the body prefix, so
+	// mutating it here is what propagates the routing decision to the upstream call.
 	if metadata, _ := ctx.Value(schemas.BifrostContextKeyLargePayloadMetadata).(*schemas.LargePayloadMetadata); metadata != nil && metadata.Model != "" {
-		provider, model, _ := req.GetRequestFields()
-		if model == "" {
-			// Some integrations leave hydration to routing. A transport route,
-			// such as Azure's URL deployment, always takes precedence over body metadata.
-			metadataProvider, metadataModel := schemas.ParseModelString(metadata.Model, provider)
-			if provider == "" {
-				provider = metadataProvider
-			}
-			model = metadataModel
-		}
-		selected, err := p.routeLargePayload(ctx, scope, schemas.Route{Provider: provider, Model: model}, req.RequestType)
+		newModel, err := p.routeLargePayloadModel(ctx, scope, metadata.Model, req.RequestType)
 		if err != nil {
 			return err
 		}
-		if selected.Model != "" {
-			if metadata.OriginalModel == "" {
-				metadata.OriginalModel = metadata.Model
-			}
-			metadata.Model = selected.Model
-			if selected.Provider != "" {
-				metadata.Model = string(selected.Provider) + "/" + selected.Model
-			}
-			req.SetProvider(selected.Provider)
-			req.SetModel(selected.Model)
+		if newModel != "" && newModel != metadata.Model {
+			metadata.Model = newModel
 		}
 		return nil
 	}
@@ -475,18 +460,22 @@ func (p *RoutingPlugin) PreRequestHook(ctx *schemas.BifrostContext, req *schemas
 	return nil
 }
 
-// routeLargePayload wraps the effective ingress route in a synthetic BifrostRequest, runs the same
-// rule evaluation and virtual key materialization as the main PreRequestHook path,
-// and returns the selected route. Its synthetic fallbacks are not attached to the
-// real request because the large-payload body is single-pass.
-func (p *RoutingPlugin) routeLargePayload(ctx *schemas.BifrostContext, scope rules.GovernanceScope, incoming schemas.Route, requestType schemas.RequestType) (schemas.Route, error) {
+// routeLargePayloadModel wraps a model string in a synthetic BifrostRequest, runs the same
+// rule evaluation and virtual key materialization as the main PreRequestHook path, and returns the resolved
+// model (provider-prefixed when a provider was selected, plain model otherwise). Used by the
+// large-payload branch where req.Model is empty because the body wasn't parsed.
+func (p *RoutingPlugin) routeLargePayloadModel(ctx *schemas.BifrostContext, scope rules.GovernanceScope, modelIn string, requestType schemas.RequestType) (string, error) {
+	// Parse a provider-prefixed model string the same way the transport does for
+	// body-having requests, so an explicit prefix like "openai/gpt-4o" lands in
+	// ChatRequest.Provider and rule evaluation honors the caller's routing intent.
+	providerIn, parsedModel := schemas.ParseModelString(modelIn, "")
 	synthetic := &schemas.BifrostRequest{
 		RequestType: requestType,
-		ChatRequest: &schemas.BifrostChatRequest{Provider: incoming.Provider, Model: incoming.Model},
+		ChatRequest: &schemas.BifrostChatRequest{Provider: providerIn, Model: parsedModel},
 	}
 
 	if _, err := p.applyRoutingRules(ctx, synthetic, scope); err != nil {
-		return schemas.Route{}, err
+		return modelIn, err
 	}
 
 	// Publish before load balancing, exactly as the body-having path does: the allowlist is
@@ -498,16 +487,14 @@ func (p *RoutingPlugin) routeLargePayload(ctx *schemas.BifrostContext, scope rul
 	p.governance.PublishRoutingAllowlist(ctx, routedModel)
 
 	if err := p.governance.LoadBalanceProvider(ctx, synthetic); err != nil {
-		return schemas.Route{}, err
-	}
-	if p.AdaptiveRouter != nil {
-		if err := p.AdaptiveRouter.Route(ctx, synthetic); err != nil {
-			return schemas.Route{}, err
-		}
+		return modelIn, err
 	}
 
 	provider, model, _ := synthetic.GetRequestFields()
-	return schemas.Route{Provider: provider, Model: model}, nil
+	if provider != "" {
+		return string(provider) + "/" + model, nil
+	}
+	return model, nil
 }
 
 // applyRoutingRules evaluates routing rules against req and mutates

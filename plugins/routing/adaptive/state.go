@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/framework/configstore"
 )
@@ -261,11 +260,6 @@ func setIncidentState(i *Incident, state string, now time.Time, request string) 
 }
 
 func (c *Controller) reserveCondition(ctx *schemas.BifrostContext, id routeID, force bool) bool {
-	// Single-pass request bodies stay on healthy keys. Forced native fail-open
-	// still sends an attempt when no usable key remains.
-	if !force && providerUtils.IsLargePayloadPassthroughEnabled(ctx) {
-		return false
-	}
 	// A lease is disposable admission state, not a durable lifecycle transition.
 	// Skip an optional check while a transition is in progress; healthy traffic
 	// never queues behind that writer. Persist the actual check with its outcome.

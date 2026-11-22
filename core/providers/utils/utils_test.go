@@ -11,7 +11,6 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
-	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -41,14 +40,6 @@ func TestRewriteJSONModelValue(t *testing.T) {
 	if !strings.Contains(string(out), `"model":"gpt-5"`) {
 		t.Fatalf("expected rewritten model, got: %s", string(out))
 	}
-	t.Run("top-level escaped model preserves nested fields", func(t *testing.T) {
-		payload := []byte(`{"nested":{"model":"m"},"model":"\u006d","messages":[`)
-		want := `{"nested":{"model":"m"},"model":"new\"model","messages":[`
-		got, changed := rewriteJSONModelValue(payload, "m", `new"model`)
-		if !changed || string(got) != want {
-			t.Fatalf("wrong JSON field or escaping: %s", got)
-		}
-	})
 }
 
 func TestApplyLargePayloadRequestBodyWithModelNormalization(t *testing.T) {
@@ -76,174 +67,6 @@ func TestApplyLargePayloadRequestBodyWithModelNormalization(t *testing.T) {
 	}
 	if !strings.Contains(body, `"model":"gpt-5"`) {
 		t.Fatalf("expected normalized model in body, got: %s", body)
-	}
-
-	t.Run("multipart changes only the model field", func(t *testing.T) {
-		payload := "--boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nm\r\n--boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"m.wav\"\r\nContent-Type: audio/wav\r\n\r\nm audio bytes\r\n--boundary--\r\n"
-		want := strings.Replace(payload, "name=\"model\"\r\n\r\nm\r\n", "name=\"model\"\r\n\r\nwhisper-large\r\n", 1)
-		reader, delta := RewriteLargePayloadModelInMultipartPrefix(strings.NewReader(payload), "m", "whisper-large")
-		got, err := io.ReadAll(reader)
-		if err != nil || string(got) != want || delta != len(want)-len(payload) {
-			t.Fatalf("multipart model rewrite changed other fields: %q delta=%d err=%v", got, delta, err)
-		}
-	})
-	for _, test := range []struct {
-		name, preamble, padding, prompt, ending string
-	}{
-		{name: "inline boundary in preamble", preamble: "example --boundary marker\r\n", ending: "\r\n"},
-		{name: "boundary prefix in preamble", preamble: "--boundary-extra\r\n", ending: "\r\n"},
-		{name: "transport padding", padding: " \t", ending: "\r\n"},
-		{name: "boundary prefixes in field", prompt: "prefix --boundary marker\r\n--boundary-extra", ending: "\r\n"},
-		{name: "padded closing delimiter at EOF", padding: "\t "},
-	} {
-		t.Run("multipart delimiter/"+test.name, func(t *testing.T) {
-			boundaryLine := "--boundary" + test.padding + "\r\n"
-			payload := test.preamble + boundaryLine + "Content-Disposition: form-data; name=\"prompt\"\r\n\r\n" + test.prompt + "\r\n" + boundaryLine + "Content-Disposition: form-data; name=\"model\"\r\n\r\nm\r\n--boundary--" + test.padding + test.ending
-			readFields := func(body string) map[string]string {
-				t.Helper()
-				reader := multipart.NewReader(strings.NewReader(body), "boundary")
-				fields := map[string]string{}
-				for {
-					part, err := reader.NextPart()
-					if err == io.EOF {
-						return fields
-					}
-					if err != nil {
-						t.Fatalf("standard MIME reader rejected the body: %v", err)
-					}
-					value, err := io.ReadAll(part)
-					if err != nil {
-						t.Fatalf("standard MIME reader rejected a part: %v", err)
-					}
-					fields[part.FormName()] = string(value)
-				}
-			}
-			if fields := readFields(payload); fields["model"] != "m" || fields["prompt"] != test.prompt {
-				t.Fatalf("invalid MIME fixture: %+v", fields)
-			}
-			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
-			ctx.SetValue(schemas.BifrostContextKeyLargePayloadMode, true)
-			ctx.SetValue(schemas.BifrostContextKeyLargePayloadReader, strings.NewReader(payload))
-			ctx.SetValue(schemas.BifrostContextKeyLargePayloadContentType, "multipart/form-data; boundary=boundary")
-			ctx.SetValue(schemas.BifrostContextKeyLargePayloadContentLength, len(payload))
-			ctx.SetValue(schemas.BifrostContextKeyLargePayloadMetadata, &schemas.LargePayloadMetadata{OriginalModel: "m", Model: "groq/whisper-large"})
-			wire := &fasthttp.Request{}
-			if !ApplyLargePayloadRequestBodyWithModelNormalization(ctx, wire, schemas.Groq) {
-				t.Fatal("stream was not attached")
-			}
-			length := wire.Header.ContentLength()
-			body, err := io.ReadAll(wire.BodyStream())
-			if err != nil {
-				t.Fatal(err)
-			}
-			want := strings.Replace(payload, "name=\"model\"\r\n\r\nm\r\n", "name=\"model\"\r\n\r\nwhisper-large\r\n", 1)
-			if string(body) != want || length != len(want) {
-				t.Fatalf("wire model or length is wrong: length=%d want=%d body=%q", length, len(want), body)
-			}
-			if fields := readFields(string(body)); fields["model"] != "whisper-large" || fields["prompt"] != test.prompt {
-				t.Fatalf("rewritten MIME fields differ: %+v", fields)
-			}
-		})
-	}
-	t.Run("multipart closing delimiter at scan limit", func(t *testing.T) {
-		part := "--boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm\r\n--boundary-- \t"
-		preambleSize := largePayloadModelRewriteScanBytes - len(part)
-		preamble := strings.Repeat("x", preambleSize%1024) + strings.Repeat(strings.Repeat("x", 1022)+"\r\n", preambleSize/1024)
-		payload := preamble + part + "\r\n"
-		mimeReader := multipart.NewReader(strings.NewReader(payload), "boundary")
-		modelPart, err := mimeReader.NextPart()
-		if err != nil {
-			t.Fatal(err)
-		}
-		model, err := io.ReadAll(modelPart)
-		if err != nil || modelPart.FormName() != "model" || string(model) != "m" {
-			t.Fatalf("invalid MIME fixture: model=%q err=%v", model, err)
-		}
-		if _, err := mimeReader.NextPart(); err != io.EOF {
-			t.Fatalf("invalid MIME ending: %v", err)
-		}
-		source := strings.NewReader(payload)
-		reader, delta := RewriteLargePayloadModelInMultipartPrefix(source, "m", "whisper-large", "boundary")
-		if source.Len() != 2 {
-			t.Fatalf("scan read beyond the prefix: %d bytes remain", source.Len())
-		}
-		body, err := io.ReadAll(reader)
-		if err != nil || string(body) != payload || delta != 0 {
-			t.Fatalf("incomplete delimiter must preserve the body and length: delta=%d err=%v", delta, err)
-		}
-	})
-	t.Run("multipart legacy boundary with transport padding", func(t *testing.T) {
-		payload := "--boundary \t\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nm\r\n--boundary--\t "
-		want := strings.Replace(payload, "\r\n\r\nm\r\n", "\r\n\r\nwhisper-large\r\n", 1)
-		reader, delta := RewriteLargePayloadModelInMultipartPrefix(strings.NewReader(payload), "m", "whisper-large")
-		body, err := io.ReadAll(reader)
-		if err != nil || string(body) != want || delta != len(want)-len(payload) {
-			t.Fatalf("legacy boundary did not ignore transport padding: delta=%d err=%v", delta, err)
-		}
-	})
-	for _, format := range []string{"json", "multipart"} {
-		for _, knownLength := range []bool{false, true} {
-			t.Run(fmt.Sprintf("routed %s/length=%t", format, knownLength), func(t *testing.T) {
-				tail := strings.Repeat("x", largePayloadModelRewriteScanBytes*2)
-				payload := `{"nested":{"model":"m"},"model":"m","data":"` + tail + `"}`
-				want := strings.Replace(payload, `},"model":"m"`, `},"model":"whisper-large"`, 1)
-				contentType := "application/json"
-				if format == "multipart" {
-					payload = "MIME preamble\r\n--boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nm\r\n--boundary\r\ncontent-disposition: form-data; name=model\r\n\r\nm\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"m.wav\"\r\nContent-Type: audio/wav\r\n\r\n" + tail + "\r\n--boundary--\r\n"
-					want = strings.Replace(payload, "name=model\r\n\r\nm\r\n", "name=model\r\n\r\nwhisper-large\r\n", 1)
-					contentType = `multipart/form-data; boundary="boundary"`
-				}
-				ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
-				reader := strings.NewReader(payload)
-				ctx.SetValue(schemas.BifrostContextKeyLargePayloadMode, true)
-				ctx.SetValue(schemas.BifrostContextKeyLargePayloadReader, reader)
-				ctx.SetValue(schemas.BifrostContextKeyLargePayloadContentType, contentType)
-				ctx.SetValue(schemas.BifrostContextKeyLargePayloadMetadata, &schemas.LargePayloadMetadata{OriginalModel: "m", Model: "groq/whisper-large"})
-				if knownLength {
-					ctx.SetValue(schemas.BifrostContextKeyLargePayloadContentLength, len(payload))
-				}
-				req := &fasthttp.Request{}
-				if !ApplyLargePayloadRequestBodyWithModelNormalization(ctx, req, schemas.Groq) {
-					t.Fatal("stream was not attached")
-				}
-				if reader.Len() < len(payload)-largePayloadModelRewriteScanBytes {
-					t.Fatal("model rewriting read beyond the bounded prefix")
-				}
-				length := req.Header.ContentLength()
-				body, err := io.ReadAll(req.BodyStream())
-				if err != nil || string(body) != want {
-					t.Fatalf("routed body differs from the selected model or changed other bytes: err=%v", err)
-				}
-				if knownLength && length != len(body) || !knownLength && length != -1 {
-					t.Fatalf("wrong wire length: header=%d actual=%d known=%t", length, len(body), knownLength)
-				}
-			})
-		}
-	}
-}
-
-func BenchmarkLargePayloadModelRewrite(b *testing.B) {
-	tail := strings.Repeat("x", largePayloadModelRewriteScanBytes*2)
-	for _, format := range []string{"json", "multipart"} {
-		b.Run(format, func(b *testing.B) {
-			payload := `{"model":"openai/m","data":"` + tail + `"}`
-			if format == "multipart" {
-				payload = "--boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nopenai/m\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\r\n" + tail + "\r\n--boundary--\r\n"
-			}
-			b.ReportAllocs()
-			b.SetBytes(int64(len(payload)))
-			for b.Loop() {
-				var rewritten io.Reader
-				if format == "json" {
-					rewritten, _ = RewriteLargePayloadModelInJSONPrefix(strings.NewReader(payload), "openai/m", "m")
-				} else {
-					rewritten, _ = RewriteLargePayloadModelInMultipartPrefix(strings.NewReader(payload), "openai/m", "m")
-				}
-				if _, err := io.Copy(io.Discard, rewritten); err != nil {
-					b.Fatal(err)
-				}
-			}
-		})
 	}
 }
 

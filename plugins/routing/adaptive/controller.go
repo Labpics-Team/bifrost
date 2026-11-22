@@ -117,6 +117,14 @@ func (c *Controller) SetProviderExists(exists func(schemas.ModelProvider) bool) 
 	c.providerExists = exists
 }
 func (c *Controller) Enabled() bool { return c.enabled.Load() }
+
+// supportsRequest leaves the unparsed-body extension on upstream selection.
+// Native parsed requests and streaming responses remain adaptive at any size.
+func supportsRequest(ctx *schemas.BifrostContext) bool {
+	largePayload, _ := ctx.Value(schemas.BifrostContextKeyLargePayloadMode).(bool)
+	return !largePayload
+}
+
 func (c *Controller) Apply(config Config) error {
 	if err := config.Validate(); err != nil {
 		return err
@@ -186,7 +194,7 @@ func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, 
 	if len(keys) == 0 {
 		return schemas.Key{}, fmt.Errorf("no eligible keys for %s/%s", provider, model)
 	}
-	if !c.enabled.Load() {
+	if !c.enabled.Load() || !supportsRequest(ctx) {
 		return keyselectors.WeightedRandom(ctx, keys, provider, model)
 	}
 	for _, key := range keys {
@@ -325,7 +333,7 @@ func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, 
 // BeginProviderAttempt observes actual provider calls, including retries and
 // streaming teardown. Direct caller credentials never enter managed-key health.
 func (c *Controller) BeginProviderAttempt(ctx *schemas.BifrostContext, info schemas.ProviderAttemptInfo) schemas.ProviderAttempt {
-	if !c.enabled.Load() || info.Model == "" || ctx.Value(schemas.BifrostContextKeyDirectKey) != nil {
+	if !c.enabled.Load() || info.Model == "" || ctx.Value(schemas.BifrostContextKeyDirectKey) != nil || !supportsRequest(ctx) {
 		return nil
 	}
 	c.mu.Lock()

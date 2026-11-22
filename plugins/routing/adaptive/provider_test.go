@@ -3,7 +3,6 @@ package adaptive
 import (
 	"context"
 	"errors"
-	"fmt"
 	"reflect"
 	"slices"
 	"strings"
@@ -418,136 +417,81 @@ func TestAdaptiveUnknownHealthPreservesExplicitDirections(t *testing.T) {
 	}
 }
 
-func passthroughContext() *schemas.BifrostContext {
-	ctx := testContext()
-	ctx.SetValue(schemas.BifrostContextKeyLargePayloadMode, true)
-	ctx.SetValue(schemas.BifrostContextKeyLargePayloadReader, strings.NewReader(`{"model":"m"}`))
-	return ctx
-}
-
-func TestAdaptiveRecoveryChecksRequireReplayableBody(t *testing.T) {
-	for _, status := range []int{401, 503} {
-		for _, body := range []string{"single pass", "metadata only", "mode only", "reader only", "ordinary stream"} {
-			for _, named := range []schemas.ModelProvider{"", "p1"} {
-				t.Run(fmt.Sprintf("%d/%s/%s", status, body, named), func(t *testing.T) {
-					c, now := providerController()
-					c.SetCatalog(func(string) []schemas.ModelProvider { return []schemas.ModelProvider{"p1", "p2"} }, func(context.Context, schemas.ModelProvider) ([]schemas.Key, error) { return testKeys[:1], nil }, func(schemas.ModelProvider, schemas.Key, string) bool { return true })
-					cfg := c.Config()
-					cfg.RerouteFailedDirections = true
-					if err := c.Apply(cfg); err != nil {
-						t.Fatal(err)
-					}
-					for range 3 {
-						observe(c, "p1", "m", "a", responseError(status))
-					}
-					*now = now.Add(time.Minute)
-					ctx := testContext()
-					req := routeRequest(named)
-					switch body {
-					case "single pass":
-						ctx = passthroughContext()
-					case "metadata only":
-						ctx.SetValue(schemas.BifrostContextKeyLargePayloadMetadata, &schemas.LargePayloadMetadata{Model: "m"})
-					case "mode only":
-						ctx.SetValue(schemas.BifrostContextKeyLargePayloadMode, true)
-					case "reader only":
-						ctx.SetValue(schemas.BifrostContextKeyLargePayloadReader, strings.NewReader("body"))
-					case "ordinary stream":
-						req.RequestType = schemas.ChatCompletionStreamRequest
-					}
-					if err := c.Route(ctx, req); err != nil {
-						t.Fatal(err)
-					}
-					provider, _, fallbacks := req.GetRequestFields()
-					if body == "single pass" {
-						if provider != "p2" || ctx.Value(probeContextKey{}) != nil {
-							t.Fatalf("single-pass request used an optional recovery check: %s", provider)
-						}
-						// Skipping this request must leave the check available for
-						// ordinary traffic that can carry its healthy fallback.
-						ctx, req = testContext(), routeRequest(named)
-						if err := c.Route(ctx, req); err != nil {
-							t.Fatal(err)
-						}
-						provider, _, fallbacks = req.GetRequestFields()
-					}
-					if provider != "p1" || ctx.Value(probeContextKey{}) == nil || !slices.ContainsFunc(fallbacks, func(fb schemas.Fallback) bool { return fb.Provider == "p2" }) {
-						t.Fatalf("ordinary request lost recovery check or healthy fallback: %s %+v", provider, fallbacks)
-					}
-				})
+func TestAdaptiveLeavesLargePayloadExtensionToNativeSelection(t *testing.T) {
+	largeText := strings.Repeat("x", int(schemas.DefaultLargePayloadRequestThresholdBytes)+1)
+	for _, test := range []struct {
+		name                     string
+		extension, reader, large bool
+		stream, metadata         bool
+	}{
+		{name: "extension", extension: true, reader: true},
+		{name: "extension without reader", extension: true},
+		{name: "native large parsed request", large: true},
+		{name: "native streaming response", stream: true},
+		{name: "metadata without extension mode", metadata: true},
+		{name: "reader without extension mode", reader: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, _ := providerController()
+			cfg := c.Config()
+			cfg.RerouteFailedDirections = true
+			if err := c.Apply(cfg); err != nil {
+				t.Fatal(err)
 			}
-		}
-	}
-}
-
-func TestAdaptiveSinglePassSkipsOptionalKeyChecks(t *testing.T) {
-	for _, status := range []int{401, 503} {
-		t.Run(fmt.Sprint(status), func(t *testing.T) {
-			c, now := testController()
-			for range 3 {
-				observe(c, "p1", "m", "a", responseError(status))
+			failProvider(c, "p1")
+			observe(c, "key-pool", "m", "a", responseError(401))
+			ctx, req := testContext(), routeRequest("p1")
+			if test.extension {
+				ctx.SetValue(schemas.BifrostContextKeyLargePayloadMode, true)
 			}
-			*now = now.Add(time.Minute)
-			ctx := passthroughContext()
-			key, err := c.SelectKey(ctx, testKeys, "p1", "m")
-			if err != nil || key.ID != "b" || ctx.Value(probeContextKey{}) != nil {
-				t.Fatalf("single-pass request checked an unavailable key: %s %v", key.ID, err)
+			reader := strings.NewReader("unparsed body")
+			if test.reader {
+				ctx.SetValue(schemas.BifrostContextKeyLargePayloadReader, reader)
 			}
-			key, err = c.SelectKey(testContext(), testKeys, "p1", "m")
-			if err != nil || key.ID != "a" {
-				t.Fatalf("ordinary traffic lost the skipped key check: %s %v", key.ID, err)
+			if test.metadata {
+				ctx.SetValue(schemas.BifrostContextKeyLargePayloadMetadata, &schemas.LargePayloadMetadata{Model: "m"})
 			}
-		})
-	}
-}
-
-func TestAdaptiveSinglePassKeepsNativeFailOpenAndPins(t *testing.T) {
-	for _, status := range []int{401, 503} {
-		for _, mode := range []string{"all unavailable", "pinned key", "allowlist"} {
-			t.Run(fmt.Sprintf("%d/%s", status, mode), func(t *testing.T) {
-				c, now := providerController()
-				cfg := c.Config()
-				cfg.RerouteFailedDirections = true
-				if err := c.Apply(cfg); err != nil {
-					t.Fatal(err)
-				}
-				for _, key := range testKeys {
-					for range 3 {
-						observe(c, "p1", "m", key.ID, responseError(status))
-					}
-				}
-				*now = now.Add(time.Minute)
-				ctx := passthroughContext()
-				switch mode {
-				case "all unavailable":
-					c.SetCatalog(func(string) []schemas.ModelProvider { return []schemas.ModelProvider{"p1"} }, c.keys, c.supports)
-				case "pinned key":
-					ctx.SetValue(schemas.BifrostContextKeyAPIKeyID, "a")
-				case "allowlist":
-					ctx.SetValue(schemas.BifrostContextKeyRoutingAllowedProviders, []schemas.ModelProvider{"p1"})
-				}
-				req := routeRequest("p1")
-				if err := c.Route(ctx, req); err != nil {
-					t.Fatal(err)
-				}
-				provider, model, _ := req.GetRequestFields()
-				if provider != "p1" {
-					t.Fatalf("single-pass routing escaped native selection: %s", provider)
-				}
-				key, err := c.SelectKey(ctx, testKeys[:1], provider, model)
-				if err != nil || key.ID != "a" {
-					t.Fatalf("all-unavailable pool refused its native attempt: %s %v", key.ID, err)
-				}
-				attempt := c.BeginProviderAttempt(ctx, schemas.ProviderAttemptInfo{Provider: provider, Model: model, KeyID: key.ID})
-				if attempt == nil {
-					t.Fatal("native attempt was not observed")
-				}
+			if test.large {
+				req.ChatRequest.Input = []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: &largeText}}}
+			}
+			if test.stream {
+				req.RequestType = schemas.ChatCompletionStreamRequest
+			}
+			before := c.Status()
+			if err := c.Route(ctx, req); err != nil {
+				t.Fatal(err)
+			}
+			provider, _, _ := req.GetRequestFields()
+			wantProvider, wantKey := schemas.ModelProvider("p2"), "b"
+			if test.extension {
+				wantProvider, wantKey = "p1", "a"
+			}
+			if provider != wantProvider {
+				t.Errorf("provider=%s, want %s", provider, wantProvider)
+			}
+			// Native configured weights deterministically choose a. Adaptive
+			// selection must instead skip its hold and choose healthy b.
+			keys := []schemas.Key{{ID: "a", Name: "A", Weight: 1}, {ID: "b", Name: "B", Weight: 0}}
+			key, err := c.SelectKey(ctx, keys, "key-pool", "m")
+			if err != nil || key.ID != wantKey {
+				t.Errorf("key=%s, want %s: %v", key.ID, wantKey, err)
+			}
+			attempt := c.BeginProviderAttempt(ctx, schemas.ProviderAttemptInfo{Provider: "key-pool", Model: "m", KeyID: "b", KeyName: "B"})
+			if test.extension && attempt != nil {
+				t.Error("extension attempt entered adaptive admission/observation")
+			} else if !test.extension && attempt == nil {
+				t.Error("native attempt lost adaptive observation")
+			}
+			if attempt != nil {
 				attempt.Observe(&schemas.BifrostResponse{}, nil)
 				attempt.End()
-				if c.holdLocked(routeID{provider, model, key.ID}, c.now()) != nil {
-					t.Fatal("successful native attempt did not release the hold")
-				}
-			})
-		}
+			}
+			if ctx.Value(probeContextKey{}) != nil || reader.Len() != len("unparsed body") {
+				t.Error("request unexpectedly reserved a check or consumed the body")
+			}
+			if test.extension && !reflect.DeepEqual(before, c.Status()) {
+				t.Error("extension request changed adaptive state")
+			}
+		})
 	}
 }

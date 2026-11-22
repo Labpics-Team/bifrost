@@ -2,25 +2,17 @@ package routing
 
 import (
 	"context"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	bifrost "github.com/maximhq/bifrost/core"
-	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
-	"github.com/maximhq/bifrost/framework/configstore"
 	configstoreTables "github.com/maximhq/bifrost/framework/configstore/tables"
 	"github.com/maximhq/bifrost/framework/grant"
-	"github.com/maximhq/bifrost/plugins/routing/adaptive"
 	"github.com/maximhq/bifrost/plugins/routing/rules"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/valyala/fasthttp"
 )
 
 // TestApplyRoutingRules_PinnedKeyReachesContext exercises the real propagation path through
@@ -324,9 +316,6 @@ func TestPreRequestHook_LargePayloadPublishesAllowlistBeforeRefinement(t *testin
 		"load balancing must run on the routed model")
 	assert.Equal(t, "azure/azure-gpt-4o-mini-deployment", metadata.Model,
 		"the refined provider/model must be written back to the streamed metadata")
-	assert.Equal(t, "gpt-4o", metadata.OriginalModel)
-	assert.Equal(t, schemas.Azure, req.ChatRequest.Provider)
-	assert.Equal(t, "azure-gpt-4o-mini-deployment", req.ChatRequest.Model)
 }
 
 // fallbackMatrixPlugin loads one global rule matching model "m" whose fallbacks are decoded from
@@ -676,151 +665,5 @@ func BenchmarkWarnFallbacksOutsideAccess(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		plugin.warnFallbacksOutsideAccess(ctx, "rule", fallbacks)
-	}
-}
-
-func TestPreRequestHook_LargePayloadUsesHealthyAdaptiveDirection(t *testing.T) {
-	for _, model := range []string{"m", "openai/m"} {
-		t.Run(model, func(t *testing.T) {
-			ctx := context.Background()
-			store, err := configstore.NewConfigStore(ctx, &configstore.Config{
-				Enabled: true,
-				Type:    configstore.ConfigStoreTypeSQLite,
-				Config:  &configstore.SQLiteConfig{Path: filepath.Join(t.TempDir(), "config.db")},
-			}, bifrost.NewDefaultLogger(schemas.LogLevelError))
-			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, store.Close(ctx)) })
-			cfg := adaptive.DefaultConfig()
-			cfg.RerouteFailedDirections = true
-			controller, err := adaptive.NewFromStore(ctx, store, &cfg)
-			require.NoError(t, err)
-			key := schemas.Key{ID: "a", Name: "A", Weight: 1}
-			controller.SetCatalog(func(string) []schemas.ModelProvider {
-				return []schemas.ModelProvider{schemas.OpenAI, schemas.Anthropic}
-			}, func(context.Context, schemas.ModelProvider) ([]schemas.Key, error) {
-				return []schemas.Key{key}, nil
-			}, func(schemas.ModelProvider, schemas.Key, string) bool { return true })
-			attempt := controller.BeginProviderAttempt(schemas.NewBifrostContext(ctx, schemas.NoDeadline), schemas.ProviderAttemptInfo{
-				Provider: schemas.OpenAI, Model: "m", KeyID: key.ID, KeyName: key.Name,
-			})
-			require.NotNil(t, attempt)
-			attempt.Observe(nil, &schemas.BifrostError{StatusCode: bifrost.Ptr(401), Error: &schemas.ErrorField{Message: "invalid credential"}})
-			attempt.End()
-			// Restore a due hold using the real persistence contract. No wall-clock
-			// wait or test-only clock hook is needed at the plugin boundary.
-			update := store.DB().Exec("UPDATE adaptive_routing_conditions SET hold_until = ?", time.Now().Add(-time.Minute))
-			require.NoError(t, update.Error)
-			require.EqualValues(t, 1, update.RowsAffected)
-			require.NoError(t, controller.Restore(ctx))
-
-			ruleStore, err := rules.NewLocalStore(ctx, rules.NewMockLogger(), nil)
-			require.NoError(t, err)
-			plugin, err := InitFromStore(ctx, &Config{AdaptiveRouter: controller}, rules.NewMockLogger(), nil, ruleStore, NewMockGovernance())
-			require.NoError(t, err)
-			metadata := &schemas.LargePayloadMetadata{Model: model}
-			requestCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
-			payload := `{"model":"` + model + `","messages":[]}`
-			reader := strings.NewReader(payload)
-			requestCtx.SetValue(schemas.BifrostContextKeyLargePayloadMetadata, metadata)
-			requestCtx.SetValue(schemas.BifrostContextKeyLargePayloadMode, true)
-			requestCtx.SetValue(schemas.BifrostContextKeyLargePayloadReader, reader)
-			requestCtx.SetValue(schemas.BifrostContextKeyLargePayloadContentType, "application/json")
-			requestCtx.SetValue(schemas.BifrostContextKeyLargePayloadContentLength, len(payload))
-			providerIn, modelIn := schemas.ParseModelString(model, "")
-			req := &schemas.BifrostRequest{RequestType: schemas.ChatCompletionRequest, ChatRequest: &schemas.BifrostChatRequest{Provider: providerIn, Model: modelIn}}
-			require.NoError(t, plugin.PreRequestHook(requestCtx, req))
-			require.Equal(t, "anthropic/m", metadata.Model, "single-pass body must use the healthy provider because this path carries no fallback chain")
-			require.Equal(t, model, metadata.OriginalModel)
-			assert.Equal(t, schemas.Anthropic, req.ChatRequest.Provider, "core dispatch must use the healthy direction")
-			assert.Equal(t, "m", req.ChatRequest.Model)
-			require.Empty(t, req.ChatRequest.Fallbacks)
-			require.Equal(t, len(payload), reader.Len(), "routing must not consume the streamed body")
-			wire := &fasthttp.Request{}
-			require.True(t, providerUtils.ApplyLargePayloadRequestBodyWithModelNormalization(requestCtx, wire, schemas.Anthropic))
-			wireLength := wire.Header.ContentLength()
-			body, err := io.ReadAll(wire.BodyStream())
-			require.NoError(t, err)
-			assert.JSONEq(t, `{"model":"m","messages":[]}`, string(body))
-			assert.Equal(t, len(body), wireLength, "announced length must match the bytes sent")
-
-			ordinary := &schemas.BifrostRequest{RequestType: schemas.ChatCompletionStreamRequest, ChatRequest: &schemas.BifrostChatRequest{Model: "m"}}
-			require.NoError(t, plugin.PreRequestHook(schemas.NewBifrostContext(ctx, schemas.NoDeadline), ordinary))
-			require.Equal(t, schemas.OpenAI, ordinary.ChatRequest.Provider, "the skipped recovery check must remain available for an ordinary streaming request")
-			require.Contains(t, ordinary.ChatRequest.Fallbacks, schemas.Fallback{Provider: schemas.Anthropic, Model: "m", Inferred: true})
-		})
-	}
-}
-
-func TestPreRequestHook_LargePayloadPreservesAzureURLRoute(t *testing.T) {
-	for _, format := range []string{"json", "multipart"} {
-		t.Run(format, func(t *testing.T) {
-			store, err := rules.NewLocalStore(context.Background(), rules.NewMockLogger(), nil)
-			require.NoError(t, err)
-			governance := NewMockGovernance()
-			plugin, err := InitFromStore(context.Background(), nil, rules.NewMockLogger(), nil, store, governance)
-			require.NoError(t, err)
-			// AzureEndpointPreHook has already made the URL deployment win over
-			// the body model before conversion to this actual BifrostRequest.
-			const deployment = "production-deployment"
-			sourceModel := "gpt-4o"
-			payload := `{"model":"gpt-4o","messages":[]}`
-			wantBody := `{"model":"production-deployment","messages":[]}`
-			contentType := "application/json"
-			endpoint := "/chat/completions"
-			req := &schemas.BifrostRequest{RequestType: schemas.ChatCompletionRequest, ChatRequest: &schemas.BifrostChatRequest{Provider: schemas.Azure, Model: deployment}}
-			if format == "multipart" {
-				sourceModel = "whisper-1"
-				payload = "--boundary\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nwhisper-1\r\n--boundary\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper-1\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n\r\naudio bytes\r\n--boundary--\r\n"
-				wantBody = strings.Replace(payload, "name=\"model\"\r\n\r\nwhisper-1\r\n", "name=\"model\"\r\n\r\nproduction-deployment\r\n", 1)
-				contentType = "multipart/form-data; boundary=boundary"
-				endpoint = "/audio/transcriptions"
-				req = &schemas.BifrostRequest{RequestType: schemas.TranscriptionRequest, TranscriptionRequest: &schemas.BifrostTranscriptionRequest{Provider: schemas.Azure, Model: deployment}}
-			}
-			metadata := &schemas.LargePayloadMetadata{Model: sourceModel}
-			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
-			reader := strings.NewReader(payload)
-			ctx.SetValue(schemas.BifrostContextKeyLargePayloadMetadata, metadata)
-			ctx.SetValue(schemas.BifrostContextKeyLargePayloadMode, true)
-			ctx.SetValue(schemas.BifrostContextKeyLargePayloadReader, reader)
-			ctx.SetValue(schemas.BifrostContextKeyLargePayloadContentType, contentType)
-			ctx.SetValue(schemas.BifrostContextKeyLargePayloadContentLength, len(payload))
-			require.NoError(t, plugin.PreRequestHook(ctx, req))
-			provider, model, fallbacks := req.GetRequestFields()
-			assert.Equal(t, schemas.Azure, provider)
-			assert.Equal(t, deployment, model)
-			assert.Equal(t, []string{deployment}, governance.AllowlistModels, "governance must evaluate the effective ingress model")
-			require.Empty(t, fallbacks)
-			require.Equal(t, sourceModel, metadata.OriginalModel)
-			require.Equal(t, len(payload), reader.Len(), "routing must not consume the body")
-			if provider != schemas.Azure || model != deployment {
-				return
-			}
-
-			type received struct {
-				path, contentType, body string
-				length                  int64
-				err                     error
-			}
-			upstreamReceived := make(chan received, 1)
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				body, err := io.ReadAll(r.Body)
-				upstreamReceived <- received{r.URL.Path, r.Header.Get("Content-Type"), string(body), r.ContentLength, err}
-				w.WriteHeader(http.StatusNoContent)
-			}))
-			defer upstream.Close()
-			wire := &fasthttp.Request{}
-			wire.Header.SetMethod(http.MethodPost)
-			wire.SetRequestURI(upstream.URL + "/openai/deployments/" + model + endpoint)
-			require.True(t, providerUtils.ApplyLargePayloadRequestBodyWithModelNormalization(ctx, wire, provider))
-			response := &fasthttp.Response{}
-			require.NoError(t, fasthttp.DoTimeout(wire, response, 2*time.Second))
-			require.Equal(t, http.StatusNoContent, response.StatusCode())
-			got := <-upstreamReceived
-			require.NoError(t, got.err)
-			assert.Equal(t, "/openai/deployments/"+deployment+endpoint, got.path)
-			assert.Equal(t, contentType, got.contentType)
-			assert.Equal(t, wantBody, got.body)
-			assert.EqualValues(t, len(got.body), got.length, "the HTTP peer must receive exactly the announced bytes")
-		})
 	}
 }

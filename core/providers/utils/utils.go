@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net"
 	"net/http"
 	"net/textproto"
@@ -1906,12 +1905,8 @@ func ApplyLargePayloadRequestBodyWithModelNormalization(
 	if contentType, ok := ctx.Value(schemas.BifrostContextKeyLargePayloadContentType).(string); ok && contentType != "" {
 		ctLower := strings.ToLower(contentType)
 		if metadata, ok := ctx.Value(schemas.BifrostContextKeyLargePayloadMetadata).(*schemas.LargePayloadMetadata); ok && metadata != nil {
-			rawModel := metadata.OriginalModel
-			if rawModel == "" {
-				rawModel = metadata.Model
-			}
-			if rawModel != "" && (defaultProvider != "" || metadata.OriginalModel != "") {
-				_, normalizedModel := schemas.ParseModelString(strings.TrimSpace(metadata.Model), defaultProvider)
+			if rawModel := strings.TrimSpace(metadata.Model); rawModel != "" && defaultProvider != "" {
+				_, normalizedModel := schemas.ParseModelString(rawModel, defaultProvider)
 				if normalizedModel != "" && normalizedModel != rawModel {
 					if strings.Contains(ctLower, "application/json") {
 						rewrittenReader, sizeDelta := RewriteLargePayloadModelInJSONPrefix(bodyReader, rawModel, normalizedModel)
@@ -1920,8 +1915,7 @@ func ApplyLargePayloadRequestBodyWithModelNormalization(
 							bodySize += sizeDelta
 						}
 					} else if strings.Contains(ctLower, "multipart/form-data") {
-						_, params, _ := mime.ParseMediaType(contentType)
-						rewrittenReader, sizeDelta := RewriteLargePayloadModelInMultipartPrefix(bodyReader, rawModel, normalizedModel, params["boundary"])
+						rewrittenReader, sizeDelta := RewriteLargePayloadModelInMultipartPrefix(bodyReader, rawModel, normalizedModel)
 						bodyReader = rewrittenReader
 						if bodySize >= 0 {
 							bodySize += sizeDelta
@@ -1961,26 +1955,73 @@ func rewriteJSONModelValue(data []byte, fromModel, toModel string) ([]byte, bool
 	if len(data) == 0 || fromModel == "" || toModel == "" || fromModel == toModel {
 		return data, false
 	}
-	// Read only the top-level field. GJSON also handles an incomplete body
-	// prefix and escaped model strings without parsing the large payload.
-	value := gjson.GetBytes(data, "model")
-	if value.Type != gjson.String || value.Str != fromModel {
-		return data, false
+	pattern := []byte(`"model"`)
+	searchFrom := 0
+	for {
+		match := bytes.Index(data[searchFrom:], pattern)
+		if match < 0 {
+			return data, false
+		}
+		idx := searchFrom + match + len(pattern)
+
+		for idx < len(data) && (data[idx] == ' ' || data[idx] == '\t' || data[idx] == '\r' || data[idx] == '\n') {
+			idx++
+		}
+		if idx >= len(data) || data[idx] != ':' {
+			searchFrom += match + len(pattern)
+			continue
+		}
+		idx++
+		for idx < len(data) && (data[idx] == ' ' || data[idx] == '\t' || data[idx] == '\r' || data[idx] == '\n') {
+			idx++
+		}
+		if idx >= len(data) || data[idx] != '"' {
+			searchFrom += match + len(pattern)
+			continue
+		}
+
+		valueStart := idx + 1
+		valueEnd := valueStart
+		escaped := false
+		for valueEnd < len(data) {
+			ch := data[valueEnd]
+			if escaped {
+				escaped = false
+				valueEnd++
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				valueEnd++
+				continue
+			}
+			if ch == '"' {
+				break
+			}
+			valueEnd++
+		}
+		if valueEnd >= len(data) {
+			return data, false
+		}
+
+		if string(data[valueStart:valueEnd]) != fromModel {
+			searchFrom = valueEnd + 1
+			continue
+		}
+
+		rewritten := make([]byte, 0, len(data)-len(fromModel)+len(toModel))
+		rewritten = append(rewritten, data[:valueStart]...)
+		rewritten = append(rewritten, toModel...)
+		rewritten = append(rewritten, data[valueEnd:]...)
+		return rewritten, true
 	}
-	encoded, _ := json.Marshal(toModel)
-	end := value.Index + len(value.Raw)
-	rewritten := make([]byte, 0, len(data)-len(value.Raw)+len(encoded))
-	rewritten = append(rewritten, data[:value.Index]...)
-	rewritten = append(rewritten, encoded...)
-	rewritten = append(rewritten, data[end:]...)
-	return rewritten, true
 }
 
-// RewriteLargePayloadModelInMultipartPrefix reads at most the first 256KB and
-// rewrites only the model form field, preserving every other byte and the tail.
-// Supply the Content-Type boundary when available; the optional form preserves
-// callers that previously relied on the body's first delimiter line.
-func RewriteLargePayloadModelInMultipartPrefix(reader io.Reader, fromModel, toModel string, boundaries ...string) (io.Reader, int) {
+// RewriteLargePayloadModelInMultipartPrefix reads the first 256KB of a streaming
+// multipart body, finds the model form field value, and rewrites it from fromModel
+// to toModel. The model field appears early in multipart bodies (typically the first
+// form field), so scanning the prefix is sufficient.
+func RewriteLargePayloadModelInMultipartPrefix(reader io.Reader, fromModel, toModel string) (io.Reader, int) {
 	if reader == nil || fromModel == "" || toModel == "" || fromModel == toModel {
 		return reader, 0
 	}
@@ -1990,82 +2031,21 @@ func RewriteLargePayloadModelInMultipartPrefix(reader io.Reader, fromModel, toMo
 		return reader, 0
 	}
 	prefix = prefix[:n]
-	unchanged := func() (io.Reader, int) { return io.MultiReader(bytes.NewReader(prefix), reader), 0 }
-	boundary := ""
-	if len(boundaries) > 0 {
-		boundary = boundaries[0]
-	}
-	if boundary == "" {
-		lineEnd := bytes.Index(prefix, []byte("\r\n"))
-		if lineEnd <= 2 || !bytes.HasPrefix(prefix, []byte("--")) {
-			return unchanged()
-		}
-		boundary = string(bytes.TrimRight(prefix[2:lineEnd], " \t"))
-		if boundary == "" {
-			return unchanged()
-		}
-	}
-	delimiter := []byte("--" + boundary)
-	atEOF := err == io.EOF || err == io.ErrUnexpectedEOF
-	for start, headerStart, closing := nextMultipartDelimiterLine(prefix, delimiter, 0, atEOF); start >= 0 && !closing; {
-		headerLength := bytes.Index(prefix[headerStart:], []byte("\r\n\r\n"))
-		if headerLength < 0 {
-			break
-		}
-		valueStart := headerStart + headerLength + 4
-		nextStart, nextHeaderStart, nextClosing := nextMultipartDelimiterLine(prefix, delimiter, valueStart+2, atEOF)
-		if nextStart < 0 {
-			break // no complete field within the bounded prefix
-		}
-		valueEnd := nextStart - 2 // the delimiter's leading CRLF is not field data
-		headers, err := textproto.NewReader(bufio.NewReader(bytes.NewReader(prefix[headerStart:valueStart]))).ReadMIMEHeader()
-		if err != nil {
-			break
-		}
-		disposition, params, err := mime.ParseMediaType(headers.Get("Content-Disposition"))
-		if err == nil && disposition == "form-data" && params["name"] == "model" && params["filename"] == "" && string(prefix[valueStart:valueEnd]) == fromModel {
-			rewritten := make([]byte, 0, len(prefix)-len(fromModel)+len(toModel))
-			rewritten = append(rewritten, prefix[:valueStart]...)
-			rewritten = append(rewritten, toModel...)
-			rewritten = append(rewritten, prefix[valueEnd:]...)
-			return io.MultiReader(bytes.NewReader(rewritten), reader), len(rewritten) - len(prefix)
-		}
-		start, headerStart, closing = nextStart, nextHeaderStart, nextClosing
-	}
-	return unchanged()
-}
 
-// nextMultipartDelimiterLine follows RFC 2046 section 5.1.1: delimiters start a
-// line and may have SPACE/HTAB transport padding. Boundary prefixes in preambles
-// or field data are not delimiters. A closing line may omit its final CRLF only
-// at the body's EOF, never just at the end of the bounded scan prefix.
-func nextMultipartDelimiterLine(data, delimiter []byte, offset int, atEOF bool) (start, end int, closing bool) {
-	for offset < len(data) {
-		index := bytes.Index(data[offset:], delimiter)
-		if index < 0 {
-			break
-		}
-		start = offset + index
-		offset = start + len(delimiter)
-		if start != 0 && (start < 2 || data[start-2] != '\r' || data[start-1] != '\n') {
-			continue
-		}
-		end = offset
-		closing = bytes.HasPrefix(data[end:], []byte("--"))
-		if closing {
-			end += 2
-		}
-		for end < len(data) && (data[end] == ' ' || data[end] == '\t') {
-			end++
-		}
-		if bytes.HasPrefix(data[end:], []byte("\r\n")) {
-			return start, end + 2, closing
-		}
-		if closing && atEOF && end == len(data) {
-			return start, end, true
-		}
+	// In multipart, the model value appears as:
+	//   ...name="model"\r\n\r\nopenai/whisper-1\r\n--boundary...
+	// A direct byte replacement of fromModel→toModel in the prefix is safe because
+	// the model string (e.g. "openai/whisper-1") is unique within the form metadata.
+	from := []byte(fromModel)
+	to := []byte(toModel)
+	if idx := bytes.Index(prefix, from); idx >= 0 {
+		rewritten := make([]byte, 0, len(prefix)-len(from)+len(to))
+		rewritten = append(rewritten, prefix[:idx]...)
+		rewritten = append(rewritten, to...)
+		rewritten = append(rewritten, prefix[idx+len(from):]...)
+		return io.MultiReader(bytes.NewReader(rewritten), reader), len(rewritten) - len(prefix)
 	}
-	return -1, 0, false
+	return io.MultiReader(bytes.NewReader(prefix), reader), 0
 }
 
 // DrainLargePayloadRemainder drains any unread bytes from the large payload reader.

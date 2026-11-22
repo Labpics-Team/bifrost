@@ -87,9 +87,11 @@ successful streams measure the first response, not the duration of generation.
 Usable providers receive traffic weighted by observed health. An expired failure
 cooldown also gets a single real checking request, so a successful alternative
 cannot leave the recovered provider permanently stuck on its last bad score.
-Native large-payload passthrough bodies are single-pass, so they skip optional
-recovery checks and use healthy alternatives; ordinary streaming responses still
-qualify for checks, and an all-unavailable pool still sends its native attempt.
+Ordinary parsed requests remain adaptive regardless of body size, including
+requests above 10 MiB and requests with streaming responses. The native OSS
+application does not register the upstream large-payload passthrough extension.
+If an external integration activates `LargePayloadMode`, that request retains
+upstream routing and key selection and does not enter adaptive observation.
 
 Holds use core's existing `FailureClass`, with the
 [documented scopes and wait ladder](https://docs.getbifrost.ai/enterprise/adaptive-routing/how-it-works#held-keys).

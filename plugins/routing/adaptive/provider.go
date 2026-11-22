@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
@@ -29,9 +28,7 @@ func (c *Controller) reserveProbe(ctx *schemas.BifrostContext, d direction) bool
 	if d.due != nil {
 		return c.reserveCondition(ctx, routeID{d.provider, d.model, d.due.KeyID}, false)
 	}
-	// The native passthrough body is single-pass and cannot carry a healthy
-	// fallback through synthetic routing. Leave optional checks to other traffic.
-	if d.recover == nil || providerUtils.IsLargePayloadPassthroughEnabled(ctx) {
+	if d.recover == nil {
 		return false
 	}
 	if !c.lifeMu.TryLock() {
@@ -137,7 +134,7 @@ func (c *Controller) Route(ctx *schemas.BifrostContext, req *schemas.BifrostRequ
 	if named && !cfg.AppendFallbacksToPinned && !cfg.RerouteFailedDirections {
 		return nil
 	}
-	if pinnedKey(ctx) {
+	if !supportsRequest(ctx) || pinnedKey(ctx) {
 		return nil
 	}
 	allowed, restricted := ctx.Value(schemas.BifrostContextKeyRoutingAllowedProviders).([]schemas.ModelProvider)
