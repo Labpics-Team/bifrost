@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	schemas "github.com/maximhq/bifrost/core/schemas"
 )
 
@@ -105,8 +106,23 @@ func newStreamTestClient(t *testing.T, account *MockAccount, plugins ...schemas.
 	return client
 }
 
-// These are real provider requests against a local SSE peer. The deadline ends
-// the three stalled streams; only the useful response may commit before it.
+// streamFixtureProgressReader signals when the native SSE parser asks for more
+// bytes after consuming the fixture. The idle reader and parser remain native.
+type streamFixtureProgressReader struct {
+	io.Reader
+	ready chan struct{}
+	once  sync.Once
+}
+
+func (r *streamFixtureProgressReader) Read(p []byte) (int, error) {
+	r.once.Do(func() { close(r.ready) })
+	return r.Reader.Read(p)
+}
+
+// These are real provider requests against a local SSE peer. Stalled cases are
+// cancelled after the parser consumes the fixture and asks for more bytes; with
+// an empty fixture, its first read proves headers and both readers are installed.
+// The useful case then sends a terminal event and completes without cancellation.
 func TestStreamStartupDiagnostics(t *testing.T) {
 	for _, tc := range []struct {
 		name, body               string
@@ -119,11 +135,20 @@ func TestStreamStartupDiagnostics(t *testing.T) {
 		{name: "useful chunk", body: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\",\"output_index\":0,\"content_index\":0}\n\n", data: 1, commit: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			progress := make(chan struct{})
 			peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "text/event-stream")
 				w.WriteHeader(http.StatusOK)
 				fmt.Fprint(w, tc.body)
 				w.(http.Flusher).Flush()
+				if tc.commit {
+					select {
+					case <-progress:
+						fmt.Fprint(w, "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"test\",\"status\":\"completed\",\"output\":[]}}\n\ndata: [DONE]\n\n")
+					case <-r.Context().Done():
+					}
+					return
+				}
 				<-r.Context().Done()
 			}))
 			defer peer.Close()
@@ -134,16 +159,59 @@ func TestStreamStartupDiagnostics(t *testing.T) {
 			client := newStreamTestClient(t, account)
 			tracer := newDeferredStreamTracer()
 			client.SetTracer(tracer)
-			ctx := newDeferredStreamContext(tracer)
-			deadline := time.AfterFunc(300*time.Millisecond, func() { ctx.Cancel() })
-			defer deadline.Stop()
-			stream, _ := client.ResponsesStreamRequest(ctx, &schemas.BifrostResponsesRequest{
+			// The overall deadline catches broken setup/progress; it does not decide
+			// when the fixture's intended stream state should be cancelled.
+			ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(5*time.Second))
+			defer ctx.Cancel()
+			ctx.SetValue(schemas.BifrostContextKeyTracer, tracer)
+			ctx.SetValue(schemas.BifrostContextKeyTraceID, "trace-1")
+			nativeReaderCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
+			defer nativeReaderCtx.Cancel()
+			// Shadow just the factory to avoid recursion. All measurement handles
+			// still come from the real request through the parent context.
+			nativeReaderCtx.SetValue(schemas.BifrostContextKeySSEReaderFactory, nil)
+			ctx.SetValue(schemas.BifrostContextKeySSEReaderFactory, &providerUtils.SSEReaderFactory{
+				NewDataReader: func(reader io.Reader) providerUtils.SSEDataReader {
+					body := io.MultiReader(io.LimitReader(reader, int64(len(tc.body))),
+						&streamFixtureProgressReader{Reader: reader, ready: progress})
+					return providerUtils.GetSSEDataReader(nativeReaderCtx, body)
+				},
+			})
+			if !tc.commit {
+				go func() {
+					select {
+					case <-progress:
+						ctx.Cancel()
+					case <-ctx.Done():
+					}
+				}()
+			}
+			stream, requestErr := client.ResponsesStreamRequest(ctx, &schemas.BifrostResponsesRequest{
 				Provider: schemas.OpenAI, Model: "gpt-4o-mini",
 				Input: []schemas.ResponsesMessage{{Role: schemas.Ptr(schemas.ResponsesInputMessageRoleUser), Content: &schemas.ResponsesMessageContent{ContentStr: schemas.Ptr("local diagnostic fixture")}}},
 			})
+			usefulSeen, completedSeen := false, false
 			if stream != nil {
-				for range stream {
+				for chunk := range stream {
+					if !tc.commit {
+						continue
+					}
+					if chunk.BifrostError != nil {
+						t.Errorf("finite useful stream returned an error: %v", chunk.BifrostError)
+					}
+					if response := chunk.BifrostResponsesStreamResponse; response != nil {
+						usefulSeen = usefulSeen || (response.Type == schemas.ResponsesStreamResponseTypeOutputTextDelta && response.Delta != nil && *response.Delta == "hello")
+						completedSeen = completedSeen || response.Type == schemas.ResponsesStreamResponseTypeCompleted
+					}
 				}
+			}
+			if tc.commit && (requestErr != nil || !usefulSeen || !completedSeen) {
+				t.Fatalf("finite useful stream: request error=%v, useful=%v, completed=%v", requestErr, usefulSeen, completedSeen)
+			}
+			select {
+			case <-progress:
+			default:
+				t.Fatalf("request ended before the native parser consumed the fixture: %v", ctx.Err())
 			}
 			// Cancellation can return to the caller before the producer completes.
 			until := time.Now().Add(3 * time.Second)
