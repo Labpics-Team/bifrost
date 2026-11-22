@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
@@ -20,6 +21,7 @@ type direction struct {
 	due      *condition
 	recover  *route
 	eligible bool
+	known    bool
 }
 type probeContextKey struct{}
 
@@ -27,7 +29,9 @@ func (c *Controller) reserveProbe(ctx *schemas.BifrostContext, d direction) bool
 	if d.due != nil {
 		return c.reserveCondition(ctx, routeID{d.provider, d.model, d.due.KeyID}, false)
 	}
-	if d.recover == nil {
+	// The native passthrough body is single-pass and cannot carry a healthy
+	// fallback through synthetic routing. Leave optional checks to other traffic.
+	if d.recover == nil || providerUtils.IsLargePayloadPassthroughEnabled(ctx) {
 		return false
 	}
 	if !c.lifeMu.TryLock() {
@@ -60,6 +64,8 @@ func (c *Controller) direction(ctx *schemas.BifrostContext, provider schemas.Mod
 	if err != nil {
 		return d
 	}
+	// A successful empty lookup is unavailable; a failed lookup is unknown.
+	d.known = true
 	for _, key := range keys {
 		c.syncKey(provider, key)
 	}
@@ -191,7 +197,7 @@ func (c *Controller) Route(ctx *schemas.BifrostContext, req *schemas.BifrostRequ
 				break
 			}
 		}
-	} else if current := c.direction(ctx, provider, model, ""); cfg.RerouteFailedDirections && current.score == 0 {
+	} else if current := c.direction(ctx, provider, model, ""); cfg.RerouteFailedDirections && current.known && current.score == 0 {
 		checking = c.reserveProbe(ctx, current)
 		if !checking {
 			if cfg.RerouteTarget == "fallbacks" {
@@ -232,8 +238,10 @@ func (c *Controller) Route(ctx *schemas.BifrostContext, req *schemas.BifrostRequ
 	// permission to prune a named request's explicitly configured fallbacks.
 	prune := cfg.PruneFailedFallbacks && (!named || cfg.AppendFallbacksToPinned || redirected)
 	for _, fb := range fallbacks {
-		if prune && c.direction(ctx, fb.Provider, fb.Model, fb.KeyID).score == 0 {
-			continue
+		if prune {
+			if d := c.direction(ctx, fb.Provider, fb.Model, fb.KeyID); d.known && d.score == 0 {
+				continue
+			}
 		}
 		appendUnique(fb)
 	}

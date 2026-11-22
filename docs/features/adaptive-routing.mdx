@@ -70,6 +70,8 @@ alternatives to ordinary named traffic is off. If every explicitly configured
 fallback is failing, redirecting can use the healthy compatible, allowed global
 pool. A managed provider without an eligible key is excluded; native keyless
 providers remain supported.
+If the key catalog cannot be read, health is unknown: that lookup failure alone
+does not prune an explicit fallback or redirect a named provider.
 Explicit caller/rule key pins and direct credentials retain their native
 precedence. Adaptive routing does not change core's retry loop or session
 affinity. A session binding can still name its existing provider/key; native
@@ -85,6 +87,9 @@ successful streams measure the first response, not the duration of generation.
 Usable providers receive traffic weighted by observed health. An expired failure
 cooldown also gets a single real checking request, so a successful alternative
 cannot leave the recovered provider permanently stuck on its last bad score.
+Native large-payload passthrough bodies are single-pass, so they skip optional
+recovery checks and use healthy alternatives; ordinary streaming responses still
+qualify for checks, and an all-unavailable pool still sends its native attempt.
 
 Holds use core's existing `FailureClass`, with the
 [documented scopes and wait ladder](https://docs.getbifrost.ai/enterprise/adaptive-routing/how-it-works#held-keys).

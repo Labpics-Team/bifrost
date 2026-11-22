@@ -830,7 +830,8 @@ func GroupPluginLogsByName(logs []PluginLogEntry) map[string][]PluginLogEntry {
 type LargePayloadMetadata struct {
 	ResponseModalities []string // e.g., ["AUDIO"] for speech, ["IMAGE"] for image generation
 	SpeechConfig       bool     // true if generationConfig.speechConfig is present
-	Model              string   // model extracted without full body parsing (openai/anthropic multipart/json)
+	Model              string   // extracted model, or the selected provider/model after routing
+	OriginalModel      string   // exact model in the incoming body, captured before routing changes Model
 	StreamRequested    *bool    // stream flag when available in request payload metadata
 	ThreadType         string   // Anthropic thread.type ("create"/"continue") when detected during metadata extraction; empty when absent or unknown. Lets the stateless thread refusal work when body parsing is skipped
 }

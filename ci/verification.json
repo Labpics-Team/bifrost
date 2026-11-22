@@ -122,6 +122,8 @@
       "TestExplicitKeySelectionExplainsNativePin"
     ],
     "github.com/maximhq/bifrost/core/providers/utils": [
+      "TestRewriteJSONModelValue",
+      "TestApplyLargePayloadRequestBodyWithModelNormalization",
       "TestContextTransport_TruncatedContentLengthStreamReportsUnexpectedEOFAndDiscardsConn",
       "TestContextTransportAcceptedPooledRequestIsNotRepeated",
       "TestContextTransport_PooledStaleConnStillRetried",
@@ -154,7 +156,9 @@
       "TestRoutingModelsDeclarationAndTargetPermissions",
       "TestRoutingModelsFirstDeclarationAndSortedNames",
       "TestRoutingModelsFollowsNativeProviderNamespace",
-      "TestRoutingModelsSkipsTargetlessFirstDeclaration"
+      "TestRoutingModelsSkipsTargetlessFirstDeclaration",
+      "TestPreRequestHook_LargePayloadUsesHealthyAdaptiveDirection",
+      "TestPreRequestHook_LargePayloadPreservesAzureURLRoute"
     ],
     "github.com/maximhq/bifrost/plugins/routing/complexity": [
       "TestSemanticClassifierDeclaresItsQueryFilterIndexes"
@@ -210,6 +214,10 @@
       "TestAdaptiveTransientProviderCheckYieldsDuringSQLiteWrite",
       "TestAdaptiveProviderRecoveryProbeKeepsOtherRequestsOnHealthyAlternative",
       "TestAdaptiveProviderUnavailablePoolStillSendsNativeAttempt",
+      "TestAdaptiveUnknownHealthPreservesExplicitDirections",
+      "TestAdaptiveRecoveryChecksRequireReplayableBody",
+      "TestAdaptiveSinglePassSkipsOptionalKeyChecks",
+      "TestAdaptiveSinglePassKeepsNativeFailOpenAndPins",
       "TestAdaptiveOldSuccessCannotReleaseNewHold",
       "TestAdaptiveOldCompletionCannotReleaseNewProbe",
       "TestAdaptiveStatusDoesNotForgetUnresolvedHold",

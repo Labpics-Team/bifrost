@@ -361,11 +361,14 @@ func adaptiveHealthyTrafficDuringSQLiteWait(t *testing.T, due, routeProvider boo
 		for _, model := range []string{"m", "new-model"} {
 			ctx := testContext()
 			key, err := c.SelectKey(ctx, testKeys, "p1", model)
-			if err != nil || key.ID != "b" {
-				served <- fmt.Errorf("expected healthy key b, got %s: %v", key.ID, err)
+			// A transient failure only affects m. A new model can use either
+			// key, while a credential refusal holds a across every model.
+			mustUseB := status == 401 || model == "m"
+			if err != nil || key.ID != "a" && key.ID != "b" || mustUseB && key.ID != "b" {
+				served <- fmt.Errorf("expected healthy key for %s after %d, got %s: %v", model, status, key.ID, err)
 				return
 			}
-			observeWithContext(c, ctx, "p1", model, "b", nil)
+			observeWithContext(c, ctx, "p1", model, key.ID, nil)
 		}
 		// First use of a different configured key also needs no durable write.
 		observe(c, "p2", "fresh", "b", nil)
