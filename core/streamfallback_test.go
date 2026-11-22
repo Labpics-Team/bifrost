@@ -105,6 +105,84 @@ func newStreamTestClient(t *testing.T, account *MockAccount, plugins ...schemas.
 	return client
 }
 
+// These are real provider requests against a local SSE peer. The deadline ends
+// the three stalled streams; only the useful response may commit before it.
+func TestStreamStartupDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name, body               string
+		comments, data, preamble int64
+		commit                   bool
+	}{
+		{name: "headers then silence"},
+		{name: "comments only", body: ": heartbeat\n\n", comments: 1},
+		{name: "preamble only", body: "data: {\"type\":\"response.created\",\"response\":{\"id\":\"test\",\"status\":\"in_progress\",\"output\":[]}}\n\n", data: 1, preamble: 1},
+		{name: "useful chunk", body: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\",\"output_index\":0,\"content_index\":0}\n\n", data: 1, commit: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, tc.body)
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+			}))
+			defer peer.Close()
+			account := NewMockAccount()
+			account.AddProviderWithBaseURL(schemas.OpenAI, 1, 1, peer.URL)
+			account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = 0
+			account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{{ID: "test-key", Value: *schemas.NewSecretVar("local-test"), Models: schemas.WhiteList{"*"}, Weight: 100}})
+			client := newStreamTestClient(t, account)
+			tracer := newDeferredStreamTracer()
+			client.SetTracer(tracer)
+			ctx := newDeferredStreamContext(tracer)
+			deadline := time.AfterFunc(300*time.Millisecond, func() { ctx.Cancel() })
+			defer deadline.Stop()
+			stream, _ := client.ResponsesStreamRequest(ctx, &schemas.BifrostResponsesRequest{
+				Provider: schemas.OpenAI, Model: "gpt-4o-mini",
+				Input: []schemas.ResponsesMessage{{Role: schemas.Ptr(schemas.ResponsesInputMessageRoleUser), Content: &schemas.ResponsesMessageContent{ContentStr: schemas.Ptr("local diagnostic fixture")}}},
+			})
+			if stream != nil {
+				for range stream {
+				}
+			}
+			// Cancellation can return to the caller before the producer completes.
+			until := time.Now().Add(3 * time.Second)
+			for tracer.recordCount() != 0 && time.Now().Before(until) {
+				time.Sleep(time.Millisecond)
+			}
+			spans := tracer.llmSpans()
+			if len(spans) != 1 || spans[0].ends != 1 {
+				t.Fatalf("attempt spans = %#v", spans)
+			}
+			if spans[0].lateAttrs != 0 {
+				t.Fatalf("%d attribute writes after EndSpan", spans[0].lateAttrs)
+			}
+			attrs := spans[0].endAttrs
+			for key, want := range map[string]int64{
+				"bifrost.stream.start.http_status":     200,
+				"bifrost.stream.start.body_bytes":      int64(len(tc.body)),
+				"bifrost.stream.start.sse_comments":    tc.comments,
+				"bifrost.stream.start.sse_data_lines":  tc.data,
+				"bifrost.stream.start.preamble_chunks": tc.preamble,
+			} {
+				got, ok := attrs[key].(int64)
+				if !ok || got != want {
+					t.Errorf("%s = %v, want %d", key, attrs[key], want)
+				}
+			}
+			if _, ok := attrs["bifrost.stream.start.headers_ms"]; !ok {
+				t.Error("missing headers timing")
+			}
+			if _, ok := attrs["bifrost.stream.start.last_read_ms"]; ok != (tc.body != "") {
+				t.Errorf("last positive read present = %v", ok)
+			}
+			if _, ok := attrs["bifrost.stream.start.commit_ms"]; ok != tc.commit {
+				t.Errorf("commit present = %v, want %v", ok, tc.commit)
+			}
+		})
+	}
+}
+
 func TestAzureSpeechErrorAfterPreamble(t *testing.T) {
 	primary := httptest.NewServer(sseHandler(
 		`{"type":"speech.audio.delta","audio":""}`,

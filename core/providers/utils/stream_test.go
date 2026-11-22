@@ -1217,6 +1217,43 @@ func TestStreamStartupStateIgnoresSkippedChunks(t *testing.T) {
 	}
 }
 
+type streamDiagnosticTracer struct{ schemas.NoOpTracer }
+
+func (*streamDiagnosticTracer) SetAttribute(handle schemas.SpanHandle, key string, value any) {
+	handle.(*schemas.Span).SetAttribute(key, value)
+}
+
+func TestStreamDiagnosticsCommitReason(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		chunks     []*schemas.BifrostStreamChunk
+		deadline   bool
+		wantReason int64
+	}{
+		{"useful", []*schemas.BifrostStreamChunk{preambleChunk(), contentChunk()}, false, 1},
+		{"capacity", []*schemas.BifrostStreamChunk{bigPreambleChunk(150 * 1024), bigPreambleChunk(150 * 1024)}, false, 2},
+		{"deadline capacity stays uncommitted", []*schemas.BifrostStreamChunk{bigPreambleChunk(3 * 1024 * 1024), bigPreambleChunk(3 * 1024 * 1024)}, true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			span := &schemas.Span{}
+			d := BeginStreamDiagnostics(ctx, &streamDiagnosticTracer{}, span)
+			startup := NewStreamStartupState(isTestPreamble, tc.deadline)
+			startup.SetDiagnostics(d)
+			for _, chunk := range tc.chunks {
+				startup.ObserveResult(ctx, &schemas.BifrostResponse{ChatResponse: chunk.BifrostChatResponse}, nil)
+			}
+			d.Stamp()
+			if got := schemas.GetInt64Attr(span.Attributes, "bifrost.stream.start.commit_reason"); got != tc.wantReason {
+				t.Fatalf("commit reason = %d, want %d", got, tc.wantReason)
+			}
+			if _, ok := span.Attributes["bifrost.stream.start.commit_ms"]; ok != (tc.wantReason != 0) {
+				t.Fatal("commit timing must have the same presence as the reason")
+			}
+		})
+	}
+}
+
 // collectStream drains ch, failing the test if it does not close in time.
 func collectStream(t *testing.T, ch chan *schemas.BifrostStreamChunk) []*schemas.BifrostStreamChunk {
 	t.Helper()

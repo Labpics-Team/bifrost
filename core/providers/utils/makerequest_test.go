@@ -1059,6 +1059,56 @@ func BenchmarkTransport_Streamed_Default(b *testing.B) {
 }
 func BenchmarkTransport_Streamed_Context(b *testing.B) { benchmarkStreamed(b, NewContextTransport()) }
 
+// Same in-memory provider request, idle reader, SSE framing and startup decision
+// with diagnostics off/on. Existing span storage is reused so its unrelated
+// allocation cost does not hide the cost added by diagnostics.
+func BenchmarkStreamStartupDiagnostics(b *testing.B) {
+	for _, enabled := range []bool{false, true} {
+		b.Run(fmt.Sprintf("enabled=%v", enabled), func(b *testing.B) {
+			ln := benchServer(b, true)
+			client := benchClient(ln, NewContextTransport(), true)
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			tracer := &streamDiagnosticTracer{}
+			span := &schemas.Span{}
+			response := &schemas.BifrostResponse{ChatResponse: contentChunk().BifrostChatResponse}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var d *StreamDiagnostics
+				if enabled {
+					d = BeginStreamDiagnostics(ctx, tracer, span)
+				}
+				startup := NewStreamStartupState(isTestPreamble, false)
+				startup.SetDiagnostics(d)
+				req, resp := fasthttp.AcquireRequest(), fasthttp.AcquireResponse()
+				req.SetRequestURI("http://bench/")
+				req.Header.SetMethod("POST")
+				req.SetBodyString(`{"model":"m","messages":[],"stream":true}`)
+				if err := DoStreamingRequest(ctx, client, req, resp); err != nil {
+					b.Fatal(err)
+				}
+				reader, stop := NewIdleTimeoutReader(resp.BodyStream(), resp.BodyStream(), time.Second, ctx)
+				sse := GetSSEDataReader(ctx, reader)
+				for {
+					_, err := sse.ReadDataLine()
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					if err != nil {
+						b.Fatal(err)
+					}
+					startup.ObserveResult(ctx, response, nil)
+				}
+				stop()
+				d.Stamp()
+				resp.CloseBodyStream()
+				fasthttp.ReleaseRequest(req)
+				fasthttp.ReleaseResponse(resp)
+			}
+		})
+	}
+}
+
 // TestContextTransport_BufferedLateCancelDoesNotPoisonPool guards the ownership
 // rule on the buffered path: the cancel watcher must be stopped before the
 // connection is returned to the pool. The test hook fires at the release

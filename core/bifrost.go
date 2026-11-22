@@ -7774,6 +7774,10 @@ func executeRequestWithRetries[T any](
 			}
 		}
 
+		var streamDiagnostics *providerUtils.StreamDiagnostics
+		if isStreamRequest {
+			streamDiagnostics = providerUtils.BeginStreamDiagnostics(ctx, tracer, handle)
+		}
 		result, bifrostError = requestHandler(currentKey)
 
 		// Detect errors carried inside HTTP 200 streams before returning success.
@@ -7880,6 +7884,7 @@ func executeRequestWithRetries[T any](
 				}
 
 				// Error attributes are stamped by PopulateLLMResponseAttributes above.
+				streamDiagnostics.Stamp()
 				if bifrostError != nil {
 					tracer.EndSpan(handle, schemas.SpanStatusError, "request failed")
 				} else {
@@ -8603,6 +8608,7 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 					isPreamble = azure.IsStreamPreamble
 				}
 				startup := providerUtils.NewStreamStartupState(isPreamble, providerUtils.AttemptAbortFromContext(req.Context) != nil)
+				startup.SetDiagnostics(providerUtils.StreamDiagnosticsFromContext(req.Context))
 				postHookRunner := func(ctx *schemas.BifrostContext, result *schemas.BifrostResponse, err *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError) {
 					if attempt != nil {
 						attempt.Observe(result, err)

@@ -196,6 +196,7 @@ func isStreamStartupError(err *schemas.BifrostError) bool {
 // startup events or release its output. Only the attempt's producer uses it;
 // it stores counters, never chunks, and needs no synchronization.
 type StreamStartupState struct {
+	diagnostics   *StreamDiagnostics
 	isPreamble    func(*schemas.BifrostStreamChunk) bool
 	maxBytes      int
 	underDeadline bool
@@ -204,6 +205,10 @@ type StreamStartupState struct {
 	committed     bool
 	ended         bool
 }
+
+// SetDiagnostics binds the attempt before the producer starts. ObserveResult
+// reuses its existing classification; diagnostics never parse a chunk again.
+func (c *StreamStartupState) SetDiagnostics(d *StreamDiagnostics) { c.diagnostics = d }
 
 // NewStreamStartupState tracks one attempt; isPreamble is nil when only the first chunk is checked.
 func NewStreamStartupState(isPreamble func(*schemas.BifrostStreamChunk) bool, underDeadline bool) *StreamStartupState {
@@ -231,7 +236,11 @@ func (c *StreamStartupState) ObserveResult(ctx context.Context, resp *schemas.Bi
 	if isStreamStartupError(chunk.BifrostError) {
 		return false
 	}
+	commitReason := int64(1) // accepted non-preamble (or no preamble classifier)
 	if c.isPreamble != nil && c.isPreamble(chunk) {
+		if c.diagnostics != nil {
+			c.diagnostics.preamble.Add(1)
+		}
 		if size, ok := fitStreamPreamble(c.count, c.bytes, chunk, c.maxBytes); ok {
 			c.count++
 			c.bytes += size
@@ -242,8 +251,10 @@ func (c *StreamStartupState) ObserveResult(ctx context.Context, resp *schemas.Bi
 			c.ended = true
 			return false
 		}
+		commitReason = 2 // bounded preamble overflow, not useful output
 	}
 	c.committed = true
+	c.diagnostics.commit(commitReason)
 	return true
 }
 
