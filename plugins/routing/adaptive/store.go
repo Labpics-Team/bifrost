@@ -261,6 +261,7 @@ func (c *Controller) maintain(ctx context.Context) error {
 		pending[id] = generation
 	}
 	now := c.now()
+	c.pruneProviderChecksLocked(now)
 	for id, previous := range c.releasedHolds {
 		if now.Sub(previous.at) >= reholdWindow {
 			delete(c.releasedHolds, id)

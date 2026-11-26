@@ -94,7 +94,7 @@ func (a *adaptiveAffinity) ResolveKey(ctx *schemas.BifrostContext, provider sche
 			a.mu.Unlock()
 			return schemas.Key{}, false
 		}
-		if lease, ok := ctx.Value(probeContextKey{}).(probeReservation); ok && lease.routeID == id && a.reservationCurrentLocked(lease, now) {
+		if lease, ok := ctx.Value(probeContextKey{}).(probeReservation); ok && !lease.providerOnly && lease.routeID == id && a.reservationCurrentLocked(lease, now) {
 			a.mu.Unlock()
 			return schemas.Key{}, false
 		}

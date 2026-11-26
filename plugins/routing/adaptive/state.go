@@ -73,13 +73,17 @@ type keyState struct {
 }
 type probeReservation struct {
 	routeID
-	conditionID string
-	token       uint64
+	conditionID  string
+	token        uint64
+	providerOnly bool
 }
 
 func (c *Controller) reservationCurrentLocked(reserved probeReservation, now time.Time) bool {
 	if reserved.token == 0 {
 		return false
+	}
+	if reserved.providerOnly {
+		return c.providerChecks[reserved.routeID].token == reserved.token
 	}
 	if h := c.holdLocked(reserved.routeID, now); h != nil {
 		return h.ID == reserved.conditionID && h.ProbeID == reserved.token
@@ -338,7 +342,7 @@ func (c *Controller) reserveCondition(ctx *schemas.BifrostContext, id routeID, f
 	copy.ProbeID = c.probeSequence
 	copy.ProbeUntil = now.Add(5 * time.Minute)
 	c.conditions[h.routeID] = &copy
-	ctx.SetValue(probeContextKey{}, probeReservation{routeID: id, conditionID: h.ID, token: copy.ProbeID})
+	c.setProbeReservationLocked(ctx, probeReservation{routeID: id, conditionID: h.ID, token: copy.ProbeID})
 	return true
 }
 

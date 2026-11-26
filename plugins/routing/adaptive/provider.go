@@ -23,6 +23,54 @@ type direction struct {
 }
 type probeContextKey struct{}
 
+// Provider admission has no key identity. Configured weights and native
+// affinity select the actual key later; only that key receives an observation.
+type providerCheck struct {
+	token uint64
+	until time.Time
+}
+
+func (c *Controller) reserveProviderCheckLocked(ctx *schemas.BifrostContext, id routeID, now time.Time) bool {
+	id.KeyID = ""
+	if c.providerChecks[id].until.After(now) {
+		return false
+	}
+	if _, exists := c.providerChecks[id]; !exists && len(c.providerChecks) >= maxRoutes {
+		c.pruneProviderChecksLocked(now)
+		if len(c.providerChecks) >= maxRoutes {
+			return false // Never evict a live lease to admit another check.
+		}
+	}
+	if c.providerChecks == nil {
+		c.providerChecks = make(map[routeID]providerCheck)
+	}
+	c.probeSequence++
+	c.providerChecks[id] = providerCheck{token: c.probeSequence, until: now.Add(5 * time.Minute)}
+	c.setProbeReservationLocked(ctx, probeReservation{routeID: id, token: c.probeSequence, providerOnly: true})
+	return true
+}
+
+func (c *Controller) finishProviderCheckLocked(reserved probeReservation, now time.Time) {
+	if reserved.providerOnly && c.reservationCurrentLocked(reserved, now) {
+		c.providerChecks[reserved.routeID] = providerCheck{until: now.Add(recoveryInterval)}
+	}
+}
+
+func (c *Controller) pruneProviderChecksLocked(now time.Time) {
+	for id, check := range c.providerChecks {
+		if !check.until.After(now) {
+			delete(c.providerChecks, id)
+		}
+	}
+}
+
+func (c *Controller) setProbeReservationLocked(ctx *schemas.BifrostContext, reserved probeReservation) {
+	if previous, ok := ctx.Value(probeContextKey{}).(probeReservation); ok && previous.providerOnly {
+		c.finishProviderCheckLocked(previous, c.now())
+	}
+	ctx.SetValue(probeContextKey{}, reserved)
+}
+
 func (c *Controller) reserveProbe(ctx *schemas.BifrostContext, d direction) bool {
 	if d.due != nil {
 		return c.reserveCondition(ctx, routeID{d.provider, d.model, d.due.KeyID}, false)
@@ -41,13 +89,16 @@ func (c *Controller) reserveProbe(ctx *schemas.BifrostContext, d direction) bool
 	if c.routes[r.routeID] != r || !c.recoveryDueLocked(r, now) {
 		return false
 	}
+	if !c.config.load().RouteSelectionEnabled && r.KeyID != "" {
+		return c.reserveProviderCheckLocked(ctx, r.routeID, now)
+	}
 	c.probeSequence++
 	// A replacement check supersedes earlier outcomes even after its disposable
 	// lease is cleared. Attempts and incident writers already fence this epoch.
 	r.Epoch++
 	r.ProbeID = c.probeSequence
 	r.ProbeUntil = now.Add(5 * time.Minute)
-	ctx.SetValue(probeContextKey{}, probeReservation{routeID: r.routeID, token: r.ProbeID})
+	c.setProbeReservationLocked(ctx, probeReservation{routeID: r.routeID, token: r.ProbeID})
 	return true
 }
 
@@ -178,7 +229,8 @@ func (c *Controller) Route(ctx *schemas.BifrostContext, req *schemas.BifrostRequ
 		// Bifrost ranks providers, but distributes traffic across keys.
 		// Due checks below are the exception to the healthiest-provider pick.
 		// A due hold, failure cooldown or stale unhealthy observation gets one real recheck,
-		// with healthy directions behind it. The slot also names the key.
+		// with healthy directions behind it. Only adaptive key selection or
+		// a held-key check may reserve a particular credential.
 		for _, d := range directions {
 			if c.reserveProbe(ctx, d) {
 				selected.Provider = d.provider

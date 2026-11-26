@@ -1,6 +1,7 @@
 package adaptive
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -135,6 +136,129 @@ func TestAdaptiveNativeAffinityRespectsConfiguredKeyWeightsMode(t *testing.T) {
 	observe(c, "p1", "m", "a", responseError(401))
 	if key, ok := affinity.ResolveKey(ctx, "p1", "m", testKeys); ok && key.ID == "a" {
 		t.Fatal("configured weights mode followed a held credential")
+	}
+}
+
+// Exercise the native hook order: provider routing, route affinity, key affinity,
+// selection, then observation of the key that actually served the request.
+func TestAdaptiveProviderRecoveryPreservesConfiguredKeySelection(t *testing.T) {
+	for _, tc := range []struct {
+		name                     string
+		sticky, zeroWeight, held bool
+	}{
+		{name: "session binding", sticky: true},
+		{name: "configured weights", zeroWeight: true},
+		{name: "held key check", sticky: true, zeroWeight: true, held: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, now := providerController()
+			cfg := c.Config()
+			cfg.RouteSelectionEnabled = false
+			if err := c.Apply(cfg); err != nil {
+				t.Fatal(err)
+			}
+			keys := append([]schemas.Key(nil), testKeys...)
+			keys[0].Weight, keys[1].Weight = 1, 1
+			if tc.zeroWeight {
+				keys[0].Weight = 0
+			}
+			c.SetCatalog(c.providers,
+				func(context.Context, schemas.ModelProvider) ([]schemas.Key, error) { return keys, nil },
+				c.supports)
+			for range 3 {
+				observe(c, "p1", "m", "a", responseError(503))
+			}
+			if tc.held {
+				observe(c, "p1", "m", "a", responseError(401))
+			}
+			observe(c, "p1", "m", "b", nil)
+			for _, key := range keys {
+				observe(c, "p2", "m", key.ID, nil)
+			}
+			before := *c.routes[routeID{"p1", "m", "a"}]
+			*now = now.Add(time.Minute)
+
+			kv, err := kvstore.New(kvstore.Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer kv.Close()
+			affinity := c.SessionAffinity(bifrost.NewSessionAffinity(kv, bifrost.NewDefaultLogger(schemas.LogLevelError)))
+			ctx := testContext()
+			ctx.SetValue(schemas.BifrostContextKeySessionID, "provider-recovery-static-keys")
+			p1 := schemas.Route{Provider: "p1", Model: "m"}
+			if tc.sticky {
+				if err := kv.SetWithTTL(bifrost.SessionStateKey(ctx, bifrost.SessionStateKindRoute, "", "m"), bifrost.RouteStateValue(p1), time.Hour); err != nil {
+					t.Fatal(err)
+				}
+				if err := kv.SetWithTTL(bifrost.SessionStateKey(ctx, bifrost.SessionStateKindKey, "p1", "m"), "b", time.Hour); err != nil {
+					t.Fatal(err)
+				}
+			}
+			req := routeRequest("")
+			if err := c.Route(ctx, req); err != nil {
+				t.Fatal(err)
+			}
+			provider, model, fallbacks := req.GetRequestFields()
+			chain := []schemas.Route{{Provider: provider, Model: model}}
+			for _, fb := range fallbacks {
+				chain = append(chain, schemas.Route{Provider: fb.Provider, Model: fb.Model, KeyID: fb.KeyID})
+			}
+			resolved := affinity.ResolveRoute(ctx, schemas.Route{Model: "m"}, chain)
+			if resolved[0] != p1 {
+				t.Fatalf("provider recovery was starved: %+v", resolved)
+			}
+			key, bound := affinity.ResolveKey(ctx, "p1", "m", keys)
+			if !bound {
+				key, err = c.SelectKey(ctx, keys, "p1", "m")
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			want := "b"
+			if tc.held {
+				want = "a"
+			}
+			if key.ID != want {
+				t.Fatalf("recovery selected key %s, want %s", key.ID, want)
+			}
+			attempt := c.BeginProviderAttempt(ctx, schemas.ProviderAttemptInfo{Provider: "p1", Model: "m", KeyID: key.ID, KeyName: key.Name, Key: key})
+			if attempt == nil {
+				t.Fatal("actual provider attempt was not observed")
+			}
+			defer attempt.End()
+
+			pick := func(want schemas.ModelProvider) {
+				t.Helper()
+				req := routeRequest("")
+				if err := c.Route(testContext(), req); err != nil {
+					t.Fatal(err)
+				}
+				if got, _, _ := req.GetRequestFields(); got != want {
+					t.Fatalf("selected provider %s, want %s", got, want)
+				}
+			}
+			for range 10 {
+				pick("p2")
+			}
+			attempt.Observe(&schemas.BifrostResponse{}, nil)
+			attempt.End()
+			if tc.held {
+				if c.holdLocked(routeID{"p1", "m", "a"}, *now) != nil {
+					t.Fatal("successful held-key check did not release the hold")
+				}
+				return
+			}
+			after := c.routes[routeID{"p1", "m", "a"}]
+			if after.Samples != before.Samples || after.LastSeen != before.LastSeen || after.ErrorRate != before.ErrorRate {
+				t.Fatal("an outcome on b changed health observations for a")
+			}
+			pick("p2")
+			*now = now.Add(29 * time.Second)
+			pick("p2")
+			*now = now.Add(2 * time.Second)
+			pick("p1")
+		})
 	}
 }
 

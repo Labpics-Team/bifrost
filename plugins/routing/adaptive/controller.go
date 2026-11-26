@@ -76,6 +76,7 @@ type Controller struct {
 	releasedHolds      map[routeID]releasedHold
 	keyStates          map[routeID]*keyState
 	providerRevisions  map[schemas.ModelProvider]string
+	providerChecks     map[routeID]providerCheck
 	pendingResets      map[routeID]uint64
 	pendingDiagnostics map[routeID]pendingDiagnostic
 	resetSequence      uint64
@@ -191,7 +192,7 @@ func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, 
 	now := c.now()
 	c.mu.Lock()
 	reserved, hasReservation := ctx.Value(probeContextKey{}).(probeReservation)
-	if hasReservation && reserved.Provider == provider && reserved.Model == model {
+	if hasReservation && !reserved.providerOnly && reserved.Provider == provider && reserved.Model == model {
 		if c.reservationCurrentLocked(reserved, now) {
 			for _, key := range keys {
 				if key.ID == reserved.KeyID {
@@ -317,6 +318,21 @@ func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, 
 // BeginProviderAttempt observes actual provider calls, including retries and
 // streaming teardown. Direct caller credentials never enter managed-key health.
 func (c *Controller) BeginProviderAttempt(ctx *schemas.BifrostContext, info schemas.ProviderAttemptInfo) schemas.ProviderAttempt {
+	var providerProbe *probeReservation
+	if lease, ok := ctx.Value(probeContextKey{}).(probeReservation); ok && lease.providerOnly {
+		ctx.ClearValue(probeContextKey{})
+		providerProbe = new(probeReservation)
+		*providerProbe = lease
+		// Every early return and a different actual route release admission.
+		// A stale ticket never suppresses an otherwise current observation.
+		defer func() {
+			if providerProbe != nil {
+				c.mu.Lock()
+				c.finishProviderCheckLocked(*providerProbe, c.now())
+				c.mu.Unlock()
+			}
+		}()
+	}
 	if !c.enabled.Load() || info.Model == "" || ctx.Value(schemas.BifrostContextKeyDirectKey) != nil || !supportsRequest(ctx) {
 		return nil
 	}
@@ -385,6 +401,10 @@ func (c *Controller) BeginProviderAttempt(ctx *schemas.BifrostContext, info sche
 	r.Inflight++
 	r.LastSeen = now
 	a := &attempt{controller: c, ctx: ctx, route: r, start: now, key: k, keyEpoch: k.epoch, modelEpoch: r.Epoch, probeID: probeID, providerRevision: info.ProviderRevision}
+	if providerProbe != nil && providerProbe.Provider == id.Provider && providerProbe.Model == id.Model && c.reservationCurrentLocked(*providerProbe, now) {
+		a.providerProbe = providerProbe
+		providerProbe = nil
+	}
 	for _, scope := range []routeID{{Provider: id.Provider, KeyID: id.KeyID}, id} {
 		if i := c.incidentLocked(scope); i != nil && i.State == "recovering" && r.Samples == 0 {
 			r.Recovering = true
@@ -413,6 +433,7 @@ type attempt struct {
 	keyEpoch, modelEpoch, probeID uint64
 	holdID                        string
 	providerRevision              string
+	providerProbe                 *probeReservation
 }
 
 func (a *attempt) Observe(result *schemas.BifrostResponse, err *schemas.BifrostError) {
@@ -486,6 +507,9 @@ func holdDuration(class schemas.FailureClass, failures int, retryAfter int64) ti
 func (c *Controller) complete(a *attempt, failure schemas.FailureClass, retryAfter int64, latency time.Duration, now time.Time) {
 	r := a.route
 	c.mu.Lock()
+	if a.providerProbe != nil {
+		c.finishProviderCheckLocked(*a.providerProbe, now)
+	}
 	r.Inflight--
 	if !c.attemptCurrentLocked(a) {
 		c.mu.Unlock()
@@ -502,6 +526,12 @@ func (c *Controller) complete(a *attempt, failure schemas.FailureClass, retryAft
 			c.completeConditions(a, failure, retryAfter, now)
 		}
 		return
+	}
+	// Ordinary traffic also supplies a fresh provider observation. Extend an
+	// existing cooldown without creating admission state for healthy providers.
+	providerID := routeID{Provider: r.Provider, Model: r.Model}
+	if check, exists := c.providerChecks[providerID]; exists && check.token == 0 {
+		c.providerChecks[providerID] = providerCheck{until: now.Add(recoveryInterval)}
 	}
 	before := c.stateLocked(r, now)
 	r.Samples++

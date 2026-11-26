@@ -259,6 +259,11 @@ func (c *Controller) reset(provider schemas.ModelProvider, keyID string) error {
 }
 
 func (c *Controller) markResetLocked(id routeID) uint64 {
+	for scope := range c.providerChecks {
+		if scope.Provider == id.Provider {
+			delete(c.providerChecks, scope)
+		}
+	}
 	c.resetSequence++
 	c.pendingResets[id] = c.resetSequence
 	c.persistence.Healthy = false

@@ -98,6 +98,12 @@ observation. The next attempt resets that interval. This local recovery boost
 continues until real responses establish health, so the first successful check
 does not leave a provider stuck behind its healthy alternative. The lease
 prevents a burst of checks; healthy fallbacks remain available.
+When adaptive key selection is off, a non-held recovery check reserves only the
+provider and model. Configured weights and native key affinity still choose the
+key. Only the key that actually serves the request receives a health observation;
+a successful response on another key does not establish recovery for an untried
+key. One such provider check is admitted at a time, with a 30-second interval
+after completion. Held-key checks retain their specific credential in both modes.
 Ordinary parsed requests remain adaptive regardless of body size, including
 requests above 10 MiB and requests with streaming responses. The native OSS
 application does not register the upstream large-payload passthrough extension.
@@ -168,8 +174,13 @@ The configured snapshot interval saves the most recent telemetry, at most 2,048
 records and 1 MiB. The snapshot carries the lifecycle revision and cannot cross
 a later key rotation or state transition. In-flight attempts and probe leases
 are not restored: after restart a due condition can receive a fresh real check.
-Probe admission only reserves an in-memory lease; it never writes SQLite. While
-a lifecycle writer is busy, optional checks yield to healthy alternatives.
+Probe admission only reserves an in-memory lease; it never writes SQLite.
+Provider-only admission is kept separately from key health, bounded to 8,192
+provider/model entries, and never evicts a live lease to admit another check.
+Expired entries are removed by maintenance. A check that never reaches an
+attempt expires after five minutes; cancellation, a different dispatched route
+and observation rejection release its own lease without inventing a health sample.
+While a lifecycle writer is busy, optional checks yield to healthy alternatives.
 **Completed checks** counts checks whose outcomes were durably recorded. The
 actual start time and result are committed together when the attempt finishes.
 Cancellation frees the lease without reducing health or counting a completed
