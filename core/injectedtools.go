@@ -27,12 +27,13 @@ type injectedToolSource interface {
 
 // injectedToolSet is the resolved set of tools injected into one attempt.
 type injectedToolSet struct {
-	tools         []schemas.ChatTool        // function tools named as the model sees them
-	targets       map[string]injectedTarget // model-facing name -> MCP tool, for classifying and running the model's calls
-	mcpNames      map[string]string         // prefixed MCP name -> model-facing name, so MCP auto-injection never declares one twice
-	webSearchName string                    // model-facing name of the tool replacing native web search, "" when none
-	maxDepth      int                       // model turns the tool loop may run before it stops executing
-	search        *toolsearch.Session       // gateway-run search over the caller's deferred tools, nil when none
+	tools           []schemas.ChatTool        // function tools named as the model sees them
+	targets         map[string]injectedTarget // model-facing name -> MCP tool, for classifying and running the model's calls
+	mcpNames        map[string]string         // prefixed MCP name -> model-facing name, so MCP auto-injection never declares one twice
+	webSearchName   string                    // model-facing name of the tool replacing native web search, "" when none
+	maxDepth        int                       // model turns the tool loop may run before it stops executing
+	search          *toolsearch.Session       // gateway-run search over the caller's deferred tools, nil when none
+	callerAgentMode bool                      // admitted MCP Agent Mode preserves pending caller calls
 }
 
 // injectedTarget is the MCP tool behind one model-facing injected tool name.
@@ -769,6 +770,7 @@ func withAdmittedStreamingMCP(set *injectedToolSet, req *schemas.BifrostRequest,
 			set.targets = make(map[string]injectedTarget)
 		}
 		set.targets[name] = injectedTarget{toolName: name}
+		set.callerAgentMode = true
 	}
 	switch req.RequestType {
 	case schemas.ChatCompletionStreamRequest:
