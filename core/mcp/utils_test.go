@@ -1011,3 +1011,24 @@ func TestRoundTripState(t *testing.T) {
 	assert.Equal(t, RoundTripID("req-2"), CallRoundTripID(ctx), "a first round's id comes from its request")
 	assert.Equal(t, id, CallRoundTripID(context.WithValue(ctx, schemas.BifrostContextKeyMCPRoundTripID, id)), "a retry keeps the id it carried")
 }
+
+func TestCheckToolExecutionPermitted_RechecksUnattendedApproval(t *testing.T) {
+	m := injectedToolTestManager(schemas.MCPConnectionStateHealthy)
+	state := *m.clientMap["id-tavily"]
+	config := *state.ExecutionConfig
+	state.ExecutionConfig = &config
+	config.ToolsToExecute = schemas.WhiteList{"search"}
+	config.ToolsToAutoExecute = schemas.WhiteList{"search"}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyMCPUnattendedExecution, true)
+	require.NoError(t, checkToolExecutionPermitted(ctx, &state, "tavily-search", m.logger))
+
+	config.ToolsToAutoExecute = schemas.WhiteList{}
+	assert.ErrorContains(t, checkToolExecutionPermitted(ctx, &state, "tavily-search", m.logger), "requires explicit approval")
+	manual := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	assert.NoError(t, checkToolExecutionPermitted(manual, &state, "tavily-search", m.logger))
+
+	config.ToolsToAutoExecute = schemas.WhiteList{"search"}
+	ctx.SetValue(schemas.MCPContextKeyIncludeTools, []string{"other-tool"})
+	assert.ErrorContains(t, checkToolExecutionPermitted(ctx, &state, "tavily-search", m.logger), "filtered by request context")
+}

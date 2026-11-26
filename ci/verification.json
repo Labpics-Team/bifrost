@@ -130,7 +130,9 @@
       "TestExplicitKeySelectionExplainsNativePin",
       "TestCompleteAbandonedTraceUsesFinalTimings",
       "TestCancelledRequestExportsLateProviderTime",
-      "TestChannelMessageAbandonTraceOwnership"
+      "TestChannelMessageAbandonTraceOwnership",
+      "TestAdmittedMCPStreamsExecuteInsideGateway",
+      "TestAdmittedMCPStreamKeepsCallerTools"
     ],
     "github.com/maximhq/bifrost/core/providers/utils": [
       "TestStreamDiagnosticsCommitReason",
@@ -151,7 +153,8 @@
       "TestCancellationPreservesParentTimeoutCause",
       "TestListModelsPaginationLargePage",
       "TestFasthttpContextCancellationReachesChildrenSynchronously",
-      "TestFasthttpContextChildDeadlineStaysIndependent"
+      "TestFasthttpContextChildDeadlineStaysIndependent",
+      "TestGatewayAutoExecutionOwnershipIsNotWireData"
     ],
     "github.com/maximhq/bifrost/plugins/governance": [
       "TestRateLimitFeedbackWindows",
@@ -280,6 +283,10 @@
       "TestAdaptiveProviderRecoversFromTransientFailureOnRealTraffic",
       "TestAdaptivePruningFollowsNativeNamedProviderSettings",
       "TestAdaptiveKeylessProviderUsesObservedHealth"
+    ],
+    "github.com/maximhq/bifrost/core/mcp": [
+      "TestStreamingMCPDeclarationOwnership",
+      "TestCheckToolExecutionPermitted_RechecksUnattendedApproval"
     ]
   }
 }

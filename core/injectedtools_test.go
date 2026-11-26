@@ -421,7 +421,7 @@ func TestResolveInjectedTools_MultipleRows(t *testing.T) {
 	assert.Equal(t, "web_search", set.tools[0].Function.Name)
 	assert.Equal(t, "fetch_page", set.tools[1].Function.Name)
 	assert.Equal(t, "web_search", set.webSearchName)
-	assert.Equal(t, injectedTarget{clientName: "fetcher", toolName: "fetcher-fetch"}, set.targets["fetch_page"], "the first row with a name wins")
+	assert.Equal(t, injectedTarget{clientName: "fetcher", toolName: "fetcher-fetch", providerConfigured: true}, set.targets["fetch_page"], "the first row with a name wins")
 	assert.False(t, set.isInjected("gone"))
 	assert.Equal(t, "fetcher-fetch", fetch.Function.Name, "renaming never reaches the source schema")
 
@@ -465,7 +465,7 @@ func TestMCPInjectedCall_MapsNameToMCPTool(t *testing.T) {
 
 	assert.Equal(t, "tavily-search", *mcpCall.Function.Name)
 	assert.Equal(t, call.Function.Arguments, mcpCall.Function.Arguments)
-	assert.Equal(t, injectedTarget{clientName: "tavily", toolName: "tavily-search"}, target)
+	assert.Equal(t, injectedTarget{clientName: "tavily", toolName: "tavily-search", providerConfigured: true}, target)
 	assert.Equal(t, "web_search", *call.Function.Name, "the caller's call keeps the model-facing name")
 
 	other, none := mcpInjectedCall(set, chatToolCall("c2", "get_weather"))

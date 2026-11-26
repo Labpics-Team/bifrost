@@ -272,6 +272,10 @@ func checkToolExecutionPermitted(ctx *schemas.BifrostContext, state *schemas.MCP
 	if shouldSkipToolForRequest(ctx, clientName, toolName) {
 		return fmt.Errorf("tool '%s' is not permitted (filtered by request context)", toolName)
 	}
+	// Recheck approval at execution, not only when the model was offered the tool.
+	if unattended, _ := ctx.Value(schemas.BifrostContextKeyMCPUnattendedExecution).(bool); unattended && !CanAutoExecuteTool(toolName, state.ExecutionConfig) {
+		return fmt.Errorf("tool '%s' requires explicit approval", toolName)
+	}
 	return nil
 }
 

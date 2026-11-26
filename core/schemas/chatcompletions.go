@@ -457,7 +457,10 @@ type ChatTool struct {
 	Custom       *ChatToolCustom     `json:"custom,omitempty"`        // Custom tool definition (shape 2)
 	CacheControl *CacheControl       `json:"cache_control,omitempty"` // Cache control for the tool
 	Annotations  *MCPToolAnnotations `json:"-"`                       // MCP tool annotations (Bifrost-internal, never forwarded to providers)
-	MCP          *MCPToolMetadata    `json:"-"`                       // MCP title, icons and output schema (Bifrost-internal)
+	// GatewayAutoExecute records ownership of an admitted MCP declaration added by
+	// Bifrost itself. It is not a permission and is never read from the wire.
+	GatewayAutoExecute bool             `json:"-"`
+	MCP                *MCPToolMetadata `json:"-"` // MCP title, icons and output schema (Bifrost-internal)
 
 	// Anthropic-native tool flags promoted to the neutral layer. All optional;
 	// ignored by providers that don't support them. Gating per ProviderFeatures

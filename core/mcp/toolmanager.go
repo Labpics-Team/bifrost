@@ -284,13 +284,13 @@ func precomputeToolSerialization(tools map[string]schemas.ChatTool) {
 }
 
 func (m *ToolsManager) GetAvailableTools(ctx *schemas.BifrostContext) []schemas.ChatTool {
-	tools, _ := m.availableTools(ctx, m.clientManager.GetCallerDiscovery(ctx, false))
+	tools, _ := m.availableTools(ctx, m.clientManager.GetCallerDiscovery(ctx, false), false)
 	return tools
 }
 
 // availableTools is GetAvailableTools over the caller's discovery, also naming which
 // of the tools are connect tools; nil when none is.
-func (m *ToolsManager) availableTools(ctx *schemas.BifrostContext, callerDiscovery CallerDiscovery) ([]schemas.ChatTool, map[string]struct{}) {
+func (m *ToolsManager) availableTools(ctx *schemas.BifrostContext, callerDiscovery CallerDiscovery, markStreamingOwnership bool) ([]schemas.ChatTool, map[string]struct{}) {
 	availableToolsPerClient := callerDiscovery.ToolsPerClient
 	// Flatten tools from all clients into a single slice, avoiding duplicates
 	var availableTools []schemas.ChatTool
@@ -322,6 +322,9 @@ func (m *ToolsManager) availableTools(ctx *schemas.BifrostContext, callerDiscove
 				seenToolNames[tool.Function.Name] = true
 				schemas.AppendToContextList(ctx, schemas.BifrostContextKeyMCPAddedTools, tool.Function.Name)
 				if direct {
+					// Only a declaration actually appended below can carry ownership.
+					// Modify the value copy, not the shared MCP catalog.
+					tool.GatewayAutoExecute = markStreamingOwnership && CanAutoExecuteTool(tool.Function.Name, client.ExecutionConfig)
 					availableTools = append(availableTools, tool)
 				}
 			}
@@ -558,7 +561,8 @@ func (m *ToolsManager) ParseAndAddToolsToRequest(ctx *schemas.BifrostContext, re
 	// One CallerDiscovery gives the request its tools, its connect tools and, on the turn
 	// that has not added them yet, its server instructions.
 	callerDiscovery := m.clientManager.GetCallerDiscovery(ctx, !serverInstructionsInjected(ctx))
-	availableTools, connectNames := m.availableTools(ctx, callerDiscovery)
+	streaming := req.RequestType == schemas.ChatCompletionStreamRequest || req.RequestType == schemas.ResponsesStreamRequest
+	availableTools, connectNames := m.availableTools(ctx, callerDiscovery, streaming)
 	dropStaleConnectTools(ctx, req, connectNames)
 	// A connect tool counts as added only once it is in the request, so a
 	// caller's own tool of the same name is never taken back.
