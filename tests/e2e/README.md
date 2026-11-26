@@ -139,17 +139,20 @@ npm run codegen
 
 ### Wait Strategies
 
-Use semantic waits instead of hardcoded timeouts:
+Wait for the state the next action or assertion needs. Prefer [auto-retrying web assertions](https://playwright.dev/docs/test-assertions#auto-retrying-assertions):
 
 ```typescript
-// ✅ Good: Semantic waits
-await page.waitForLoadState('networkidle')
-await element.waitFor({ state: 'visible' })
+// ✅ Good: Assert the required rendered state
 await expect(element).toBeVisible({ timeout: 5000 })
+await expect(page.getByTestId('status')).toHaveText('Ready')
 
 // ❌ Bad: Hardcoded timeouts (flaky and slow)
 await page.waitForTimeout(2000)
 ```
+
+When the test needs a specific response, register `page.waitForResponse()` before the triggering action, await it, then assert the resulting UI.
+
+Do not add `waitForNetworkIdle()` or `waitForPageLoad()` after every navigation. These helpers wait for network silence, which does not establish application readiness. [Playwright discourages `networkidle` for tests](https://playwright.dev/docs/api/class-page#page-wait-for-load-state); background polling can also make it unreliable.
 
 ### Selectors
 
@@ -212,7 +215,7 @@ if (count === 0) {
 
 1. Replace `waitForTimeout()` with proper semantic waits
 2. Ensure toasts are dismissed: `await page.dismissToasts()`
-3. Add `waitForPageLoad()` after navigation
+3. After navigation, assert the required visible content or actionable control
 4. Wait for sheets/modals to complete animation: `await page.waitForSheetAnimation()`
 
 ### Tests Pass Individually but Fail Together
