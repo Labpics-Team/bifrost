@@ -2,7 +2,6 @@ package adaptive
 
 import (
 	"fmt"
-	"math"
 	"math/rand/v2"
 	"slices"
 	"sort"
@@ -69,7 +68,7 @@ func (c *Controller) direction(ctx *schemas.BifrostContext, provider schemas.Mod
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	count := 0
+	count, measured := 0, 0
 	total, latency := 0.0, 0.0
 	for _, key := range keys {
 		if key.Enabled != nil && !*key.Enabled || keyID != "" && key.ID != keyID || !c.supports(provider, key, model) {
@@ -77,9 +76,13 @@ func (c *Controller) direction(ctx *schemas.BifrostContext, provider schemas.Mod
 		}
 		count++
 		id := routeID{provider, model, key.ID}
-		total += c.weightLocked(id, now)
+		weight := c.weightLocked(id, now)
+		total += weight
 		if r := c.routes[id]; r != nil {
-			latency += r.LatencyMS
+			if weight > 0 && r.LatencyMS > 0 {
+				latency += r.LatencyMS
+				measured++
+			}
 			if !r.FailedUntil.IsZero() && !r.FailedUntil.After(now) && !r.ProbeUntil.After(now) && c.holdLocked(id, now) == nil {
 				d.recover = r
 			}
@@ -104,7 +107,9 @@ func (c *Controller) direction(ctx *schemas.BifrostContext, provider schemas.Mod
 		d.score = total / float64(count)
 		// Comparing the inverse first-response latency is relative across the
 		// providers serving this same requested model, including aliases.
-		d.latency = latency / float64(count)
+		if measured > 0 {
+			d.latency = latency / float64(measured)
+		}
 	}
 	return d
 }
@@ -156,7 +161,7 @@ func (c *Controller) Route(ctx *schemas.BifrostContext, req *schemas.BifrostRequ
 	}
 	if baseline > 0 {
 		for i := range directions {
-			directions[i].score /= math.Sqrt(math.Max(1, directions[i].latency/baseline))
+			directions[i].score *= latencyFactor(directions[i].latency / baseline)
 		}
 	}
 	// Shuffle only equal scores so a new key/provider starts with a fair share.
@@ -170,21 +175,8 @@ func (c *Controller) Route(ctx *schemas.BifrostContext, req *schemas.BifrostRequ
 			return nil
 		}
 		selected.Provider = directions[0].provider
-		// Keep real traffic on every usable direction, as we do for keys.
-		// Always taking the maximum would freeze a recovered provider's last
-		// bad score forever behind a healthy provider that keeps serving.
-		total := 0.0
-		for _, d := range directions {
-			total += d.score
-		}
-		draw := rand.Float64() * total
-		for _, d := range directions {
-			draw -= d.score
-			if draw < 0 {
-				selected.Provider = d.provider
-				break
-			}
-		}
+		// Bifrost ranks providers, but distributes traffic across keys.
+		// Due checks below are the exception to the healthiest-provider pick.
 		// A due hold or an expired failure cooldown gets one real recheck,
 		// with healthy directions behind it. The slot also names the key.
 		for _, d := range directions {

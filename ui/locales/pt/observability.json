@@ -51,7 +51,7 @@
 		"configured": "Configurado",
 		"unconfigured": "Não configurado",
 		"unconfiguredHelp": "Salve as configurações para ativar um perfil de roteamento adaptativo. Até lá, Bifrost usa sua seleção nativa de provedores e chaves.",
-		"healthHelp": "A saúde é medida pelo tráfego deste nó. A pontuação de 0 a 100 reflete erros; o roteamento também considera latência relativa e carga atual.",
+		"healthHelp": "A saúde é medida pelo tráfego deste nó. A pontuação da chave de 0 a 100 combina erros, latência relativa, carga e recuperação.",
 		"routeHealth": "Saúde atual das rotas",
 		"historyDisabled": "O registro de eventos está desativado. Incidentes existentes e retenções ativas são preservados.",
 		"routes": "Rotas observadas",

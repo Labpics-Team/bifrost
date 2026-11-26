@@ -1,0 +1,74 @@
+package adaptive
+
+import (
+	"math"
+	"time"
+)
+
+// The public EE contract defines the signals and their precedence, not its
+// coefficients. Keep the fork's tuning private and in this one calculation.
+const (
+	baselineDecay        = 0.02
+	degradedLatencyRatio = 2
+)
+
+func (r *route) observeLatency(measured float64) {
+	if measured <= 0 {
+		return
+	}
+	if r.BaselineLatencyMS <= 0 {
+		r.BaselineLatencyMS = r.LatencyMS
+		if r.BaselineLatencyMS <= 0 {
+			r.BaselineLatencyMS = measured
+		}
+	}
+	if r.LatencyMS <= 0 {
+		r.LatencyMS = measured
+	} else {
+		r.LatencyMS += decay * (measured - r.LatencyMS)
+	}
+	r.BaselineLatencyMS += baselineDecay * (measured - r.BaselineLatencyMS)
+}
+
+func (r *route) latencyRatio(peerBaseline float64) float64 {
+	ratio := 1.0
+	if r.BaselineLatencyMS > 0 {
+		ratio = max(ratio, r.LatencyMS/r.BaselineLatencyMS)
+	}
+	if peerBaseline > 0 {
+		ratio = max(ratio, r.LatencyMS/peerBaseline)
+	}
+	return ratio
+}
+
+func latencyFactor(ratio float64) float64 {
+	return 0.5 + 0.5/math.Sqrt(max(1, ratio))
+}
+
+func (r *route) score(peerBaseline float64) float64 {
+	// Errors dominate substantial degradation. Latency is relative to both
+	// the eligible peers and this key's own recent performance. Keep load
+	// a smaller, bounded adjustment rather than letting long streams
+	// eliminate an otherwise healthy key from rotation.
+	w := math.Max(0.05, math.Pow(1-r.ErrorRate, 3))
+	w *= latencyFactor(r.latencyRatio(peerBaseline))
+	w *= 1 - 0.2*float64(r.Inflight)/(1+float64(r.Inflight))
+	if r.Recovering && r.Recoveries < 5 {
+		w *= 0.1 + 0.18*float64(r.Recoveries)
+	}
+	return w
+}
+
+func (c *Controller) keyWeightLocked(id routeID, now time.Time, peerBaseline float64) float64 {
+	if c.holdLocked(id, now) != nil {
+		return 0
+	}
+	r := c.routes[id]
+	if r == nil {
+		return 1
+	}
+	if !r.FailedUntil.IsZero() {
+		return 0
+	}
+	return r.score(peerBaseline)
+}

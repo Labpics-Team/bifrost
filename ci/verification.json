@@ -198,6 +198,11 @@
       "TestAdaptiveNativeConfigDurability"
     ],
     "github.com/maximhq/bifrost/plugins/routing/adaptive": [
+      "TestAdaptiveEEChoosesHealthiestProviderAndWeightsKeys",
+      "TestAdaptiveEESelfLatencyDegradesEvenWithoutPeer",
+      "TestAdaptiveEEPartialHoldDegradesProviderAndDefersDiagnostic",
+      "TestAdaptiveEEReholdResumesAndResetsLadder",
+      "TestAdaptiveEENativeAffinityCannotKeepFailedRouteOrKey",
       "TestAdaptiveAdmissionCannotAdoptReplacementCredential",
       "TestAdaptiveWholeKeyCheckReplacesExistingModelHold",
       "TestAdaptiveDisabledRestartRestoresLifecycleRevision",

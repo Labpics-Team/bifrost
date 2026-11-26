@@ -31,21 +31,22 @@ type routeID struct {
 
 type route struct {
 	routeID
-	KeyRevision  string               `json:"key_revision"`
-	Epoch        uint64               `json:"-"`
-	KeyName      string               `json:"key_name"`
-	Samples      uint64               `json:"samples"`
-	ErrorRate    float64              `json:"error_rate"`
-	LatencyMS    float64              `json:"latency_ms"`
-	Inflight     int                  `json:"inflight"`
-	Consecutive  int                  `json:"consecutive_failures"`
-	Recoveries   int                  `json:"recoveries"`
-	LastSeen     time.Time            `json:"last_seen"`
-	ProbeUntil   time.Time            `json:"-"`
-	ProbeID      uint64               `json:"-"`
-	Recovering   bool                 `json:"recovering"`
-	FailedUntil  time.Time            `json:"failed_until,omitempty"`
-	FailureClass schemas.FailureClass `json:"failure_class,omitempty"`
+	KeyRevision       string               `json:"key_revision"`
+	Epoch             uint64               `json:"-"`
+	KeyName           string               `json:"key_name"`
+	Samples           uint64               `json:"samples"`
+	ErrorRate         float64              `json:"error_rate"`
+	LatencyMS         float64              `json:"latency_ms"`
+	BaselineLatencyMS float64              `json:"baseline_latency_ms,omitempty"`
+	Inflight          int                  `json:"inflight"`
+	Consecutive       int                  `json:"consecutive_failures"`
+	Recoveries        int                  `json:"recoveries"`
+	LastSeen          time.Time            `json:"last_seen"`
+	ProbeUntil        time.Time            `json:"-"`
+	ProbeID           uint64               `json:"-"`
+	Recovering        bool                 `json:"recovering"`
+	FailedUntil       time.Time            `json:"failed_until,omitempty"`
+	FailureClass      schemas.FailureClass `json:"failure_class,omitempty"`
 }
 
 type RouteStatus struct {
@@ -70,32 +71,34 @@ type Controller struct {
 	keyless        func(schemas.ModelProvider) bool
 	providerExists func(schemas.ModelProvider) bool
 	// lifeMu serializes durable transitions. mu is never held over database IO.
-	lifeMu            sync.Mutex
-	conditions        map[routeID]*condition
-	keyStates         map[routeID]*keyState
-	providerRevisions map[schemas.ModelProvider]string
-	pendingResets     map[routeID]uint64
-	resetSequence     uint64
-	incidents         map[routeID]*Incident
-	revision          uint64
-	probeSequence     uint64
-	persistence       PersistenceStatus
-	stateStore        *configstore.AdaptiveRoutingStore
-	enabled           atomic.Bool
-	startOnce         sync.Once
-	stop              context.CancelFunc
-	wg                sync.WaitGroup
-	config            configValue
-	mu                sync.Mutex
-	routes            map[routeID]*route
-	now               func() time.Time
-	keys              func(context.Context, schemas.ModelProvider) ([]schemas.Key, error)
-	providers         func(string) []schemas.ModelProvider
-	supports          func(schemas.ModelProvider, schemas.Key, string) bool
+	lifeMu             sync.Mutex
+	conditions         map[routeID]*condition
+	releasedHolds      map[routeID]releasedHold
+	keyStates          map[routeID]*keyState
+	providerRevisions  map[schemas.ModelProvider]string
+	pendingResets      map[routeID]uint64
+	pendingDiagnostics map[routeID]pendingDiagnostic
+	resetSequence      uint64
+	incidents          map[routeID]*Incident
+	revision           uint64
+	probeSequence      uint64
+	persistence        PersistenceStatus
+	stateStore         *configstore.AdaptiveRoutingStore
+	enabled            atomic.Bool
+	startOnce          sync.Once
+	stop               context.CancelFunc
+	wg                 sync.WaitGroup
+	config             configValue
+	mu                 sync.Mutex
+	routes             map[routeID]*route
+	now                func() time.Time
+	keys               func(context.Context, schemas.ModelProvider) ([]schemas.Key, error)
+	providers          func(string) []schemas.ModelProvider
+	supports           func(schemas.ModelProvider, schemas.Key, string) bool
 }
 
 func New(config Config) *Controller {
-	c := &Controller{routes: make(map[routeID]*route), conditions: make(map[routeID]*condition), keyStates: make(map[routeID]*keyState), incidents: make(map[routeID]*Incident), persistence: PersistenceStatus{Healthy: true}, now: time.Now}
+	c := &Controller{routes: make(map[routeID]*route), conditions: make(map[routeID]*condition), releasedHolds: make(map[routeID]releasedHold), keyStates: make(map[routeID]*keyState), incidents: make(map[routeID]*Incident), persistence: PersistenceStatus{Healthy: true}, now: time.Now}
 	c.providerRevisions = make(map[schemas.ModelProvider]string)
 	c.pendingResets = make(map[routeID]uint64)
 	c.config.store(config)
@@ -150,6 +153,7 @@ func (c *Controller) routeLocked(id routeID, name string, now time.Time) *route 
 			return nil
 		}
 		delete(c.routes, oldest.routeID)
+		delete(c.pendingDiagnostics, oldest.routeID)
 	}
 	r := &route{routeID: id, KeyName: name, LastSeen: now}
 	c.routes[id] = r
@@ -168,24 +172,7 @@ func (c *Controller) holdLocked(id routeID, now time.Time) *condition {
 }
 
 func (c *Controller) weightLocked(id routeID, now time.Time) float64 {
-	if c.holdLocked(id, now) != nil {
-		return 0
-	}
-	r := c.routes[id]
-	if r == nil {
-		return 1
-	}
-	if !r.FailedUntil.IsZero() {
-		return 0
-	}
-	// Success probability dominates latency and queueing. A usable route keeps
-	// a small share of real traffic, so it can recover without synthetic probes.
-	w := math.Max(0.05, math.Pow(1-r.ErrorRate, 3))
-	w /= float64(1 + r.Inflight)
-	if r.Recovering && r.Recoveries < 5 {
-		w *= 0.1 + 0.18*float64(r.Recoveries)
-	}
-	return w
+	return c.keyWeightLocked(id, now, 0)
 }
 
 // SelectKey receives core's already filtered pool; caller/rule pins and session
@@ -266,11 +253,7 @@ func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, 
 			}
 			return 0
 		}
-		w := c.weightLocked(id, now)
-		if r := c.routes[id]; r != nil && baseline > 0 {
-			w /= math.Sqrt(math.Max(1, r.LatencyMS/baseline))
-		}
-		return w
+		return c.keyWeightLocked(id, now, baseline)
 	}
 	total, maxWeight := 0.0, 0.0
 	for _, key := range keys {
@@ -532,11 +515,7 @@ func (c *Controller) complete(a *attempt, failure schemas.FailureClass, retryAft
 	}
 	if failure == "" {
 		measured := float64(latency) / float64(time.Millisecond)
-		if r.LatencyMS == 0 {
-			r.LatencyMS = measured
-		} else {
-			r.LatencyMS += decay * (measured - r.LatencyMS)
-		}
+		r.observeLatency(measured)
 		r.Consecutive = 0
 		r.Recoveries++
 		r.FailedUntil = time.Time{}
@@ -591,14 +570,14 @@ func (c *Controller) stateLocked(r *route, now time.Time) string {
 		return "recovering"
 	case r.Samples == 0:
 		return "unknown"
-	case r.ErrorRate > 0.05:
+	case r.ErrorRate > 0.05 || r.latencyRatio(0) >= degradedLatencyRatio:
 		return "degraded"
 	}
 	return "healthy"
 }
 
-func (c *Controller) statusLocked(r *route, now time.Time) RouteStatus {
-	status := RouteStatus{Provider: r.Provider, Model: r.Model, KeyID: r.KeyID, KeyName: r.KeyName, State: c.stateLocked(r, now), Score: 100 * c.weightLocked(r.routeID, now), Samples: r.Samples, ErrorRate: r.ErrorRate, LatencyMS: r.LatencyMS, Inflight: r.Inflight, LastSeen: r.LastSeen, FailureClass: r.FailureClass}
+func (c *Controller) statusLocked(r *route, now time.Time, baseline float64) RouteStatus {
+	status := RouteStatus{Provider: r.Provider, Model: r.Model, KeyID: r.KeyID, KeyName: r.KeyName, State: c.stateLocked(r, now), Score: 100 * c.keyWeightLocked(r.routeID, now, baseline), Samples: r.Samples, ErrorRate: r.ErrorRate, LatencyMS: r.LatencyMS, Inflight: r.Inflight, LastSeen: r.LastSeen, FailureClass: r.FailureClass}
 	if h := c.holdLocked(r.routeID, now); h != nil {
 		until := h.HoldUntil
 		status.HoldUntil = &until
@@ -613,8 +592,18 @@ func (c *Controller) Status() []RouteStatus {
 	defer c.mu.Unlock()
 	result := make([]RouteStatus, 0, len(c.routes)+len(c.conditions))
 	seen := make(map[routeID]bool)
+	// The dashboard and selection use the same key score. The dashboard's
+	// peers are the observed, usable keys of the provider/model; a request
+	// can narrow that set further through governance or explicit key pins.
+	baselines := make(map[routeID]float64)
 	for id, r := range c.routes {
-		result = append(result, c.statusLocked(r, now))
+		scope := routeID{Provider: id.Provider, Model: id.Model}
+		if r.LatencyMS > 0 && c.weightLocked(id, now) > 0 && (baselines[scope] == 0 || r.LatencyMS < baselines[scope]) {
+			baselines[scope] = r.LatencyMS
+		}
+	}
+	for id, r := range c.routes {
+		result = append(result, c.statusLocked(r, now, baselines[routeID{Provider: id.Provider, Model: id.Model}]))
 		seen[id] = true
 		if c.wholeKeyHoldLocked(id, now) != nil {
 			seen[routeID{Provider: id.Provider, KeyID: id.KeyID}] = true

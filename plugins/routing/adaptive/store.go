@@ -260,19 +260,27 @@ func (c *Controller) maintain(ctx context.Context) error {
 	for id, generation := range c.pendingResets {
 		pending[id] = generation
 	}
+	now := c.now()
+	for id, previous := range c.releasedHolds {
+		if now.Sub(previous.at) >= reholdWindow {
+			delete(c.releasedHolds, id)
+		}
+	}
 	c.mu.Unlock()
 	for id, generation := range pending {
 		if err := c.retryReset(ctx, id, generation); err != nil {
 			return err
 		}
 	}
-	now := c.now()
+	c.flushDiagnostics()
+	now = c.now()
 	err := c.transition(ctx, func() transition {
 		t := transition{}
 		observed := make(map[routeID]bool, len(c.routes))
 		for id, r := range c.routes {
 			if r.Inflight == 0 && now.Sub(r.LastSeen) > idleTTL {
 				delete(c.routes, id)
+				delete(c.pendingDiagnostics, id)
 				continue
 			}
 			observed[id] = true

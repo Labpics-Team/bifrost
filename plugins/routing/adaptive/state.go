@@ -2,6 +2,7 @@ package adaptive
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -20,6 +21,32 @@ type condition struct {
 	HoldClass                            schemas.FailureClass
 	ProbeID                              uint64
 	ProbeUntil                           time.Time
+}
+
+// A released condition is no longer a hold. Retain only the short
+// re-hold ladder window, scoped to the same credential and refusal.
+type releasedHold struct {
+	class    schemas.FailureClass
+	rung     int
+	revision string
+	at       time.Time
+}
+
+const reholdWindow = 10 * time.Minute
+
+func (c *Controller) reholdRungLocked(id routeID, class schemas.FailureClass, revision string, now time.Time) int {
+	if previous, ok := c.releasedHolds[id]; ok && previous.class == class && previous.revision == revision && now.Sub(previous.at) < reholdWindow {
+		return previous.rung
+	}
+	return 1
+}
+
+func (c *Controller) forgetReleasedLocked(provider schemas.ModelProvider, keyID, model string) {
+	for id := range c.releasedHolds {
+		if (provider == "" || id.Provider == provider) && (keyID == "" || id.KeyID == keyID) && (model == "" || id.Model == model) {
+			delete(c.releasedHolds, id)
+		}
+	}
 }
 
 type keyState struct {
@@ -75,7 +102,19 @@ func (t transition) durable() bool {
 // transition admits observation-only updates without waiting for the durable
 // writer. A real transition is rebuilt after serial admission; build may run
 // twice and must defer lifecycle publication to publish.
+var errLifecycleBusy = errors.New("adaptive lifecycle writer is busy")
+
 func (c *Controller) transition(ctx context.Context, build func() transition) error {
+	return c.transitionWithAdmission(ctx, build, true)
+}
+
+// Observations must not queue a healthy request behind an unrelated hold
+// transaction. A contended diagnostic is retried by the maintenance worker.
+func (c *Controller) tryDiagnosticTransition(ctx context.Context, build func() transition) error {
+	return c.transitionWithAdmission(ctx, build, false)
+}
+
+func (c *Controller) transitionWithAdmission(ctx context.Context, build func() transition, wait bool) error {
 	c.mu.Lock()
 	t := build()
 	if !t.durable() {
@@ -86,7 +125,11 @@ func (c *Controller) transition(ctx context.Context, build func() transition) er
 		return nil
 	}
 	c.mu.Unlock()
-	c.lifeMu.Lock()
+	if wait {
+		c.lifeMu.Lock()
+	} else if !c.lifeMu.TryLock() {
+		return errLifecycleBusy
+	}
 	defer c.lifeMu.Unlock()
 	c.mu.Lock()
 	t = build()
@@ -254,7 +297,7 @@ func setIncidentState(i *Incident, state string, now time.Time, request string) 
 		i.Action = "Healthy alternatives receive traffic while this route is checked."
 	default:
 		i.Status = "mitigated"
-		i.Summary = "The route is returning errors."
+		i.Summary = "The route is returning errors or responding more slowly than usual."
 		i.Action = "Its traffic share is reduced while observations recover."
 	}
 }
@@ -358,7 +401,11 @@ func (c *Controller) completeConditions(a *attempt, failure schemas.FailureClass
 				t.remove = append(t.remove, h)
 				setIncidentState(i, "recovering", now, request)
 				t.events = append(t.events, incidentEvent(i, "hold_released", request, "The check showed the previous refusal no longer applies.", now))
-				t.publish = func() { r.Recovering = true; r.Recoveries = 0 }
+				t.publish = func() {
+					c.releasedHolds[h.routeID] = releasedHold{class: h.HoldClass, rung: h.Rung, revision: h.KeyRevision, at: now}
+					r.Recovering = true
+					r.Recoveries = 0
+				}
 			} else {
 				copy := *h
 				copy.ID = uuid.NewString()
@@ -397,7 +444,8 @@ func (c *Controller) completeConditions(a *attempt, failure schemas.FailureClass
 			if previous := c.conditions[id]; previous != nil && previous != h {
 				t.remove = append(t.remove, previous)
 			}
-			next := &condition{routeID: id, ID: uuid.NewString(), KeyRevision: r.KeyRevision, IncidentID: i.ID, KeyName: r.KeyName, HoldUntil: now.Add(holdDuration(failure, 1, retryAfter)), HeldAt: now, Rung: 1, HoldClass: failure}
+			rung := c.reholdRungLocked(id, failure, r.KeyRevision, now)
+			next := &condition{routeID: id, ID: uuid.NewString(), KeyRevision: r.KeyRevision, IncidentID: i.ID, KeyName: r.KeyName, HoldUntil: now.Add(holdDuration(failure, rung, retryAfter)), HeldAt: now, Rung: rung, HoldClass: failure}
 			t.upsert = append(t.upsert, next)
 			t.events = append(t.events, incidentEvent(i, "held", request, "The provider refused the key; ordinary traffic skips it.", now))
 		}
@@ -415,7 +463,7 @@ func (c *Controller) updateHealthIncident(a *attempt, request string, now time.T
 	r := a.route
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = c.transition(ctx, func() transition {
+	err := c.tryDiagnosticTransition(ctx, func() transition {
 		if !c.attemptCurrentLocked(a) || c.holdLocked(r.routeID, now) != nil {
 			return transition{}
 		}
@@ -453,6 +501,9 @@ func (c *Controller) updateHealthIncident(a *attempt, request string, now time.T
 		}
 		return t
 	})
+	if err != nil {
+		c.deferDiagnostic(a, request, now, true, false)
+	}
 }
 
 func (c *Controller) updateProviderIncident(a *attempt, request string, now time.Time) {
@@ -474,7 +525,7 @@ func (c *Controller) updateProviderIncident(a *attempt, request string, now time
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = c.transition(ctx, func() transition {
+	err = c.tryDiagnosticTransition(ctx, func() transition {
 		if c.revision != revision || c.resetSequence != generation || c.providerRevisions[provider] != providerRevision || !c.attemptCurrentLocked(a) {
 			return transition{}
 		}
@@ -484,8 +535,7 @@ func (c *Controller) updateProviderIncident(a *attempt, request string, now time
 			return transition{}
 		}
 		eligible, unavailable := 0, 0
-		errorRate := 0.0
-		recovering := false
+		degraded, recovering := false, false
 		for _, key := range keys {
 			if key.Enabled != nil && !*key.Enabled || !c.supports(provider, key, model) {
 				continue
@@ -496,8 +546,9 @@ func (c *Controller) updateProviderIncident(a *attempt, request string, now time
 				unavailable++
 			}
 			if r := c.routes[rid]; r != nil {
-				errorRate += r.ErrorRate
-				recovering = recovering || r.Recovering
+				state := c.stateLocked(r, now)
+				degraded = degraded || state == "degraded"
+				recovering = recovering || state == "recovering"
 			}
 		}
 		if eligible == 0 {
@@ -506,10 +557,10 @@ func (c *Controller) updateProviderIncident(a *attempt, request string, now time
 		state := "healthy"
 		if unavailable == eligible {
 			state = "failed"
+		} else if unavailable > 0 || degraded {
+			state = "degraded"
 		} else if recovering {
 			state = "recovering"
-		} else if errorRate/float64(eligible) > 0.05 {
-			state = "degraded"
 		}
 		if i == nil && state == "healthy" {
 			return transition{}
@@ -523,4 +574,7 @@ func (c *Controller) updateProviderIncident(a *attempt, request string, now time
 		setIncidentState(i, state, now, request)
 		return transition{incidents: []*Incident{i}, events: []IncidentEvent{incidentEvent(i, "state_changed", request, fmt.Sprintf("Provider health for this model changed to %s.", state), now)}}
 	})
+	if err != nil {
+		c.deferDiagnostic(a, request, now, false, true)
+	}
 }

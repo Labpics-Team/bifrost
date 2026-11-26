@@ -51,7 +51,7 @@
 		"configured": "Configurato",
 		"unconfigured": "Non configurato",
 		"unconfiguredHelp": "Salva le impostazioni per attivare un profilo di instradamento adattivo. Fino ad allora Bifrost usa la propria selezione nativa di provider e chiavi.",
-		"healthHelp": "Lo stato è misurato dal traffico di questo nodo. Il punteggio 0–100 riflette gli errori; l'instradamento considera anche latenza relativa e carico attuale.",
+		"healthHelp": "Lo stato è misurato dal traffico di questo nodo. Il punteggio della chiave da 0 a 100 combina errori, latenza relativa, carico e ripristino.",
 		"routeHealth": "Stato attuale delle rotte",
 		"historyDisabled": "La registrazione degli eventi è disattivata. Incidenti esistenti e sospensioni attive vengono mantenuti.",
 		"routes": "Rotte osservate",
