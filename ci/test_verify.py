@@ -173,6 +173,7 @@ class CombinedVerificationTests(unittest.TestCase):
             ([line for line in good if not (b in line and '"Test":' in line)], 0, False),
             (good + [event(b, "skip", "TestRequired/subtest")], 0, False),
             (good + ["not JSON\\n"], 0, False),
+            (good + [event([], "pass")], 0, False),
             (good, 1, False),
         ]
         for events, code, success in variants:
@@ -183,9 +184,16 @@ class CombinedVerificationTests(unittest.TestCase):
                     process.wait.return_value = code
                     if success:
                         verify.run_test_packages(Path("."), {}, packages, ["go", "test"])
+                        self.assertEqual(popen.call_args.args[0], ["go", "test", *packages])
                     else:
                         with self.assertRaises(verify.VerificationError):
                             verify.run_test_packages(Path("."), {}, packages, ["go", "test"])
+
+    def test_empty_roster_rejected_before_spawn(self):
+        with patch.object(verify.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(verify.VerificationError, "empty test package roster"):
+                verify.run_test_packages(Path("."), {}, {}, ["go", "test"])
+            popen.assert_not_called()
 
 
 @unittest.skipUnless(shutil.which("go"), "Go is needed for native JSON verification")
@@ -204,7 +212,7 @@ class NativeMultiPackageTests(unittest.TestCase):
             env = {**os.environ, "GOWORK": "off", "GOTOOLCHAIN": "local", "GOPROXY": "off",
                    "GOSUMDB": "off", "GOFLAGS": "-p=2", "GOMAXPROCS": "2"}
             packages = {"example.org/testplan/a": ["TestRequired"], "example.org/testplan/b": ["TestRequired"]}
-            command = ["go", "test", "-json", "-short", "-count=1", *packages]
+            command = ["go", "test", "-json", "-short", "-count=1"]
             verify.run_test_packages(root, env, packages, command)
             packages["example.org/testplan/b"] = ["TestMissing"]
             with self.assertRaisesRegex(verify.VerificationError, "example.org/testplan/b: required tests did not pass: TestMissing"):
@@ -396,7 +404,7 @@ class ChangedPackageTests(unittest.TestCase):
             ])
             self.assertTrue({"-short", "-race", "-count=1"}.issubset(command))
             self.assertFalse(any(arg.startswith("-run") for arg in command))
-            self.assertEqual(command[-len(packages):], list(packages))
+            self.assertEqual(command, verify.short_command())
 
     def test_untracked_new_package_is_included_in_unit_verification(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):

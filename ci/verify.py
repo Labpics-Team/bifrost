@@ -161,13 +161,13 @@ def test_command(package, required):
         command.extend(["-short", "-run=."])
     else:
         command.extend(["-short=false", "-run=^(" + "|".join(required) + ")$"])
-    return [*command, package]
+    return command
 
 
-def short_command(packages):
+def short_command():
     # Go schedules independent test binaries using its existing -p budget.
     # -timeout applies to each test binary, not to the entire package list.
-    return ["go", "test", "-json", "-short", "-race", "-count=1", "-timeout=15m", *packages]
+    return ["go", "test", "-json", "-short", "-race", "-count=1", "-timeout=15m"]
 
 
 def decode_test_event(line):
@@ -228,10 +228,12 @@ class TestReport:
 
 def run_test_packages(root, env, packages, command):
     """Run one native Go invocation; every expected package must report success."""
+    if not packages:
+        raise VerificationError("empty test package roster")
     reports = {package: TestReport(package, required) for package, required in packages.items()}
     invalid = []
     with subprocess.Popen(
-        command, cwd=root, env=env,
+        [*command, *reports], cwd=root, env=env,
         stdout=subprocess.PIPE, text=True, encoding="utf-8",
     ) as process:
         for line in process.stdout:
@@ -240,9 +242,17 @@ def run_test_packages(root, env, packages, command):
             except VerificationError as error:
                 invalid.append(str(error))
                 continue
+            package = event.get("Package")
+            if package is not None and not isinstance(package, str):
+                invalid.append("go test package must be a string")
+                continue
             if isinstance(event.get("Output"), str):
-                print(event["Output"], end="", flush=True)
-            report = reports.get(event.get("Package"))
+                output = event["Output"]
+                label = package or event.get("ImportPath")
+                if len(reports) > 1 and isinstance(label, str) and label:
+                    output = "".join(f"[{label}] {line}" for line in output.splitlines(keepends=True))
+                print(output, end="", flush=True)
+            report = reports.get(package)
             if report is not None:
                 report.accept(event)
         returncode = process.wait()
@@ -261,7 +271,7 @@ def check_short_corpus(root, env, packages):
     if not packages:
         return
     print(f"Testing full short corpus: {', '.join(packages)}", flush=True)
-    run_test_packages(root, env, dict.fromkeys(packages, ()), short_command(packages))
+    run_test_packages(root, env, dict.fromkeys(packages, ()), short_command())
     print(f"All {len(packages)} planned short suites passed", flush=True)
 
 
