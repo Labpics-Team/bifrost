@@ -332,6 +332,72 @@ func toolResultSummaryBlocks(contentBlocks []schemas.ChatContentBlock) []map[str
 	return blocks
 }
 
+// FormatExecutedToolResults projects executed calls when the caller still owns
+// the next turn. Chat, Responses and streaming Agent Mode share this projection.
+func FormatExecutedToolResults(executedToolResults []*schemas.ChatMessage, executedToolCalls []schemas.ChatAssistantMessageToolCall) string {
+	// Build a map from tool call ID to tool name for easy lookup
+	toolCallIDToName := make(map[string]string)
+	for _, toolCall := range executedToolCalls {
+		if toolCall.ID != nil && toolCall.Function.Name != nil {
+			toolCallIDToName[*toolCall.ID] = *toolCall.Function.Name
+		}
+	}
+
+	// Build content text showing executed tool results
+	var contentText string
+	if len(executedToolResults) > 0 {
+		// Format tool results as JSON-like structure
+		toolResultsMap := make(map[string]interface{})
+		counts := make(map[string]int)
+		for _, toolResult := range executedToolResults {
+			// Get tool name from tool call ID mapping
+			var toolName string
+			if toolResult.ChatToolMessage != nil && toolResult.ChatToolMessage.ToolCallID != nil {
+				toolCallID := *toolResult.ChatToolMessage.ToolCallID
+				if name, ok := toolCallIDToName[toolCallID]; ok {
+					toolName = name
+				} else {
+					toolName = toolCallID // Fallback to tool call ID if name not found
+				}
+			} else {
+				toolName = "unknown_tool"
+			}
+
+			// Extract output from tool result
+			var output interface{}
+			if toolResult.Content != nil {
+				if toolResult.Content.ContentStr != nil {
+					output = *toolResult.Content.ContentStr
+				} else if toolResult.Content.ContentBlocks != nil {
+					output = toolResultSummaryBlocks(toolResult.Content.ContentBlocks)
+				}
+			}
+			switch counts[toolName] {
+			case 0:
+				toolResultsMap[toolName] = output
+			case 1:
+				toolResultsMap[toolName] = []interface{}{toolResultsMap[toolName], output}
+			default:
+				toolResultsMap[toolName] = append(toolResultsMap[toolName].([]interface{}), output)
+			}
+			counts[toolName]++
+		}
+
+		// Convert to JSON string for display
+		jsonBytes, err := schemas.MarshalSorted(toolResultsMap)
+		if err != nil {
+			// Fallback to simple string representation
+			contentText = fmt.Sprintf("The Output from allowed tools calls is - %v\n\nNow I shall call these tools next...", toolResultsMap)
+		} else {
+			contentText = fmt.Sprintf("The Output from allowed tools calls is - %s\n\nNow I shall call these tools next...", string(jsonBytes))
+		}
+	} else {
+		contentText = "Now I shall call these tools next..."
+	}
+
+	return contentText
+}
+
 // createChatResponseWithExecutedToolsAndNonAutoExecutableCalls creates a chat response
 // that includes executed tool results and non-auto-executable tool calls. The response
 // contains a formatted text summary of executed tool results and includes the non-auto-executable
@@ -368,56 +434,7 @@ func createChatResponseWithExecutedToolsAndNonAutoExecutableCalls(
 		Citations:         originalResponse.Citations,
 	}
 
-	// Build a map from tool call ID to tool name for easy lookup
-	toolCallIDToName := make(map[string]string)
-	for _, toolCall := range executedToolCalls {
-		if toolCall.ID != nil && toolCall.Function.Name != nil {
-			toolCallIDToName[*toolCall.ID] = *toolCall.Function.Name
-		}
-	}
-
-	// Build content text showing executed tool results
-	var contentText string
-	if len(executedToolResults) > 0 {
-		// Format tool results as JSON-like structure
-		toolResultsMap := make(map[string]interface{})
-		for _, toolResult := range executedToolResults {
-			// Get tool name from tool call ID mapping
-			var toolName string
-			if toolResult.ChatToolMessage != nil && toolResult.ChatToolMessage.ToolCallID != nil {
-				toolCallID := *toolResult.ChatToolMessage.ToolCallID
-				if name, ok := toolCallIDToName[toolCallID]; ok {
-					toolName = name
-				} else {
-					toolName = toolCallID // Fallback to tool call ID if name not found
-				}
-			} else {
-				toolName = "unknown_tool"
-			}
-
-			// Extract output from tool result
-			var output interface{}
-			if toolResult.Content != nil {
-				if toolResult.Content.ContentStr != nil {
-					output = *toolResult.Content.ContentStr
-				} else if toolResult.Content.ContentBlocks != nil {
-					output = toolResultSummaryBlocks(toolResult.Content.ContentBlocks)
-				}
-			}
-			toolResultsMap[toolName] = output
-		}
-
-		// Convert to JSON string for display
-		jsonBytes, err := schemas.MarshalSorted(toolResultsMap)
-		if err != nil {
-			// Fallback to simple string representation
-			contentText = fmt.Sprintf("The Output from allowed tools calls is - %v\n\nNow I shall call these tools next...", toolResultsMap)
-		} else {
-			contentText = fmt.Sprintf("The Output from allowed tools calls is - %s\n\nNow I shall call these tools next...", string(jsonBytes))
-		}
-	} else {
-		contentText = "Now I shall call these tools next..."
-	}
+	contentText := FormatExecutedToolResults(executedToolResults, executedToolCalls)
 
 	// Create content with the formatted text
 	content := &schemas.ChatMessageContent{
@@ -644,56 +661,7 @@ func createResponsesResponseWithExecutedToolsAndNonAutoExecutableCalls(
 		Output:        make([]schemas.ResponsesMessage, 0),
 	}
 
-	// Build a map from tool call ID to tool name for easy lookup
-	toolCallIDToName := make(map[string]string)
-	for _, toolCall := range executedToolCalls {
-		if toolCall.ID != nil && toolCall.Function.Name != nil {
-			toolCallIDToName[*toolCall.ID] = *toolCall.Function.Name
-		}
-	}
-
-	// Build content text showing executed tool results
-	var contentText string
-	if len(executedToolResults) > 0 {
-		// Format tool results as JSON-like structure
-		toolResultsMap := make(map[string]interface{})
-		for _, toolResult := range executedToolResults {
-			// Get tool name from tool call ID mapping
-			var toolName string
-			if toolResult.ChatToolMessage != nil && toolResult.ChatToolMessage.ToolCallID != nil {
-				toolCallID := *toolResult.ChatToolMessage.ToolCallID
-				if name, ok := toolCallIDToName[toolCallID]; ok {
-					toolName = name
-				} else {
-					toolName = toolCallID // Fallback to tool call ID if name not found
-				}
-			} else {
-				toolName = "unknown_tool"
-			}
-
-			// Extract output from tool result
-			var output interface{}
-			if toolResult.Content != nil {
-				if toolResult.Content.ContentStr != nil {
-					output = *toolResult.Content.ContentStr
-				} else if toolResult.Content.ContentBlocks != nil {
-					output = toolResultSummaryBlocks(toolResult.Content.ContentBlocks)
-				}
-			}
-			toolResultsMap[toolName] = output
-		}
-
-		// Convert to JSON string for display
-		jsonBytes, err := schemas.MarshalSorted(toolResultsMap)
-		if err != nil {
-			// Fallback to simple string representation
-			contentText = fmt.Sprintf("The Output from allowed tools calls is - %v\n\nNow I shall call these tools next...", toolResultsMap)
-		} else {
-			contentText = fmt.Sprintf("The Output from allowed tools calls is - %s\n\nNow I shall call these tools next...", string(jsonBytes))
-		}
-	} else {
-		contentText = "Now I shall call these tools next..."
-	}
+	contentText := FormatExecutedToolResults(executedToolResults, executedToolCalls)
 
 	// Create assistant message with the formatted text content
 	messageType := schemas.ResponsesMessageTypeMessage

@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/google/uuid"
+	"github.com/maximhq/bifrost/core/mcp"
 	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
 )
@@ -32,19 +34,55 @@ type streamedCall struct {
 	name         *string
 	arguments    strings.Builder
 	extraContent []byte
+	cacheControl *schemas.CacheControl
+	custom       bool
+	customName   *string
+	customInput  strings.Builder
 }
 
 func (c *streamedCall) toolCall() schemas.ChatAssistantMessageToolCall {
 	call := schemas.ChatAssistantMessageToolCall{
-		Index:    c.index,
-		ID:       c.id,
-		Type:     c.callType,
-		Function: schemas.ChatAssistantMessageToolCallFunction{Name: c.name, Arguments: c.arguments.String()},
+		Index:        c.index,
+		ID:           c.id,
+		Type:         c.callType,
+		Function:     schemas.ChatAssistantMessageToolCallFunction{Name: c.name, Arguments: c.arguments.String()},
+		CacheControl: c.cacheControl,
+	}
+	if c.custom {
+		call.Function = schemas.ChatAssistantMessageToolCallFunction{}
+		call.Custom = &schemas.ChatAssistantMessageToolCallCustom{Name: c.customName, Input: c.customInput.String()}
 	}
 	if len(c.extraContent) > 0 {
 		call.ExtraContent = c.extraContent
 	}
 	return call
+}
+
+// Only admitted function calls are executable. A freeform custom call with the
+// same name is still a caller call, not an alternative spelling of a function.
+func (c *streamedCall) isInjected(set *injectedToolSet) bool {
+	return !c.custom && (c.callType == nil || *c.callType == "function") && c.name != nil && set.isInjected(*c.name)
+}
+
+// Retain results only for Agent Mode; the client may need them to continue a
+// conversation after a later manual call. These are existing execution messages.
+type streamedAgentResults struct {
+	calls   []schemas.ChatAssistantMessageToolCall
+	results []*schemas.ChatMessage
+}
+
+func (r *streamedAgentResults) remember(set *injectedToolSet, calls []schemas.ChatAssistantMessageToolCall, results []*schemas.ChatMessage) {
+	if set.callerAgentMode {
+		r.calls = append(r.calls, calls...)
+		r.results = append(r.results, results...)
+	}
+}
+
+func (r *streamedAgentResults) summary() *string {
+	if len(r.results) == 0 {
+		return nil
+	}
+	return new("\n\n" + mcp.FormatExecutedToolResults(r.results, r.calls))
 }
 
 // injectedChatStream turns a sequence of upstream chat streams into one client stream.
@@ -67,6 +105,9 @@ type injectedChatStream struct {
 	finish    *string
 	turnUsage *schemas.BifrostLLMUsage
 	more      bool // set on the turn's final chunk: injected calls are pending
+
+	agentResults  streamedAgentResults
+	pendingClient *schemas.BifrostChatResponse // terminal projection awaiting automatic results
 }
 
 func newInjectedChatStream(set *injectedToolSet) *injectedChatStream {
@@ -103,25 +144,42 @@ func (s *injectedChatStream) onChunk(resp *schemas.BifrostChatResponse, final bo
 
 	var injected, client []schemas.ChatAssistantMessageToolCall
 	for _, call := range s.orderedCalls() {
-		if call.name != nil && s.set.isInjected(*call.name) {
+		if call.isInjected(s.set) {
 			injected = append(injected, call.toolCall())
 		} else {
-			client = append(client, call.toolCall())
+			visible := call.toolCall()
+			visible.Index = uint16(len(client))
+			client = append(client, visible)
 		}
 	}
-	if len(injected) > 0 && s.depth < s.set.maxDepth {
+	// An interrupted generation may carry a partial call, even alongside valid
+	// JSON for another call. Preserve the provider terminal state and do not run
+	// tools or open another model turn after it.
+	interrupted := s.finish != nil && (*s.finish == string(schemas.BifrostFinishReasonLength) || *s.finish == "content_filter")
+	if !interrupted && len(injected) > 0 && s.depth < s.set.maxDepth {
 		s.more = true
 		s.usage = schemas.MergeBifrostLLMUsage(s.usage, s.turnUsage)
 		s.turnUsage = nil
+		if s.set.callerAgentMode && len(client) > 0 {
+			s.pendingClient = s.clientChunk(resp, &schemas.ChatStreamResponseChoiceDelta{ToolCalls: client}, new(string(schemas.BifrostFinishReasonToolCalls)))
+			s.pendingClient.Usage = s.usage
+		}
 		return emits
 	}
 	s.more = false
 
 	finish := s.finish
-	if len(injected) > 0 && len(client) == 0 {
+	if !interrupted && len(injected) > 0 && len(client) == 0 {
 		finish = new(string(schemas.BifrostFinishReasonStop))
 	}
-	terminal := s.clientChunk(resp, &schemas.ChatStreamResponseChoiceDelta{ToolCalls: client}, finish)
+	delta := &schemas.ChatStreamResponseChoiceDelta{ToolCalls: client}
+	if s.set.callerAgentMode && len(client) > 0 {
+		delta.Content = s.agentResults.summary()
+		if !interrupted {
+			finish = new(string(schemas.BifrostFinishReasonToolCalls))
+		}
+	}
+	terminal := s.clientChunk(resp, delta, finish)
 	terminal.Usage = schemas.MergeBifrostLLMUsage(s.usage, s.turnUsage)
 	return append(emits, streamEmit{resp: terminal, terminal: true})
 }
@@ -129,7 +187,8 @@ func (s *injectedChatStream) onChunk(resp *schemas.BifrostChatResponse, final bo
 // absorbDelta records the delta for the turn and returns its client-visible part, or
 // nil when it carries nothing the client should see now. Every tool call is held:
 // whether a call is injected is only known from its name, and a client call can stream
-// before an injected one in the same turn, which must then be dropped.
+// before an injected one in the same turn. Agent Mode preserves the caller
+// calls; provider-only injection retains its existing replan policy.
 func (s *injectedChatStream) absorbDelta(delta *schemas.ChatStreamResponseChoiceDelta) *schemas.ChatStreamResponseChoiceDelta {
 	for _, call := range delta.ToolCalls {
 		s.absorbCall(call)
@@ -178,6 +237,16 @@ func (s *injectedChatStream) absorbCall(delta schemas.ChatAssistantMessageToolCa
 		call.name = delta.Function.Name
 	}
 	call.arguments.WriteString(delta.Function.Arguments)
+	if delta.Custom != nil {
+		call.custom = true
+		if delta.Custom.Name != nil && *delta.Custom.Name != "" {
+			call.customName = delta.Custom.Name
+		}
+		call.customInput.WriteString(delta.Custom.Input)
+	}
+	if delta.CacheControl != nil {
+		call.cacheControl = delta.CacheControl
+	}
 	if len(delta.ExtraContent) > 0 {
 		call.extraContent = delta.ExtraContent
 	}
@@ -255,7 +324,7 @@ func (s *injectedChatStream) continues() bool {
 func (s *injectedChatStream) endTurn() (schemas.ChatMessage, []schemas.ChatAssistantMessageToolCall) {
 	var injected []schemas.ChatAssistantMessageToolCall
 	for _, call := range s.orderedCalls() {
-		if call.name != nil && s.set.isInjected(*call.name) {
+		if call.isInjected(s.set) {
 			injected = append(injected, call.toolCall())
 		}
 	}
@@ -289,6 +358,19 @@ func (s *injectedChatStream) endTurn() (schemas.ChatMessage, []schemas.ChatAssis
 	s.turnUsage = nil
 	s.more = false
 	return assistant, injected
+}
+
+// After the provider drains, execute the automatic calls and finish the
+// pending caller turn instead of dispatching an unresolved tool transcript.
+func (s *injectedChatStream) finishAgentTurn(calls []schemas.ChatAssistantMessageToolCall, results []*schemas.ChatMessage) []clientEmit {
+	s.agentResults.remember(s.set, calls, results)
+	if s.pendingClient == nil {
+		return nil
+	}
+	terminal := s.pendingClient
+	s.pendingClient = nil
+	terminal.Choices[0].Delta.Content = s.agentResults.summary()
+	return []clientEmit{{result: &schemas.BifrostResponse{ChatResponse: terminal}, terminal: true}}
 }
 
 // injectedStreamSkip tells the provider not to send a chunk itself: the session has
@@ -364,8 +446,9 @@ type injectedStreamTurns struct {
 	// usage is the usage of every turn that has finished, billed onto an error that ends
 	// the client stream.
 	usage func() *schemas.BifrostLLMUsage
-	// advance executes the pending injected calls and prepares the next turn's request.
-	advance func()
+	// advance executes pending calls. A terminal projection means the caller
+	// owns the next turn; otherwise it prepares the next upstream request.
+	advance func() []clientEmit
 	// dispatch opens the current turn's upstream stream.
 	dispatch func(runner schemas.PostHookRunner, finalizer func(context.Context)) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError)
 }
@@ -469,8 +552,19 @@ func chainInjectedStream(ctx *schemas.BifrostContext, turns injectedStreamTurns,
 			if cancelled() {
 				return
 			}
-			turns.advance()
+			emits := turns.advance()
 			if cancelled() {
+				return
+			}
+			if len(emits) > 0 {
+				for _, emit := range emits {
+					ctx.SetValue(schemas.BifrostContextKeyStreamEndIndicator, emit.terminal)
+					if emit.terminal {
+						ended.Store(true)
+						ctx.SetValue(schemas.BifrostContextKeyStreamTurnPending, false)
+					}
+					sendThroughPostHooks(ctx, postHookRunner, emit.result, nil, out)
+				}
 				return
 			}
 			upstream, bifrostErr = turns.dispatch(runner, turnFinalizer)
@@ -504,11 +598,14 @@ func (bifrost *Bifrost) startInjectedChatStream(ctx *schemas.BifrostContext, pro
 		},
 		continues: session.continues,
 		usage:     func() *schemas.BifrostLLMUsage { return session.usage },
-		advance: func() {
+		advance: func() []clientEmit {
 			assistant, injected := session.endTurn()
 			results := executeInjectedCalls(injected, func(call schemas.ChatAssistantMessageToolCall) *schemas.ChatMessage {
 				return bifrost.executeInjectedCall(ctx, set, call)
 			})
+			if terminal := session.finishAgentTurn(injected, results); len(terminal) > 0 {
+				return terminal
+			}
 			next := *turn
 			next.Params = relaxForcedChatChoice(turn.Params)
 			next.Input = make([]schemas.ChatMessage, 0, len(turn.Input)+1+len(results))
@@ -518,6 +615,7 @@ func (bifrost *Bifrost) startInjectedChatStream(ctx *schemas.BifrostContext, pro
 				next.Input = append(next.Input, *result)
 			}
 			turn = &next
+			return nil
 		},
 		dispatch: func(runner schemas.PostHookRunner, finalizer func(context.Context)) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
 			return bifrost.dispatchChatStream(ctx, provider, config, key, turn, runner, finalizer)
@@ -543,11 +641,14 @@ func (bifrost *Bifrost) startInjectedResponsesStream(ctx *schemas.BifrostContext
 		},
 		continues: session.continues,
 		usage:     func() *schemas.BifrostLLMUsage { return session.usage },
-		advance: func() {
+		advance: func() []clientEmit {
 			items, injected := session.endTurn()
 			results := executeInjectedCalls(injected, func(call schemas.ChatAssistantMessageToolCall) *schemas.ChatMessage {
 				return bifrost.executeInjectedCall(ctx, set, call)
 			})
+			if terminal := session.finishAgentTurn(injected, results); len(terminal) > 0 {
+				return terminal
+			}
 			next := *turn
 			next.Params = relaxForcedResponsesChoice(nextResponsesTools(original, turn, set).Params)
 			next.Input = make([]schemas.ResponsesMessage, 0, len(turn.Input)+len(items)+len(results))
@@ -557,6 +658,7 @@ func (bifrost *Bifrost) startInjectedResponsesStream(ctx *schemas.BifrostContext
 				next.Input = append(next.Input, result.ToResponsesMessages()...)
 			}
 			turn = &next
+			return nil
 		},
 		dispatch: func(runner schemas.PostHookRunner, finalizer func(context.Context)) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
 			return bifrost.dispatchResponsesStream(ctx, provider, config, key, turn, runner, finalizer)
@@ -616,6 +718,9 @@ type injectedResponsesStream struct {
 	injected    []schemas.ChatAssistantMessageToolCall
 	hasInjected bool
 	more        bool
+
+	agentResults  streamedAgentResults
+	pendingClient *schemas.BifrostResponsesStreamResponse
 }
 
 func newInjectedResponsesStream(set *injectedToolSet) *injectedResponsesStream {
@@ -651,7 +756,7 @@ func (s *injectedResponsesStream) onEvent(ev *schemas.BifrostResponsesStreamResp
 	}
 
 	var emits []responsesEmit
-	if ev.Type == schemas.ResponsesStreamResponseTypeOutputItemAdded && ev.Item != nil && isFunctionCall(*ev.Item) &&
+	if !s.set.callerAgentMode && ev.Type == schemas.ResponsesStreamResponseTypeOutputItemAdded && ev.Item != nil && isFunctionCall(*ev.Item) &&
 		ev.Item.Name != nil && s.set.isInjected(*ev.Item.Name) {
 		// The turn calls an injected tool, so it is re-asked and its client calls are never
 		// answered: drop them, and release whatever was held behind them. On the last
@@ -671,7 +776,7 @@ func (s *injectedResponsesStream) onEvent(ev *schemas.BifrostResponsesStreamResp
 	switch {
 	case route == routeInjected || route == routeDropped:
 		return emits
-	case (route == routeClient || s.holding) && !s.live:
+	case !s.set.callerAgentMode && (route == routeClient || s.holding) && !s.live:
 		// Every tool call is held until the turn shows whether it also calls an injected
 		// tool. Items after a held call wait behind it, so the turn keeps its order.
 		s.holding = true
@@ -709,15 +814,18 @@ func (s *injectedResponsesStream) routeOf(ev *schemas.BifrostResponsesStreamResp
 	if ev.Type == schemas.ResponsesStreamResponseTypeOutputItemAdded && ev.OutputIndex != nil && ev.Item != nil {
 		index := *ev.OutputIndex
 		route := routeVisible
-		if isFunctionCall(*ev.Item) {
+		switch {
+		case isFunctionCall(*ev.Item):
 			switch {
 			case ev.Item.Name != nil && s.set.isInjected(*ev.Item.Name):
 				route = routeInjected
-			case s.hasInjected:
+			case s.hasInjected && !s.set.callerAgentMode:
 				route = routeDropped
 			default:
 				route = routeClient
 			}
+		case s.set.callerAgentMode && isCallerResponsesAction(*ev.Item):
+			route = routeClient
 		}
 		s.routes[index] = route
 		if ev.Item.ID != nil {
@@ -726,6 +834,31 @@ func (s *injectedResponsesStream) routeOf(ev *schemas.BifrostResponsesStreamResp
 		return index, route, true
 	}
 	return s.routeFor(ev)
+}
+
+// Caller actions besides ordinary function calls also require a continuation
+// from the caller. Provider-side built-in tools remain visible items.
+func isCallerResponsesAction(item schemas.ResponsesMessage) bool {
+	if item.Type == nil {
+		return false
+	}
+	switch *item.Type {
+	case schemas.ResponsesMessageTypeCustomToolCall,
+		schemas.ResponsesMessageTypeComputerCall,
+		schemas.ResponsesMessageTypeLocalShellCall,
+		schemas.ResponsesMessageTypeApplyPatchCall,
+		schemas.ResponsesMessageTypeMCPApprovalRequest:
+		return true
+	case schemas.ResponsesMessageTypeShellCall:
+		// Hosted shell calls already execute at the provider. Local shell calls
+		// (including older events without environment) still need the caller.
+		return item.ResponsesToolMessage == nil || item.ResponsesShellCall == nil ||
+			item.Environment == nil || item.Environment.Type != "container_reference"
+	case schemas.ResponsesMessageTypeToolSearchCall:
+		return item.ResponsesToolMessage != nil && item.Execution != nil && *item.Execution == "client"
+	default:
+		return false
+	}
 }
 
 // routeFor looks up the route of an event whose item is already registered.
@@ -805,13 +938,22 @@ func (s *injectedResponsesStream) onTurnEnd(ev *schemas.BifrostResponsesStreamRe
 		turnUsage = ev.Response.Usage.ToBifrostLLMUsage()
 	}
 	s.usage = schemas.MergeBifrostLLMUsage(s.usage, turnUsage)
-	if len(s.injected) > 0 && s.depth < s.set.maxDepth && !s.sentCall {
+	if ev.Type == schemas.ResponsesStreamResponseTypeCompleted && len(s.injected) > 0 && s.depth < s.set.maxDepth && (s.set.callerAgentMode || !s.sentCall) {
 		s.more = true
+		if s.set.callerAgentMode && s.sentCall {
+			s.pendingClient = ev
+		}
 		return nil
 	}
 	s.more = false
+	return s.finishTurn(ev, s.set.callerAgentMode && s.sentCall)
+}
 
+func (s *injectedResponsesStream) finishTurn(ev *schemas.BifrostResponsesStreamResponse, callerPending bool) []responsesEmit {
 	emits := s.releaseHeld()
+	if callerPending {
+		emits = append(emits, s.emitAgentResults(ev)...)
+	}
 	terminal := s.renumber(ev, nil)
 	response := schemas.BifrostResponsesResponse{}
 	if ev.Response != nil {
@@ -826,6 +968,59 @@ func (s *injectedResponsesStream) onTurnEnd(ev *schemas.BifrostResponsesStreamRe
 	response.Usage = s.usage.ToResponsesResponseUsage()
 	terminal.Response = &response
 	return append(emits, responsesEmit{event: terminal, terminal: true})
+}
+
+// emitAgentResults uses the ordinary Agent Mode projection in native Responses
+// events. Caller output items keep their actual IDs and arguments.
+func (s *injectedResponsesStream) emitAgentResults(template *schemas.BifrostResponsesStreamResponse) []responsesEmit {
+	text := s.agentResults.summary()
+	if text == nil {
+		return nil
+	}
+	index := s.nextIndex
+	s.nextIndex++
+	id := "msg_" + uuid.NewString()
+	part := schemas.ResponsesMessageContentBlock{Type: schemas.ResponsesOutputMessageContentTypeText, Text: text}
+	emptyPart := part
+	emptyPart.Text = new("")
+	item := schemas.ResponsesMessage{
+		ID: &id, Type: new(schemas.ResponsesMessageTypeMessage), Status: new("completed"),
+		Role:    new(schemas.ResponsesInputMessageRoleAssistant),
+		Content: &schemas.ResponsesMessageContent{ContentBlocks: []schemas.ResponsesMessageContentBlock{part}},
+	}
+	added := item
+	added.Status = new("in_progress")
+	added.Content = &schemas.ResponsesMessageContent{ContentBlocks: []schemas.ResponsesMessageContentBlock{}}
+	events := []schemas.BifrostResponsesStreamResponse{
+		{Type: schemas.ResponsesStreamResponseTypeOutputItemAdded, Item: &added},
+		{Type: schemas.ResponsesStreamResponseTypeContentPartAdded, ItemID: &id, ContentIndex: new(0), Part: &emptyPart},
+		{Type: schemas.ResponsesStreamResponseTypeOutputTextDelta, ItemID: &id, ContentIndex: new(0), Delta: text},
+		{Type: schemas.ResponsesStreamResponseTypeOutputTextDone, ItemID: &id, ContentIndex: new(0), Text: text},
+		{Type: schemas.ResponsesStreamResponseTypeContentPartDone, ItemID: &id, ContentIndex: new(0), Part: &part},
+		{Type: schemas.ResponsesStreamResponseTypeOutputItemDone, Item: &item},
+	}
+	emits := make([]responsesEmit, 0, len(events))
+	for i := range events {
+		events[i].ExtraFields = template.ExtraFields
+		emits = append(emits, responsesEmit{event: s.renumber(&events[i], &index)})
+	}
+	s.output = append(s.output, item)
+	return emits
+}
+
+func (s *injectedResponsesStream) finishAgentTurn(calls []schemas.ChatAssistantMessageToolCall, results []*schemas.ChatMessage) []clientEmit {
+	s.agentResults.remember(s.set, calls, results)
+	if s.pendingClient == nil {
+		return nil
+	}
+	pending := s.pendingClient
+	s.pendingClient = nil
+	emits := s.finishTurn(pending, true)
+	out := make([]clientEmit, 0, len(emits))
+	for _, emit := range emits {
+		out = append(out, clientEmit{result: &schemas.BifrostResponse{ResponsesStreamResponse: emit.event}, terminal: emit.terminal})
+	}
+	return out
 }
 
 // renumber copies an event with the client's next sequence number and, when given, the

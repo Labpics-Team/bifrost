@@ -132,7 +132,11 @@
       "TestCancelledRequestExportsLateProviderTime",
       "TestChannelMessageAbandonTraceOwnership",
       "TestAdmittedMCPStreamsExecuteInsideGateway",
-      "TestAdmittedMCPStreamKeepsCallerTools"
+      "TestAdmittedMCPStreamKeepsCallerTools",
+      "TestAdmittedMCPMixedStream",
+      "TestAdmittedMCPStreamPreservesCustomCall",
+      "TestAdmittedMCPInterruptedStream",
+      "TestAdmittedMCPStreamShellOwnership"
     ],
     "github.com/maximhq/bifrost/core/providers/utils": [
       "TestStreamDiagnosticsCommitReason",
