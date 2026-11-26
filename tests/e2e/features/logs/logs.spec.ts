@@ -2245,8 +2245,17 @@ test.describe("LLM log detail identity", () => {
         { offset: 500, order: "asc", limit: 500 },
       ]);
 
-      await sheet.getByTestId("session-details-sort-btn").click();
+      const sortControl = sheet.getByTestId("session-details-sort-btn");
+      const dialogBeforeSort = await sheet.elementHandle();
+      for (let tabs = 0; tabs < 4 && !await sortControl.evaluate((control) => control === document.activeElement); tabs++) {
+        await page.keyboard.press("Tab");
+      }
+      await expect(sortControl).toBeFocused();
+      await page.keyboard.press("Enter");
       await expect(sheet.getByText("Loading session...", { exact: true })).toBeVisible();
+      // Sorting has committed; keyboard focus and the existing dialog must survive it.
+      await expect(sortControl).toBeFocused();
+      expect(await dialogBeforeSort!.evaluate((dialog) => dialog.isConnected)).toBe(true);
       await expect(sheet.getByRole("cell", { name: rows[0].model, exact: true })).toHaveCount(0);
       releaseDescending();
       await expect(tableRows).toHaveCount(500);

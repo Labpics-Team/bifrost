@@ -56,7 +56,8 @@ interface SessionDetailsSheetProps {
 }
 
 export function SessionDetailsSheet(props: SessionDetailsSheetProps) {
-	const { sessionId, open } = props;
+	const { sessionId, open, onOpenChange, onFilterByParentRequestId } = props;
+	const { t } = useTranslation("observability");
 	const [sortOrder, setSortOrder] = useState<"asc" | "desc">("asc");
 	const { currentData: sessionSummary } = useGetLogSessionSummaryByIdQuery(sessionId || "", {
 		skip: !open || !sessionId,
@@ -64,38 +65,66 @@ export function SessionDetailsSheet(props: SessionDetailsSheetProps) {
 		refetchOnMountOrArgChange: true,
 	});
 
-	if (!open || !sessionId) return null;
-
 	return (
-		<OpenSessionDetailsSheet
-			key={sessionId + ":" + sortOrder}
-			{...props}
-			sessionId={sessionId}
-			sortOrder={sortOrder}
-			onSortOrderChange={() => setSortOrder((previous) => (previous === "asc" ? "desc" : "asc"))}
-			sessionSummary={sessionSummary}
-		/>
+		<Sheet open={open} onOpenChange={onOpenChange}>
+			<SheetContent className="flex w-full flex-col gap-4 overflow-x-hidden p-4 sm:max-w-[60%] md:p-8">
+				<div className="flex items-center justify-between gap-4">
+					<div>
+						<div className="text-lg font-medium">{t("labels.session")}</div>
+						{sessionId && onFilterByParentRequestId ? (
+							<Tooltip>
+								<TooltipTrigger asChild>
+									<button
+										type="button"
+										className="text-primary hover:text-primary/80 cursor-pointer text-left font-mono text-sm break-all underline-offset-2 hover:underline"
+										onClick={() => onFilterByParentRequestId(sessionId)}
+									>
+										{sessionId}
+									</button>
+								</TooltipTrigger>
+								<TooltipContent sideOffset={6}>{t("logs.session.filterThis")}</TooltipContent>
+							</Tooltip>
+						) : (
+							<code className="text-sm break-all">{sessionId}</code>
+						)}
+					</div>
+					<div className="flex items-center gap-3">
+						<Button
+							variant="outline"
+							size="sm"
+							data-testid="session-details-sort-btn"
+							onClick={() => setSortOrder((previous) => (previous === "asc" ? "desc" : "asc"))}
+						>
+							{sortOrder === "asc" ? <ArrowUp className="mr-2 h-4 w-4" /> : <ArrowDown className="mr-2 h-4 w-4" />}
+							{sortOrder === "asc" ? t("logs.session.earliestFirst") : t("logs.session.latestFirst")}
+						</Button>
+					</div>
+				</div>
+
+				{open && sessionId ? (
+					<SessionPages
+						key={sessionId + ":" + sortOrder}
+						sessionId={sessionId}
+						open={open}
+						highlightedLogId={props.highlightedLogId}
+						onOpenChange={onOpenChange}
+						onLogClick={props.onLogClick}
+						sortOrder={sortOrder}
+						sessionSummary={sessionSummary}
+					/>
+				) : null}
+			</SheetContent>
+		</Sheet>
 	);
 }
 
-interface OpenSessionDetailsSheetProps extends SessionDetailsSheetProps {
+interface SessionPagesProps extends Pick<SessionDetailsSheetProps, "open" | "highlightedLogId" | "onOpenChange" | "onLogClick"> {
 	sessionId: string;
 	sortOrder: "asc" | "desc";
-	onSortOrderChange: () => void;
 	sessionSummary?: LogSessionSummaryResponse;
 }
 
-function OpenSessionDetailsSheet({
-	sessionId,
-	highlightedLogId,
-	open,
-	onOpenChange,
-	onLogClick,
-	onFilterByParentRequestId,
-	sortOrder,
-	onSortOrderChange,
-	sessionSummary,
-}: OpenSessionDetailsSheetProps) {
+function SessionPages({ sessionId, highlightedLogId, open, onOpenChange, onLogClick, sortOrder, sessionSummary }: SessionPagesProps) {
 	const { t, i18n } = useTranslation("observability");
 	const dateLocale = dateFnsLocale(i18n.language);
 	// This committed opening owns its pages. Closing or changing session/order
@@ -175,141 +204,111 @@ function OpenSessionDetailsSheet({
 	);
 
 	return (
-		<Sheet open={open} onOpenChange={onOpenChange}>
-			<SheetContent className="flex w-full flex-col gap-4 overflow-x-hidden p-4 sm:max-w-[60%] md:p-8">
-				<div className="flex items-center justify-between gap-4">
-					<div>
-						<div className="text-lg font-medium">{t("labels.session")}</div>
-						{sessionId && onFilterByParentRequestId ? (
-							<Tooltip>
-								<TooltipTrigger asChild>
-									<button
-										type="button"
-										className="text-primary hover:text-primary/80 cursor-pointer text-left font-mono text-sm break-all underline-offset-2 hover:underline"
-										onClick={() => onFilterByParentRequestId(sessionId)}
-									>
-										{sessionId}
-									</button>
-								</TooltipTrigger>
-								<TooltipContent sideOffset={6}>{t("logs.session.filterThis")}</TooltipContent>
-							</Tooltip>
-						) : (
-							<code className="text-sm break-all">{sessionId}</code>
-						)}
-					</div>
-					<div className="flex items-center gap-3">
-						<Button variant="outline" size="sm" data-testid="session-details-sort-btn" onClick={onSortOrderChange}>
-							{sortOrder === "asc" ? <ArrowUp className="mr-2 h-4 w-4" /> : <ArrowDown className="mr-2 h-4 w-4" />}
-							{sortOrder === "asc" ? t("logs.session.earliestFirst") : t("logs.session.latestFirst")}
-						</Button>
-					</div>
-				</div>
+		<>
+			<div className="grid shrink-0 grid-cols-1 gap-4 sm:grid-cols-3">
+				{summaryCards.map((card) => (
+					<Card key={card.label} className="py-4 shadow-none">
+						<CardContent className="px-4">
+							<div className="text-muted-foreground text-xs">{card.label}</div>
+							<div
+								className={
+									card.size === "sm"
+										? "font-mono text-sm leading-5 break-words sm:text-base"
+										: "truncate font-mono text-xl font-medium sm:text-2xl"
+								}
+							>
+								{card.helper ? (
+									<div className="flex items-baseline gap-2">
+										<span>{card.value}</span>
+										<span className="text-muted-foreground text-sm">{card.helper}</span>
+									</div>
+								) : (
+									card.value
+								)}
+							</div>
+						</CardContent>
+					</Card>
+				))}
+			</div>
 
-				<div className="grid shrink-0 grid-cols-1 gap-4 sm:grid-cols-3">
-					{summaryCards.map((card) => (
-						<Card key={card.label} className="py-4 shadow-none">
-							<CardContent className="px-4">
-								<div className="text-muted-foreground text-xs">{card.label}</div>
-								<div
-									className={
-										card.size === "sm"
-											? "font-mono text-sm leading-5 break-words sm:text-base"
-											: "truncate font-mono text-xl font-medium sm:text-2xl"
-									}
-								>
-									{card.helper ? (
-										<div className="flex items-baseline gap-2">
-											<span>{card.value}</span>
-											<span className="text-muted-foreground text-sm">{card.helper}</span>
-										</div>
-									) : (
-										card.value
-									)}
-								</div>
-							</CardContent>
-						</Card>
-					))}
-				</div>
-
-				<div className="min-h-0 flex-1 overflow-hidden rounded-sm border">
-					<Table containerClassName="h-full overflow-auto">
-						<TableHeader className="sticky top-0 z-10 bg-[#f9f9f9] dark:bg-[#27272a]">
+			<div className="min-h-0 flex-1 overflow-hidden rounded-sm border">
+				<Table containerClassName="h-full overflow-auto">
+					<TableHeader className="sticky top-0 z-10 bg-[#f9f9f9] dark:bg-[#27272a]">
+						<TableRow>
+							<TableHead className="w-2"></TableHead>
+							<TableHead>{t("labels.time")}</TableHead>
+							<TableHead>{t("labels.type")}</TableHead>
+							<TableHead>{t("labels.message")}</TableHead>
+							<TableHead>{t("labels.provider")}</TableHead>
+							<TableHead>{t("labels.model")}</TableHead>
+						</TableRow>
+					</TableHeader>
+					<TableBody>
+						{loadingSession && sessionLogs.length === 0 ? (
 							<TableRow>
-								<TableHead className="w-2"></TableHead>
-								<TableHead>{t("labels.time")}</TableHead>
-								<TableHead>{t("labels.type")}</TableHead>
-								<TableHead>{t("labels.message")}</TableHead>
-								<TableHead>{t("labels.provider")}</TableHead>
-								<TableHead>{t("labels.model")}</TableHead>
+								<TableCell colSpan={6} className="h-24 text-center">
+									<div className="flex items-center justify-center gap-2">
+										<Loader2 className="h-4 w-4 animate-spin" />
+										{t("logs.session.loading")}
+									</div>
+								</TableCell>
 							</TableRow>
-						</TableHeader>
-						<TableBody>
-							{loadingSession && sessionLogs.length === 0 ? (
-								<TableRow>
-									<TableCell colSpan={6} className="h-24 text-center">
-										<div className="flex items-center justify-center gap-2">
-											<Loader2 className="h-4 w-4 animate-spin" />
-											{t("logs.session.loading")}
-										</div>
+						) : sessionLogs.length ? (
+							sessionLogs.map((log) => (
+								<TableRow
+									key={log.id}
+									className={cn("cursor-pointer transition-colors", log.id === highlightedLogId ? HIGHLIGHTED_ROW : "hover:bg-muted/40")}
+									onClick={() => {
+										if (open && sessionId) onLogClick?.(log);
+									}}
+								>
+									<TableCell>
+										<div className={`h-6 w-1 rounded-sm ${StatusBarColors[log.status as Status]}`} />
 									</TableCell>
-								</TableRow>
-							) : sessionLogs.length ? (
-								sessionLogs.map((log) => (
-									<TableRow
-										key={log.id}
-										className={cn("cursor-pointer transition-colors", log.id === highlightedLogId ? HIGHLIGHTED_ROW : "hover:bg-muted/40")}
-										onClick={() => {
-											if (open && sessionId) onLogClick?.(log);
-										}}
-									>
-										<TableCell>
-											<div className={`h-6 w-1 rounded-sm ${StatusBarColors[log.status as Status]}`} />
-										</TableCell>
-										<TableCell className="relative text-xs">
-											{log.id === highlightedLogId ? (
-												<div className="bg-background pointer-events-none absolute -top-1.5 left-1 z-10 rounded-full border border-sky-400/45 px-1.5 py-0 text-[9px] leading-tight font-semibold tracking-wide text-sky-600 uppercase dark:text-sky-300">
-													{t("logs.session.current")}
-												</div>
-											) : null}
-											{format(new Date(log.timestamp), "yyyy-MM-dd hh:mm:ss aa (XXX)", { locale: dateLocale })}
-										</TableCell>
-										<TableCell>
-											<Badge variant="outline" className={`${RequestTypeColors[log.object as keyof typeof RequestTypeColors]} text-xs`}>
-												{getRequestTypeLabel(log.object, t)}
-											</Badge>
-										</TableCell>
-										<TableCell className="max-w-[360px]">
-											<LogMessageCell log={log} contentClassName="max-w-[360px]" />
-										</TableCell>
-										<TableCell>
-											<Badge variant="secondary" className="font-mono text-xs uppercase">
-												<RenderProviderIcon provider={log.provider as ProviderIconType} size="sm" />
-												{log.provider as ProviderName}
-											</Badge>
-										</TableCell>
-										<TableCell className="max-w-[140px] truncate font-mono text-xs">{log.model || t("labels.nA")}</TableCell>
-									</TableRow>
-								))
-							) : (
-								<TableRow>
-									<TableCell colSpan={6} className="text-muted-foreground h-24 text-center">
-										{t("logs.session.empty")}
+									<TableCell className="relative text-xs">
+										{log.id === highlightedLogId ? (
+											<div className="bg-background pointer-events-none absolute -top-1.5 left-1 z-10 rounded-full border border-sky-400/45 px-1.5 py-0 text-[9px] leading-tight font-semibold tracking-wide text-sky-600 uppercase dark:text-sky-300">
+												{t("logs.session.current")}
+											</div>
+										) : null}
+										{format(new Date(log.timestamp), "yyyy-MM-dd hh:mm:ss aa (XXX)", { locale: dateLocale })}
 									</TableCell>
+									<TableCell>
+										<Badge variant="outline" className={`${RequestTypeColors[log.object as keyof typeof RequestTypeColors]} text-xs`}>
+											{getRequestTypeLabel(log.object, t)}
+										</Badge>
+									</TableCell>
+									<TableCell className="max-w-[360px]">
+										<LogMessageCell log={log} contentClassName="max-w-[360px]" />
+									</TableCell>
+									<TableCell>
+										<Badge variant="secondary" className="font-mono text-xs uppercase">
+											<RenderProviderIcon provider={log.provider as ProviderIconType} size="sm" />
+											{log.provider as ProviderName}
+										</Badge>
+									</TableCell>
+									<TableCell className="max-w-[140px] truncate font-mono text-xs">{log.model || t("labels.nA")}</TableCell>
 								</TableRow>
-							)}
-						</TableBody>
-					</Table>
-				</div>
+							))
+						) : (
+							<TableRow>
+								<TableCell colSpan={6} className="text-muted-foreground h-24 text-center">
+									{t("logs.session.empty")}
+								</TableCell>
+							</TableRow>
+						)}
+					</TableBody>
+				</Table>
+			</div>
 
-				{hasMore ? (
-					<div className="flex justify-center">
-						<Button variant="outline" data-testid="session-details-load-more-btn" onClick={() => fetchNextPage()} disabled={loadingSession}>
-							{loadingSession ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-							{t("logs.session.loadMore")}
-						</Button>
-					</div>
-				) : null}
-			</SheetContent>
-		</Sheet>
+			{hasMore ? (
+				<div className="flex justify-center">
+					<Button variant="outline" data-testid="session-details-load-more-btn" onClick={() => fetchNextPage()} disabled={loadingSession}>
+						{loadingSession ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+						{t("logs.session.loadMore")}
+					</Button>
+				</div>
+			) : null}
+		</>
 	);
 }
