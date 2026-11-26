@@ -92,26 +92,35 @@ successful streams measure the first response, not the duration of generation.
 
 For an unnamed request the highest-scored provider is selected, with usable
 alternatives ordered by score. Keys within a provider are selected by weight.
+
 A transient failure excludes a key for a short cooldown. When that wait ends,
 the key returns to Recovering with a reduced ordinary traffic share, without
 counting a success or changing its observed metrics. Held keys remain excluded
 until a real check or an explicit release resolves the hold.
+
 A due hold gets a single real checking request ahead of healthy alternatives.
 A degraded or recovering route that has not received an attempt for 30 seconds
 can use the same lease for one fresh observation. This priority lease does not
-exclude ordinary traffic from a recovering key. The next attempt resets that interval. This local recovery boost
-continues until real responses establish health, so the first successful check
-does not leave a provider stuck behind its healthy alternative. One active
-admission lease limits priority checks; healthy fallbacks remain available.
+exclude ordinary traffic from a recovering key. The next attempt resets that interval.
+
+This local recovery boost continues until real responses establish health,
+so the first successful check does not leave a provider stuck behind its healthy
+alternative. One active admission lease limits priority checks; healthy fallbacks
+remain available.
+
 After five minutes an unreported check can be replaced. Its old physical request
 may still be running, but its late outcome cannot override the newer check;
 ordinary requests keep contributing their own outcomes.
+
 When adaptive key selection is off, a non-held recovery check reserves only the
 provider and model. Configured weights and native key affinity still choose the
 key. Only the key that actually serves the request receives a health observation;
 a successful response on another key does not establish recovery for an untried
-key. One such provider check is admitted at a time, with a 30-second interval
+key.
+
+One such provider check is admitted at a time, with a 30-second interval
 after completion. Held-key checks retain their specific credential in both modes.
+
 Ordinary parsed requests remain adaptive regardless of body size, including
 requests above 10 MiB and requests with streaming responses. The native OSS
 application does not register the upstream large-payload passthrough extension.

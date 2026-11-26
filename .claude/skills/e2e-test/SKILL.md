@@ -511,13 +511,16 @@ For a new feature, create these files:
 - Use `page.getByRole()` as a secondary strategy
 - NEVER use brittle CSS selectors or chained parent locators (`.locator('..')`)
 - Methods should be async and use semantic waits
+- Mutation helpers must await their specific rendered result (created row visible or deleted row absent) before returning; a ready list alone does not prove that its refresh has finished.
 - Include `goto()`, CRUD methods, and a `cleanup` method
+- Before checking whether an item exists, wait for the completed list state, including a successfully loaded empty list. An enabled create button or a visible table shell does not establish that state.
+
+The template assumes that `feature-row-*` contains actual items from a completed list load and `feature-empty-state` is rendered only after a successful empty response. These states are mutually exclusive; loading and error placeholders must not match either locator. Adapt the locators to the feature's rendered list states.
 
 **Template:**
 ```typescript
 import { Locator, Page, expect } from '@playwright/test'
 import { BasePage } from '../../../core/pages/base.page'
-import { waitForNetworkIdle } from '../../../core/utils/test-helpers'
 
 // Define interfaces for the feature's data
 export interface FeatureConfig {
@@ -530,6 +533,8 @@ export class FeaturePage extends BasePage {
   // Main page elements
   readonly createBtn: Locator
   readonly table: Locator
+  readonly rows: Locator
+  readonly emptyState: Locator
 
   // Sheet/form elements
   readonly sheet: Locator
@@ -543,6 +548,8 @@ export class FeaturePage extends BasePage {
     // Use getByTestId for all locators
     this.createBtn = page.getByTestId('create-feature-btn')
     this.table = page.getByTestId('feature-table')
+    this.rows = page.getByTestId(/^feature-row-/)
+    this.emptyState = page.getByTestId('feature-empty-state')
     this.sheet = page.getByTestId('feature-sheet')
     this.nameInput = page.getByTestId('feature-name-input')
     this.saveBtn = page.getByTestId('feature-save-btn')
@@ -551,7 +558,11 @@ export class FeaturePage extends BasePage {
 
   async goto(): Promise<void> {
     await this.page.goto('/workspace/<feature>')
-    await waitForNetworkIdle(this.page)
+    await this.waitForListReady()
+  }
+
+  private async waitForListReady(): Promise<void> {
+    await expect(this.rows.filter({ visible: true }).first().or(this.emptyState.filter({ visible: true }))).toBeVisible()
   }
 
   async createFeature(config: FeatureConfig): Promise<void> {
@@ -567,9 +578,11 @@ export class FeaturePage extends BasePage {
     await this.waitForSuccessToast()
     await this.dismissToasts()
     await expect(this.sheet).not.toBeVisible({ timeout: 5000 })
+    await expect(this.page.getByTestId(`feature-row-${config.name}`)).toBeVisible()
   }
 
   async featureExists(name: string): Promise<boolean> {
+    await this.waitForListReady()
     const row = this.page.getByTestId(`feature-row-${name}`)
     return (await row.count()) > 0
   }
@@ -586,6 +599,7 @@ export class FeaturePage extends BasePage {
 
     await this.waitForSuccessToast()
     await this.dismissToasts()
+    await expect(this.page.getByTestId(`feature-row-${name}`)).toHaveCount(0)
   }
 
   async closeSheet(): Promise<void> {
@@ -792,7 +806,7 @@ make run-e2e-headed FLOW=<feature>
 
 **1. Element not found / timeout:**
 - Check if the `data-testid` attribute exists in the UI component
-- Verify the page has loaded: add `await waitForNetworkIdle(page)` after navigation
+- After navigation, assert the state the next step needs, such as `await expect(page.getByTestId('create-feature-btn')).toBeEnabled()`
 - Check for loading spinners: `await page.locator('[data-testid="loading-spinner"]').waitFor({ state: 'hidden' })`
 
 **2. Toast interfering with clicks:**
@@ -847,10 +861,13 @@ These rules MUST be followed at all times:
 - If a needed `data-testid` doesn't exist in the UI, add it to the UI component first
 
 ### Waits
-- **ALWAYS** use semantic waits (`waitFor()`, `expect().toBeVisible()`, `waitForLoadState()`)
+- **ALWAYS** wait for the UI state the next action or assertion needs with auto-retrying web assertions.
 - **NEVER** use `page.waitForTimeout()` except as last resort in cleanup/polling (and document why)
-- **ALWAYS** wait for page load after navigation: `await waitForNetworkIdle(page)`
+- After navigation, assert the required rendered content or actionable control; do not add blanket `networkidle` waits.
+- When a specific response is part of the test, register `page.waitForResponse()` before its triggering action, await it, then assert the resulting UI.
 - **ALWAYS** wait for sheet animations before interacting with sheet contents
+
+Follow [Playwright's readiness guidance](https://playwright.dev/docs/api/class-page#page-wait-for-load-state): network silence does not establish application readiness. See [wait strategies](../../../tests/e2e/README.md#wait-strategies) for examples.
 
 ### Test Data
 - **ALWAYS** use `Date.now()` or `TestDataFactory.uniqueId()` for unique test names
@@ -901,7 +918,7 @@ Every page object inherits these from `BasePage` (`core/pages/base.page.ts`):
 
 | Method | Description |
 |--------|-------------|
-| `waitForPageLoad()` | Wait for `networkidle` load state |
+| `waitForPageLoad()` | Existing network-idle helper; prefer web assertions for readiness |
 | `waitForChartsToLoad()` | Wait for charts/data and skeletons to disappear |
 | `getToast(type?)` | Get toast locator (success/error/loading/default) |
 | `waitForSuccessToast(message?)` | Wait for success toast, optionally match message |
@@ -922,7 +939,7 @@ Every page object inherits these from `BasePage` (`core/pages/base.page.ts`):
 
 | Helper | Description |
 |--------|-------------|
-| `waitForNetworkIdle(page, timeout?)` | Wait for network idle state |
+| `waitForNetworkIdle(page, timeout?)` | Existing network-idle helper; prefer web assertions for readiness |
 | `wait(ms)` | Sleep for ms (use sparingly) |
 | `retry(fn, { retries, delay })` | Retry async function with backoff |
 | `randomString(length?)` | Generate random alphanumeric string |
