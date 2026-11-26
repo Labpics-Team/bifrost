@@ -11,6 +11,7 @@ import (
 	"github.com/maximhq/bifrost/framework/logstore"
 	"github.com/maximhq/bifrost/framework/vectorstore"
 	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
+	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 )
 
@@ -48,9 +49,14 @@ func TestCacheAvailabilityReadinessAndDiagnosticHealth(t *testing.T) {
 		r.Handler(&ctx)
 		return ctx.Response.StatusCode()
 	}
-	if code := call("/readyz"); code != 200 || vector.pings != 0 {
+	var ready fasthttp.RequestCtx
+	ready.Request.Header.SetMethod("GET")
+	ready.Request.SetRequestURI("/readyz")
+	r.Handler(&ready)
+	if code := ready.Response.StatusCode(); code != 200 || vector.pings != 0 {
 		t.Fatalf("optional vector store affected readiness: status=%d pings=%d", code, vector.pings)
 	}
+	require.JSONEq(t, `{"status":"ok","components":{"db_pings":"ok"}}`, string(ready.Response.Body()))
 	if code := call("/health"); code != 503 || vector.pings != 1 {
 		t.Fatal("diagnostic health hid the vector-store failure")
 	}

@@ -308,6 +308,13 @@ entry point использует `go:embed all:ui`, поэтому Go-сборк
 обеспечивают workspace и `LOCAL=1`; её результат не является опубликованным
 образом или проверкой production runtime.
 
+Provider harness сохраняет проверки реального межпротокольного cache replay,
+сквозного учёта квоты и клиентских beta-заголовков. Готовность и каталог
+маршрутов проверяются обязательными Go HTTP-тестами на зарегистрированных
+маршрутах (включая тело readiness, допуск и полную пагинацию); готовность
+реального процесса дополнительно проверяет production qualification в Infra.
+Отдельные сценарии readiness и каталога в provider harness не нужны.
+
 ## Сборка и поставка
 
 [Рецепт Infra](https://github.com/Labpics-Team/labpics-infra/blob/main/services/bifrost/build/Dockerfile)
