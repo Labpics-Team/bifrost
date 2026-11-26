@@ -68,6 +68,15 @@ JSON parsing and encoding at the edges of the request.
 | Response parse | Decoding the provider's raw JSON response into a provider response struct |
 | Response encode | Encoding the final Bifrost response back to JSON for the client |
 
+**Response parse measures wall-clock time, not CPU time.** The shared unary
+response handler also includes compacting raw request/response JSON when raw capture
+is enabled. In the native OpenAI Responses stream, the per-event timer starts
+after the SSE reader returns the event: waiting for the next event and writing
+to the client are outside that timer. Decoder initialization, garbage collection,
+or scheduling delays during decoding can still increase the measured time.
+Compare [CPU profiles and execution traces](https://go.dev/doc/diagnostics)
+to distinguish decoding work from those delays.
+
 ### Conversion
 
 Translating between Bifrost's unified schema and a provider's native shape.
@@ -130,7 +139,7 @@ Handling the request between the client, the gateway, and the provider.
 | Request signing | Signing the upstream request (for example, AWS SigV4 for Bedrock) |
 | Credential fetch | Fetching provider credentials (for example, a Vertex or Bedrock token) |
 | Response read | Reading and finalizing the provider's HTTP response, including header extraction |
-| Provider processing | The provider's server-side handling not covered by a more specific row (a residual, see below) |
+| Provider processing | Bifrost provider-adapter time not covered by upstream or a more specific row (a residual, see below) |
 
 ### Client delivery
 
@@ -155,9 +164,9 @@ Two rows are not tied to a single phase. Each accounts for overhead that does no
 
 ### Provider processing
 
-The **Provider processing** row is the provider's own server-side handling of the request, excluding the network round trip to the provider (that counts as upstream, not overhead) and any handling already broken out into a more specific row.
+The **Provider processing** row is the residual time inside Bifrost's provider adapter after subtracting the recorded upstream wait and the measured child phases. Provider-side generation is included in upstream.
 
-It varies by provider, and a larger value simply means more of that provider's handling is not itemized into finer rows. It is normally small.
+A larger residual means more adapter time remains unattributed. It does not identify a specific operation or prove CPU work; inspect the attempt spans and upstream timing before assigning a cause.
 
 ### Miscellaneous
 
@@ -175,6 +184,29 @@ A streamed response is accounted for differently, because most of its time is sp
 
 - **Provider processing and the Miscellaneous residual are not shown.** For a stream, the time between chunks is off-CPU waiting, not Bifrost work, so these two residuals are left out to avoid mislabeling it.
 - **Per-chunk work still appears in the usual rows.** Decoding each chunk shows up in **Response parse** (Serialization), converting chunks in **Stream convert (inbound)** and **Stream convert (outbound)** (Conversion), and writing chunks back to the client in **Client write** (Client delivery). A stream's numbers therefore read like a unary request's.
+
+---
+
+## Cancelled requests
+
+Before publishing abandonment, the caller marks the trace as deferred. If the
+worker claims delivery during that setup, the caller removes only the deferral
+it created and receives the claimed result. An existing deferral is preserved.
+
+A caller can stop waiting before the provider finishes recording its cancelled
+attempt. When a worker owns this abandoned request, it refreshes the final
+upstream and streaming totals after the provider finishes and the existing
+transport-handoff wait completes, before exporting the deferred trace. The
+caller's earlier snapshot
+must not turn late upstream time into gateway overhead or drop late parse,
+conversion, and backpressure measurements. Refreshing replaces the snapshot;
+it does not add the same time twice.
+
+The existing five-second handoff budget still applies if a transport never
+signals completion. These accounting updates do not extend that wait.
+
+This corrects timing attribution in newly completed traces. It does not shorten
+the provider call or rewrite previously stored logs.
 
 ---
 

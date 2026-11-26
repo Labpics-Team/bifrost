@@ -884,3 +884,408 @@ func BenchmarkRequestWorkerStreamAttempt(b *testing.B) {
 	pq.signalClosing()
 	wg.Wait()
 }
+
+type abandonedTimingSnapshotTracer struct {
+	*recordingTracer
+	snapshot map[string]any
+	exported chan struct{}
+	handoff  func()
+}
+
+func (r *abandonedTimingSnapshotTracer) AwaitTransportHandoff(_ string) {
+	if r.handoff != nil {
+		r.handoff()
+	}
+}
+
+func (r *abandonedTimingSnapshotTracer) CompleteAndFlushTrace(traceID string) {
+	r.mu.Lock()
+	r.snapshot = make(map[string]any, len(r.attrs))
+	for key, value := range r.attrs {
+		r.snapshot[key] = value
+	}
+	r.mu.Unlock()
+	r.recordingTracer.CompleteAndFlushTrace(traceID)
+	if r.exported != nil {
+		close(r.exported)
+	}
+}
+
+// The request handler can finish on ctx.Done before the provider's cancellation
+// branch records its socket wait. The worker must export the final counters, not
+// the handler's earlier snapshot, or that wait is misreported as gateway overhead.
+func TestCompleteAbandonedTraceUsesFinalTimings(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		name := "unary"
+		if streaming {
+			name = "streaming"
+		}
+		t.Run(name, func(t *testing.T) {
+			tracer := &abandonedTimingSnapshotTracer{recordingTracer: newRecordingTracer()}
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			defer ctx.Cancel()
+			ctx.SetValue(schemas.BifrostContextKeyTracer, tracer)
+			ctx.SetValue(schemas.BifrostContextKeyTraceID, tracer.CreateTrace(""))
+			ctx.ResetUpstreamLatency()
+			if streaming {
+				ctx.ResetStreamOverhead()
+			}
+
+			// A completed first attempt is all that the departing handler saw.
+			schemas.AddUpstreamLatency(ctx, 57*time.Millisecond)
+			ctx.StampUpstreamLatency()
+			if streaming {
+				schemas.AddStreamParse(ctx, 2*time.Millisecond)
+				ctx.StampStreamOverhead()
+			}
+
+			// The last provider attempt finishes after that snapshot.
+			schemas.AddUpstreamLatency(ctx, 92*time.Millisecond)
+			if streaming {
+				schemas.AddStreamParse(ctx, 3*time.Millisecond)
+				// The transport can record its final work during the handoff.
+				tracer.handoff = func() {
+					schemas.AddStreamConvert(ctx, time.Millisecond)
+					schemas.AddStreamBackpressure(ctx, 4*time.Millisecond)
+				}
+			}
+			(&Bifrost{}).completeAbandonedTrace(ctx)
+
+			if got := tracer.snapshot[schemas.AttrBifrostUpstreamDurationMs]; got != float64(149) {
+				t.Errorf("exported upstream = %v ms, want 149: late provider wait must not become overhead", got)
+			}
+			if streaming {
+				for key, want := range map[string]float64{
+					schemas.AttrBifrostStreamParseMs:        5,
+					schemas.AttrBifrostStreamConvertMs:      1,
+					schemas.AttrBifrostStreamBackpressureMs: 4,
+				} {
+					if got := tracer.snapshot[key]; got != want {
+						t.Errorf("exported %s = %v, want %v", key, got, want)
+					}
+				}
+			} else if _, exists := tracer.snapshot[schemas.AttrBifrostStreamParseMs]; exists {
+				t.Error("unary request acquired a streaming measurement")
+			}
+			if got := tracer.completed.Load(); got != 1 {
+				t.Errorf("exported %d traces, want exactly one", got)
+			}
+		})
+	}
+}
+
+func BenchmarkCompleteAbandonedTraceTimings(b *testing.B) {
+	for _, streaming := range []bool{false, true} {
+		name := "unary"
+		if streaming {
+			name = "streaming"
+		}
+		b.Run(name, func(b *testing.B) {
+			tracer := newRecordingTracer()
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			defer ctx.Cancel()
+			ctx.SetValue(schemas.BifrostContextKeyTracer, tracer)
+			ctx.SetValue(schemas.BifrostContextKeyTraceID, tracer.CreateTrace(""))
+			ctx.ResetUpstreamLatency()
+			schemas.AddUpstreamLatency(ctx, time.Second)
+			if streaming {
+				ctx.ResetStreamOverhead()
+				schemas.AddStreamParse(ctx, time.Millisecond)
+				schemas.AddStreamConvert(ctx, time.Millisecond)
+				schemas.AddStreamBackpressure(ctx, time.Millisecond)
+				ctx.StampStreamOverhead()
+			}
+			ctx.StampUpstreamLatency()
+			client := &Bifrost{}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				client.completeAbandonedTrace(ctx)
+			}
+		})
+	}
+}
+
+type delayedTimingProvider struct {
+	schemas.Provider
+	started chan struct{}
+	release chan struct{}
+}
+
+func (p *delayedTimingProvider) ChatCompletion(ctx *schemas.BifrostContext, _ schemas.Key, _ *schemas.BifrostChatRequest) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
+	// The clock values make the ordering assertion independent of host load.
+	schemas.AddUpstreamLatency(ctx, 57*time.Millisecond)
+	p.started <- struct{}{}
+	<-p.release
+	schemas.AddUpstreamLatency(ctx, 92*time.Millisecond)
+	return nil, &schemas.BifrostError{
+		IsBifrostError: true,
+		StatusCode:     new(499),
+		Error:          &schemas.ErrorField{Message: "request cancelled"},
+	}
+}
+
+func TestCancelledRequestExportsLateProviderTime(t *testing.T) {
+	account := mockAccountFor("http://unused.invalid")
+	account.configs[schemas.OpenAI].NetworkConfig.MaxRetries = 0
+	tracer := &abandonedTimingSnapshotTracer{
+		recordingTracer: newRecordingTracer(),
+		exported:        make(chan struct{}),
+	}
+	client, err := Init(context.Background(), schemas.BifrostConfig{
+		Account: account, Logger: NewNoOpLogger(), Tracer: tracer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Shutdown)
+
+	// Use the real SDK, queue and worker, but control when the provider records its
+	// cancelled wait so the handler is guaranteed to finish first.
+	cfg, err := account.GetConfigForProvider(schemas.OpenAI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalQueue, err := client.getProviderQueue(schemas.OpenAI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream := &delayedTimingProvider{
+		Provider: openai.NewOpenAIProvider(cfg, NewNoOpLogger()),
+		started:  make(chan struct{}, 1),
+		release:  make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(upstream.release) }) }
+	pq := &ProviderQueue{queue: make(chan *ChannelMessage, 1), done: make(chan struct{})}
+	client.requestQueues.Store(schemas.OpenAI, pq)
+	var workers sync.WaitGroup
+	workers.Add(1)
+	go client.requestWorker(upstream, cfg, pq, &workers, "")
+	t.Cleanup(func() {
+		release()
+		pq.signalClosing()
+		workers.Wait()
+		client.requestQueues.Store(schemas.OpenAI, originalQueue)
+	})
+
+	ctx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
+	defer cancel()
+	ctx.SetValue(schemas.BifrostContextKeyTraceID, tracer.CreateTrace(""))
+	result := make(chan *schemas.BifrostError, 1)
+	go func() {
+		_, requestErr := client.ChatCompletionRequest(ctx, chatRequest())
+		result <- requestErr
+	}()
+	select {
+	case <-upstream.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider never received the request")
+	}
+	cancel()
+	select {
+	case requestErr := <-result:
+		if requestErr == nil {
+			t.Fatal("cancelled caller returned success")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("caller waited for provider completion after cancellation")
+	}
+	if got, _ := tracer.get(schemas.AttrBifrostUpstreamDurationMs); got != float64(57) {
+		t.Fatalf("departing handler stamped %v ms, want the 57 ms recorded before cancellation", got)
+	}
+
+	release()
+	select {
+	case <-tracer.exported:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not export the abandoned request")
+	}
+	if got := tracer.snapshot[schemas.AttrBifrostUpstreamDurationMs]; got != float64(149) {
+		t.Errorf("cancelled request exported upstream = %v ms, want 149", got)
+	}
+}
+
+type abandonmentTrace struct {
+	*abandonedTimingSnapshotTracer
+	deferred     atomic.Bool
+	beforeDefer  func()
+	waitEntered  chan struct{}
+	handoff      chan struct{}
+	logs         atomic.Int64
+	exportedLogs atomic.Int64
+}
+
+func (r *abandonmentTrace) DeferTraceCompletion(traceID string) {
+	if r.beforeDefer != nil {
+		r.beforeDefer()
+	}
+	r.deferred.Store(true)
+	r.recordingTracer.DeferTraceCompletion(traceID)
+}
+
+func (r *abandonmentTrace) IsTraceCompletionDeferred(_ string) bool {
+	return r.deferred.Load()
+}
+
+func (r *abandonmentTrace) ClearTraceCompletionDeferral(traceID string) {
+	r.deferred.Store(false)
+	r.recordingTracer.ClearTraceCompletionDeferral(traceID)
+}
+
+func (r *abandonmentTrace) AwaitTransportHandoff(_ string) {
+	if r.deferred.Load() {
+		close(r.waitEntered)
+		<-r.handoff
+	}
+}
+
+func (r *abandonmentTrace) AttachPluginLogs(_ string, logs []schemas.PluginLogEntry) {
+	r.logs.Add(int64(len(logs)))
+}
+
+func (r *abandonmentTrace) CompleteAndFlushTrace(traceID string) {
+	r.exportedLogs.Store(r.logs.Load())
+	r.abandonedTimingSnapshotTracer.CompleteAndFlushTrace(traceID)
+}
+
+func TestChannelMessageAbandonTraceOwnership(t *testing.T) {
+	newMessage := func(t *testing.T) (*ChannelMessage, *abandonmentTrace) {
+		t.Helper()
+		tracer := &abandonmentTrace{
+			abandonedTimingSnapshotTracer: &abandonedTimingSnapshotTracer{recordingTracer: newRecordingTracer()},
+			waitEntered:                   make(chan struct{}),
+			handoff:                       make(chan struct{}),
+		}
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		t.Cleanup(ctx.Cancel)
+		ctx.SetValue(schemas.BifrostContextKeyTracer, tracer)
+		ctx.SetValue(schemas.BifrostContextKeyTraceID, tracer.CreateTrace(""))
+		return &ChannelMessage{Context: ctx}, tracer
+	}
+
+	t.Run("worker claims while deferral is being installed", func(t *testing.T) {
+		message, tracer := newMessage(t)
+		entered, unblock := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		release := func() { once.Do(func() { close(unblock) }) }
+		t.Cleanup(release)
+		tracer.beforeDefer = func() {
+			close(entered)
+			<-unblock
+		}
+		abandoned := make(chan bool, 1)
+		go func() { abandoned <- message.abandonDelivery() }()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("caller never reached trace deferral")
+		}
+		// Without the deferral the worker must still be able to claim, rather
+		// than export a trace that the transport is still writing.
+		claimed := message.claimDelivery()
+		release()
+		select {
+		case got := <-abandoned:
+			if got || !claimed {
+				t.Errorf("ownership: abandoned=%v claimed=%v, want false/true", got, claimed)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("caller did not finish after trace deferral")
+		}
+		if tracer.IsTraceCompletionDeferred("") {
+			t.Error("losing abandonment left a deferral that suppresses normal transport export")
+		}
+		if got := tracer.cleared.Load(); got != 1 {
+			t.Errorf("cleared %d deferrals, want the one installed by the losing caller", got)
+		}
+	})
+
+	t.Run("abandoned worker waits for transport metadata", func(t *testing.T) {
+		message, tracer := newMessage(t)
+		if !message.abandonDelivery() || message.claimDelivery() {
+			t.Fatal("caller did not retain abandonment ownership")
+		}
+		var once sync.Once
+		release := func() { once.Do(func() { close(tracer.handoff) }) }
+		t.Cleanup(release)
+		done := make(chan struct{})
+		go func() {
+			(&Bifrost{}).completeAbandonedTrace(message.Context)
+			close(done)
+		}()
+		select {
+		case <-tracer.waitEntered:
+		case <-done:
+			t.Fatal("worker exported before transport handoff")
+		case <-time.After(5 * time.Second):
+			t.Fatal("worker did not wait for transport handoff")
+		}
+		if got := tracer.completed.Load(); got != 0 {
+			t.Fatalf("exported %d traces before transport metadata", got)
+		}
+		traceID, _ := message.Context.Value(schemas.BifrostContextKeyTraceID).(string)
+		tracer.SetAttribute("root-span", schemas.AttrHTTPResponseStatusCode, 499)
+		tracer.AttachPluginLogs(traceID, []schemas.PluginLogEntry{{PluginName: "transport", Message: "request cancelled"}})
+		release()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("worker did not finish after transport handoff")
+		}
+		if got := tracer.snapshot[schemas.AttrHTTPResponseStatusCode]; got != 499 {
+			t.Errorf("exported HTTP status=%v, want 499", got)
+		}
+		if got := tracer.exportedLogs.Load(); got != 1 {
+			t.Errorf("exported %d transport logs, want 1", got)
+		}
+		if tracer.IsTraceCompletionDeferred(traceID) || tracer.completed.Load() != 1 {
+			t.Error("abandoned trace did not finish exactly once with its deferral cleared")
+		}
+	})
+
+	t.Run("claimed delivery preserves an existing deferral", func(t *testing.T) {
+		message, tracer := newMessage(t)
+		tracer.deferred.Store(true)
+		if !message.claimDelivery() || message.abandonDelivery() {
+			t.Fatal("worker did not retain delivery ownership")
+		}
+		if !tracer.IsTraceCompletionDeferred("") || tracer.cleared.Load() != 0 {
+			t.Error("losing caller cleared a deferral it did not install")
+		}
+	})
+}
+
+func BenchmarkChannelMessageTraceHandoff(b *testing.B) {
+	for _, path := range []string{"normal", "abandoned", "claimed"} {
+		b.Run(path, func(b *testing.B) {
+			tracer := newRecordingTracer()
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			defer ctx.Cancel()
+			ctx.SetValue(schemas.BifrostContextKeyTracer, tracer)
+			ctx.SetValue(schemas.BifrostContextKeyTraceID, tracer.CreateTrace(""))
+			message := &ChannelMessage{Context: ctx}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				switch path {
+				case "normal":
+					message.handoff.Store(handoffOpen)
+					if !message.claimDelivery() {
+						b.Fatal("delivery was not claimed")
+					}
+				case "abandoned":
+					message.handoff.Store(handoffOpen)
+					if !message.abandonDelivery() {
+						b.Fatal("delivery was not abandoned")
+					}
+				case "claimed":
+					message.handoff.Store(handoffClaimed)
+					if message.abandonDelivery() {
+						b.Fatal("claimed delivery was abandoned")
+					}
+				}
+			}
+		})
+	}
+}

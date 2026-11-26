@@ -142,7 +142,7 @@ func BenchmarkRoutingModels(b *testing.B) {
 }
 
 func routingModelsAccess(permits ...schemas.ProviderPermit) schemas.Access {
-	return grant.NewAccess([]schemas.Permit{grant.NewPermit(grant.PermitVirtualKey, "caller", "Caller", true, false, permits, nil)}, nil, "", nil)
+	return grant.NewAccess([]schemas.Permit{grant.NewPermit(grant.PermitVirtualKey, "caller", "Caller", true, false, permits, nil)}, grant.Union, nil, "", nil)
 }
 
 func TestRoutingModelsFollowsNativeProviderNamespace(t *testing.T) {

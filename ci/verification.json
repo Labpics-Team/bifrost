@@ -127,7 +127,10 @@
       "TestOwnedStreamCancellationIsNotCleanEOF",
       "TestProviderAttemptObserverSeesEachRetryAndStreamingTeardown",
       "TestProviderAttemptObserverSeesTTFTFailureBeforeHealthyFallback",
-      "TestExplicitKeySelectionExplainsNativePin"
+      "TestExplicitKeySelectionExplainsNativePin",
+      "TestCompleteAbandonedTraceUsesFinalTimings",
+      "TestCancelledRequestExportsLateProviderTime",
+      "TestChannelMessageAbandonTraceOwnership"
     ],
     "github.com/maximhq/bifrost/core/providers/utils": [
       "TestStreamDiagnosticsCommitReason",
