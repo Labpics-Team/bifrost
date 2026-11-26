@@ -1,5 +1,5 @@
 import type { Locator, Page } from "@playwright/test";
-import { expect, test } from "../../core/fixtures/base.fixture";
+import { expect, test } from "../../core/fixtures/query-observer.fixture";
 import {
   createLogSearchQuery,
   SAMPLE_MODELS,
@@ -1592,6 +1592,805 @@ test.describe("LLM Logs", () => {
       expect(url).toMatch(/end_time=\d+/);
     });
   });
+});
+
+test.describe("LLM log detail identity", () => {
+  test.use({ viewport: { width: 1440, height: 900 } });
+
+  for (const offList of [false, true]) {
+    for (const detailStatus of [500, 200]) {
+      test(`keeps the selected record ${offList ? "outside the table" : "in the table"} when detail returns ${detailStatus}`, async ({ page, logsPage }) => {
+        const timestamp = new Date().toISOString();
+        const row = (id: string) => ({
+          id,
+          object: "chat.completion",
+          timestamp,
+          created_at: timestamp,
+          provider: "openai",
+          model: `${id}-listed-model`,
+          number_of_retries: 0,
+          fallback_index: 0,
+          status: "success",
+          stream: false,
+          latency: 120,
+          cost: 0,
+          input_history: [],
+          responses_input_history: [],
+          selected_prompt_id: `${id}-prompt`,
+          selected_prompt_name: `${id}-listed-prompt`,
+        });
+        const first = {
+          ...row("synthetic-identity-first"),
+          ...(offList ? {
+            status: "error",
+            child_count: 1,
+            error_details: { status_code: 429, error: { message: "Synthetic provider failure" } },
+          } : {}),
+        };
+        const next = {
+          ...row("synthetic-identity-next"),
+          ...(offList ? { parent_request_id: first.id, fallback_index: 1 } : {}),
+        };
+        const fullFirst = { ...first, model: "first-full-model" };
+        const fullNext = { ...next, model: "next-full-model", status: "processing" };
+        let releaseDetail!: () => void;
+        let releasePrompt!: () => void;
+        let releaseRefetch!: () => void;
+        let markRefetchStarted!: () => void;
+        let nextRequests = 0;
+        const detailReady = new Promise<void>((resolve) => { releaseDetail = resolve; });
+        const promptReady = new Promise<void>((resolve) => { releasePrompt = resolve; });
+        const refetchReady = new Promise<void>((resolve) => { releaseRefetch = resolve; });
+        const refetchStarted = new Promise<void>((resolve) => { markRefetchStarted = resolve; });
+
+        await page.route((url) => url.pathname === "/api/logs", (route) => {
+          const parent = new URL(route.request().url()).searchParams.get("parent_request_id");
+          const logs = parent
+            ? (offList && parent === first.id ? [next] : [])
+            : (offList ? [row("synthetic-visible-row")] : [first, next]);
+          return route.fulfill({ json: {
+            logs,
+            pagination: { limit: 50, offset: 0, sort_by: "timestamp", order: "desc" },
+            stats: {
+              total_requests: logs.length,
+              success_rate: 100,
+              user_facing_success_rate: 100,
+              user_facing_total_requests: logs.length,
+              average_latency: 120,
+              total_tokens: 0,
+              prompt_tokens: 0,
+              completion_tokens: 0,
+              total_cost: 0,
+            },
+            has_logs: true,
+          } });
+        });
+        await page.route((url) => url.pathname === `/api/logs/${first.id}`, (route) =>
+          route.fulfill({ json: fullFirst }));
+        await page.route((url) => url.pathname === `/api/logs/${next.id}`, async (route) => {
+          if (++nextRequests > 1) {
+            markRefetchStarted();
+            await refetchReady;
+            await route.fulfill({ status: 500, json: { error: { message: "Synthetic polling failure" } } });
+            return;
+          }
+          await detailReady;
+          await route.fulfill({
+            status: detailStatus,
+            json: detailStatus === 200 ? fullNext : { error: { message: "Synthetic detail failure" } },
+          });
+        });
+        await page.route((url) => url.pathname === `/api/prompt-repo/prompts/${first.selected_prompt_id}`, (route) =>
+          route.fulfill({ json: { prompt: { id: first.selected_prompt_id, name: "first-resolved-prompt" } } }));
+        await page.route((url) => url.pathname === `/api/prompt-repo/prompts/${next.selected_prompt_id}`, async (route) => {
+          await promptReady;
+          await route.fulfill({ json: { prompt: { id: next.selected_prompt_id, name: "next-resolved-prompt" } } });
+        });
+
+        try {
+          if (offList) {
+            await page.goto(`/workspace/logs?selected_log=${first.id}`);
+            await expect(logsPage.tableRows).toHaveCount(1);
+          } else {
+            await logsPage.goto();
+            await expect(logsPage.tableRows).toHaveCount(2);
+            await logsPage.viewLogDetails(0);
+          }
+          const sheet = logsPage.logDetailSheet;
+          const prompt = sheet.getByTestId("logdetails-selected-prompt-link");
+          await expect(sheet.getByText(first.id, { exact: true })).toBeVisible();
+          await expect(sheet.getByText(fullFirst.model, { exact: true }).first()).toBeVisible();
+          await expect(prompt).toHaveText("first-resolved-prompt");
+
+          const nextRequested = page.waitForRequest((request) => new URL(request.url()).pathname === `/api/logs/${next.id}`);
+          if (offList) {
+            await sheet.getByTestId("logdetails-fallback-open-final").click();
+          } else {
+            await sheet.getByRole("button", { name: "Next log", exact: true }).click();
+          }
+          await nextRequested;
+          await expect(page).toHaveURL(new RegExp(`selected_log=${next.id}`));
+          await expect.soft(sheet.getByRole("heading", { name: "Loading log details", exact: true })).toBeAttached();
+          await expect.soft(sheet.getByText(first.id, { exact: true })).toHaveCount(0);
+          await expect(sheet.getByText(next.id, { exact: true })).toBeVisible();
+          await expect(sheet.getByRole("button", { name: "Close", exact: true })).toBeEnabled();
+
+          releaseDetail();
+          if (offList && detailStatus === 500) {
+            // No row or successful response belongs to this ID: show its load error, not the previous request.
+            await expect.soft(sheet.getByText(first.id, { exact: true })).toHaveCount(0);
+            await expect(sheet.getByRole("alert")).toHaveText("Synthetic detail failure");
+            await expect(sheet.getByText(next.id, { exact: true })).toBeVisible();
+            await expect(prompt).toHaveCount(0);
+          } else {
+            await expect(sheet.getByText(next.id, { exact: true })).toBeVisible();
+            // A fallback may legitimately name its parent A; its own model and prompt must belong to B.
+            await expect(sheet.getByText(fullFirst.model, { exact: true })).toHaveCount(0);
+            await expect(sheet.getByText(detailStatus === 200 ? fullNext.model : next.model, { exact: true }).first()).toBeVisible();
+            // A pending prompt for the current row must not reuse the previous row's name.
+            await expect(prompt).toHaveText(next.selected_prompt_name);
+            releasePrompt();
+            await expect(prompt).toHaveText("next-resolved-prompt");
+          }
+
+          if (detailStatus === 200) {
+            // Cached details for this same ID remain usable while polling and after its error.
+            await refetchStarted;
+            await expect(sheet.getByText(fullNext.model, { exact: true }).first()).toBeVisible();
+            const failedPoll = page.waitForResponse((response) =>
+              new URL(response.url()).pathname === `/api/logs/${next.id}` && response.status() === 500);
+            releaseRefetch();
+            await (await failedPoll).finished();
+            await expect(sheet.getByText(next.id, { exact: true })).toBeVisible();
+            await expect(sheet.getByText(fullNext.model, { exact: true }).first()).toBeVisible();
+          }
+
+          await expect(page).toHaveURL(new RegExp(`selected_log=${next.id}`));
+          if (offList) {
+            await page.goBack();
+          } else {
+            await sheet.getByRole("button", { name: "Previous log", exact: true }).click();
+          }
+          await expect(page).toHaveURL(new RegExp(`selected_log=${first.id}`));
+          await expect(sheet.getByText(first.id, { exact: true })).toBeVisible();
+          await expect(sheet.getByText(fullFirst.model, { exact: true }).first()).toBeVisible();
+          await expect(prompt).toHaveText("first-resolved-prompt");
+          await expect(sheet.getByRole("alert")).toHaveCount(0);
+        } finally {
+          releaseDetail();
+          releasePrompt();
+          releaseRefetch();
+        }
+      });
+    }
+  }
+  test("keeps the selected detail independent of an empty scoped list and ignores a late error after close", async ({ page, logsPage }) => {
+    const missingId = "synthetic-missing-after-retention";
+    const closedId = "synthetic-missing-closed-pending";
+    const message = "Synthetic selected log not found";
+    let releaseList!: () => void;
+    let releaseMissing!: () => void;
+    let releaseClosed!: () => void;
+    const listReady = new Promise<void>((resolve) => { releaseList = resolve; });
+    const missingReady = new Promise<void>((resolve) => { releaseMissing = resolve; });
+    const closedReady = new Promise<void>((resolve) => { releaseClosed = resolve; });
+
+    await page.route((url) => url.pathname === "/api/logs", async (route) => {
+      await listReady;
+      await route.fulfill({ json: {
+        logs: [],
+        pagination: { limit: 50, offset: 0, sort_by: "timestamp", order: "desc" },
+        stats: {
+          total_requests: 0,
+          success_rate: 0,
+          user_facing_success_rate: 0,
+          user_facing_total_requests: 0,
+          average_latency: 0,
+          total_tokens: 0,
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          total_cost: 0,
+        },
+        has_logs: false,
+      } });
+    });
+    await page.route((url) => url.pathname === `/api/logs/${missingId}`, async (route) => {
+      await missingReady;
+      await route.fulfill({ status: 404, json: { error: { message } } });
+    });
+    await page.route((url) => url.pathname === `/api/logs/${closedId}`, async (route) => {
+      await closedReady;
+      await route.fulfill({ status: 404, json: { error: { message } } });
+    });
+
+    const sheet = logsPage.logDetailSheet;
+    const emptyState = page.getByRole("heading", { name: "Integrate under 60 seconds", exact: true, includeHidden: true });
+    try {
+      await page.goto(`/workspace/logs?selected_log=${missingId}`);
+      await expect(sheet.getByText(missingId, { exact: true })).toBeVisible();
+      await expect(sheet.getByRole("heading", { name: "Loading log details", exact: true })).toBeVisible();
+
+      // has_logs=false means no visible scoped records, rather than an empty result page.
+      const emptyList = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/logs");
+      releaseList();
+      await (await emptyList).finished();
+      await expect(emptyState).toBeVisible();
+      await expect.soft(sheet.getByText(missingId, { exact: true })).toBeVisible();
+
+      const missingResponse = page.waitForResponse((response) => new URL(response.url()).pathname === `/api/logs/${missingId}`);
+      releaseMissing();
+      await (await missingResponse).finished();
+      await expect(page).toHaveURL(new RegExp(`selected_log=${missingId}`));
+      await expect(sheet.getByRole("alert")).toHaveText(message);
+      await expect(sheet.getByText(missingId, { exact: true })).toBeVisible();
+      await sheet.getByRole("button", { name: "Close", exact: true }).click();
+      await expect(page).not.toHaveURL(/selected_log=/);
+      await expect(sheet).toHaveCount(0);
+      await expect(emptyState).toBeVisible();
+
+      // Closing during a second lookup must keep the selection cleared when its 404 arrives later.
+      const closedRequest = page.waitForRequest((request) => new URL(request.url()).pathname === `/api/logs/${closedId}`);
+      await page.goto(`/workspace/logs?selected_log=${closedId}`);
+      await closedRequest;
+      await expect(emptyState).toBeVisible();
+      await expect(sheet.getByText(closedId, { exact: true })).toBeVisible();
+      await expect(sheet.getByRole("heading", { name: "Loading log details", exact: true })).toBeVisible();
+      await sheet.getByRole("button", { name: "Close", exact: true }).click();
+      await expect(page).not.toHaveURL(/selected_log=/);
+      await expect(sheet).toHaveCount(0);
+
+      const closedResponse = page.waitForResponse((response) => new URL(response.url()).pathname === `/api/logs/${closedId}`);
+      releaseClosed();
+      await (await closedResponse).finished();
+      await expect(page).not.toHaveURL(/selected_log=/);
+      await expect(sheet).toHaveCount(0);
+      await expect(page.getByRole("alert")).toHaveCount(0);
+      await expect(emptyState).toBeVisible();
+    } finally {
+      releaseList();
+      releaseMissing();
+      releaseClosed();
+    }
+  });
+
+  for (const emptyBeforeSession of [true, false]) {
+    test("keeps the selected session available when the scoped list empties " + (emptyBeforeSession ? "before" : "after") + " opening it", async ({ page, logsPage }) => {
+      const timestamp = new Date().toISOString();
+      const sessionId = "synthetic-selection-session";
+      const clientSessionId = "synthetic-selection-client-session";
+      const row = (id: string) => ({
+        id, object: "chat.completion", timestamp, created_at: timestamp,
+        provider: "openai", model: id + "-model",
+        number_of_retries: 0, fallback_index: 0, status: "success", stream: false,
+        latency: 120, cost: 0, input_history: [], responses_input_history: [],
+        parent_request_id: sessionId, session_id: clientSessionId,
+      });
+      const first = row("synthetic-session-first");
+      const next = row("synthetic-session-next");
+      const rows = [first, next];
+      const listResult = (logs: typeof rows, hasLogs: boolean) => ({
+        logs,
+        pagination: { limit: 50, offset: 0, sort_by: "timestamp", order: "desc" },
+        stats: {
+          total_requests: logs.length, success_rate: 100, user_facing_success_rate: 100,
+          user_facing_total_requests: logs.length, average_latency: 120,
+          total_tokens: 0, prompt_tokens: 0, completion_tokens: 0, total_cost: 0,
+        },
+        has_logs: hasLogs,
+      });
+      let releaseFirstList!: () => void;
+      let releaseVisibleList!: () => void;
+      let releaseSession!: () => void;
+      let listRequests = 0;
+      let deletedIds: string[] = [];
+      const firstListReady = new Promise<void>((resolve) => { releaseFirstList = resolve; });
+      const visibleListReady = new Promise<void>((resolve) => { releaseVisibleList = resolve; });
+      const sessionReady = new Promise<void>((resolve) => { releaseSession = resolve; });
+      const isMainList = (url: URL) => url.pathname === "/api/logs" && url.searchParams.get("limit") !== "1000";
+
+      await page.route((url) => url.pathname === "/api/logs", async (route) => {
+        const url = new URL(route.request().url());
+        if (route.request().method() === "DELETE") {
+          deletedIds = route.request().postDataJSON().ids;
+          return route.fulfill({ json: {} });
+        }
+        // Fallback-chain lookups are independent of the scoped list under test.
+        if (!isMainList(url)) return route.fulfill({ json: listResult([], true) });
+        if (++listRequests === 1) {
+          await firstListReady;
+          return route.fulfill({ json: listResult([], false) });
+        }
+        await visibleListReady;
+        return route.fulfill({ json: listResult(rows.filter((log) => !deletedIds.includes(log.id)), true) });
+      });
+      for (const log of [...rows, { ...row(sessionId), parent_request_id: undefined }]) {
+        await page.route((url) => url.pathname === "/api/logs/" + log.id, (route) => route.fulfill({ json: log }));
+      }
+      await page.route((url) => url.pathname === "/api/logs/sessions/" + sessionId, async (route) => {
+        await sessionReady;
+        await route.fulfill({ json: {
+          session_id: sessionId, logs: rows, count: rows.length, returned_count: rows.length, has_more: false,
+          pagination: { limit: 500, offset: 0, order: "asc" },
+        } });
+      });
+      await page.route((url) => url.pathname === "/api/logs/sessions/" + sessionId + "/summary", (route) =>
+        route.fulfill({ json: { session_id: sessionId, count: 2, total_cost: 0, total_tokens: 0, duration_ms: 0 } }));
+
+      const sheet = logsPage.logDetailSheet;
+      const sessionSort = page.getByTestId("session-details-sort-btn");
+      const emptyState = page.getByRole("heading", { name: "Integrate under 60 seconds", exact: true, includeHidden: true });
+      const settleEmptyList = async () => {
+        const response = page.waitForResponse((candidate) => isMainList(new URL(candidate.url())));
+        releaseFirstList();
+        await (await response).finished();
+        await expect(emptyState).toBeVisible();
+      };
+      try {
+        await page.goto("/workspace/logs?selected_log=" + first.id + "&polling=false&log_more=true");
+        await expect(sheet.getByText(first.id, { exact: true })).toBeVisible();
+        if (emptyBeforeSession) await settleEmptyList();
+
+        await sheet.getByTestId("session-button-view").click();
+        await expect(page).not.toHaveURL(/selected_log=/);
+        await expect(sessionSort).toBeVisible();
+        if (!emptyBeforeSession) {
+          // A delayed first list response must not unmount an already selected session.
+          await settleEmptyList();
+          await expect(sessionSort).toBeVisible();
+        }
+
+        if (emptyBeforeSession) {
+          // Closing a pending session must survive its late result and the real
+          // empty-list poll that makes the main table visible again.
+          await page.keyboard.press("Escape");
+          await expect(sheet).toHaveCount(0);
+          const sessionResponse = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/logs/sessions/" + sessionId);
+          releaseSession();
+          await (await sessionResponse).finished();
+          releaseVisibleList();
+          await expect(logsPage.tableRows).toHaveCount(2, { timeout: 15000 });
+          await expect(sheet).toHaveCount(0);
+          await logsPage.viewLogDetails(0);
+          await sheet.getByTestId("session-button-view").click();
+        } else {
+          releaseSession();
+        }
+
+        // The session action has a useful result: its row opens that record's detail.
+        await expect(sheet.getByRole("cell", { name: next.model, exact: true })).toBeVisible();
+        await sheet.getByRole("cell", { name: next.model, exact: true }).click();
+        await expect(page).toHaveURL(new RegExp("selected_log=" + next.id));
+        await expect(sheet.getByText(next.id, { exact: true })).toBeVisible();
+        await expect(sessionSort).toHaveCount(0);
+
+        if (!emptyBeforeSession) {
+          // Controls owned by the selected card remain usable over the empty-list view.
+          await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+          await sheet.getByTestId("logdetails-copy-request-id-button").click();
+          await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(next.id);
+          await sheet.getByTestId("logdetails-actions-button").click();
+          await page.getByTestId("logdetails-copy-request-body-button").click();
+          await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toContain(next.model);
+          await sheet.getByTestId("logdetails-actions-button").click();
+          const downloaded = page.waitForEvent("download");
+          await page.getByTestId("logdetails-export-log-button").click();
+          const download = await downloaded;
+          expect(download.suggestedFilename()).toBe("log-" + next.id + ".json");
+          const stream = await download.createReadStream();
+          let json = "";
+          for await (const chunk of stream!) json += chunk.toString();
+          expect(JSON.parse(json).id).toBe(next.id);
+          await download.delete();
+          await sheet.getByTestId("logdetails-actions-button").click();
+          await page.getByTestId("logdetails-delete-item").click();
+          await expect(page.getByTestId("logdetails-delete-confirm-button")).toBeVisible();
+          await page.getByTestId("logdetails-delete-cancel-button").click();
+          await expect(sheet.getByText(next.id, { exact: true })).toBeVisible();
+        }
+
+        // Both filter actions leave selection overlays and keep their own URL intent.
+        releaseVisibleList();
+        await sheet.getByRole("button", { name: sessionId, exact: true }).click();
+        await expect(page).toHaveURL(new RegExp("parent_request_id=" + sessionId));
+        await expect(page).not.toHaveURL(/selected_log=/);
+        await expect(sheet).toHaveCount(0);
+        await expect(logsPage.tableRows).toHaveCount(2);
+        await logsPage.viewLogDetails(0);
+        await sheet.getByRole("button", { name: clientSessionId, exact: true }).click();
+        await expect(page).toHaveURL(new RegExp("session_id=" + clientSessionId));
+        await expect(page).not.toHaveURL(/selected_log=/);
+        await expect(sheet).toHaveCount(0);
+        if (!emptyBeforeSession) {
+          await logsPage.viewLogDetails(1);
+          await expect(sheet.getByText(next.id, { exact: true })).toBeVisible();
+          await sheet.getByTestId("logdetails-actions-button").click();
+          await page.getByTestId("logdetails-delete-item").click();
+          await page.getByTestId("logdetails-delete-confirm-button").click();
+          await expect.poll(() => deletedIds).toEqual([next.id]);
+          await expect(sheet).toHaveCount(0);
+          await expect(page).not.toHaveURL(/selected_log=/);
+          await expect(logsPage.tableRows).toHaveCount(1);
+        }
+      } finally {
+        releaseFirstList();
+        releaseVisibleList();
+        releaseSession();
+      }
+    });
+  }
+
+
+  for (const oldResult of ["rows", "empty", "error"] as const) {
+    test("keeps session B data and effects when an old session returns " + oldResult, async ({ page, logsPage, queryObserver }) => {
+      const timestamp = new Date().toISOString();
+      const row = (id: string, parent: string) => ({
+        id, parent_request_id: parent, object: "chat.completion", timestamp, created_at: timestamp,
+        provider: "openai", model: id + "-model", number_of_retries: 0, fallback_index: 0,
+        status: "success", stream: false, latency: 120, cost: 0, input_history: [], responses_input_history: [],
+      });
+      const first = row("synthetic-older-session-log", "synthetic-older-session");
+      const next = row("synthetic-current-session-log", "synthetic-current-session");
+      const sessionResult = (log: typeof first, logs: (typeof first)[]) => ({
+        session_id: log.parent_request_id, logs, count: logs.length, returned_count: logs.length, has_more: false,
+        pagination: { limit: 500, offset: 0, order: "asc" },
+      });
+      let releaseOld!: () => void;
+      let releaseCurrent!: () => void;
+      let releaseSummary!: () => void;
+      const oldReady = new Promise<void>((resolve) => { releaseOld = resolve; });
+      const currentReady = new Promise<void>((resolve) => { releaseCurrent = resolve; });
+      const summaryReady = new Promise<void>((resolve) => { releaseSummary = resolve; });
+      await page.route((url) => url.pathname === "/api/logs", (route) => {
+        const logs = new URL(route.request().url()).searchParams.has("parent_request_id") ? [] : [first, next];
+        return route.fulfill({ json: {
+          logs, has_logs: true, pagination: { limit: 50, offset: 0, sort_by: "timestamp", order: "desc" },
+          stats: { total_requests: logs.length, success_rate: 100, user_facing_success_rate: 100,
+            user_facing_total_requests: logs.length, average_latency: 120, total_tokens: 0,
+            prompt_tokens: 0, completion_tokens: 0, total_cost: 0 },
+        } });
+      });
+      for (const log of [first, next]) {
+        await page.route((url) => url.pathname === "/api/logs/" + log.id, (route) => route.fulfill({ json: log }));
+        await page.route((url) => url.pathname === "/api/logs/" + log.parent_request_id, (route) =>
+          route.fulfill({ json: { ...log, id: log.parent_request_id, parent_request_id: undefined } }));
+      }
+      await page.route((url) => url.pathname === "/api/logs/sessions/" + first.parent_request_id, async (route) => {
+        await oldReady;
+        await route.fulfill({
+          status: oldResult === "error" ? 500 : 200,
+          json: oldResult === "error" ? { error: { message: "Synthetic old session failure" } }
+            : sessionResult(first, oldResult === "empty" ? [] : [first]),
+        });
+      });
+      await page.route((url) => url.pathname === "/api/logs/sessions/" + next.parent_request_id, async (route) => {
+        await currentReady;
+        await route.fulfill({ json: sessionResult(next, [next]) });
+      });
+      await page.route((url) => url.pathname === "/api/logs/sessions/" + first.parent_request_id + "/summary", (route) =>
+        route.fulfill({ json: { session_id: first.parent_request_id, count: 1, total_cost: 12.3456, total_tokens: 789, duration_ms: 0 } }));
+      await page.route((url) => url.pathname === "/api/logs/sessions/" + next.parent_request_id + "/summary", async (route) => {
+        await summaryReady;
+        await route.fulfill({ status: 500, json: { error: { message: "Synthetic current summary failure" } } });
+      });
+
+      const sheet = logsPage.logDetailSheet;
+      try {
+        await page.goto("/workspace/logs?polling=false");
+        await expect(logsPage.tableRows).toHaveCount(2);
+        await logsPage.viewLogDetails(0);
+        await sheet.getByTestId("session-button-view").click();
+        await expect(sheet.getByText("$12.3456", { exact: true })).toBeVisible();
+        await page.keyboard.press("Escape");
+        await expect(sheet).toHaveCount(0);
+        await logsPage.viewLogDetails(1);
+        await sheet.getByTestId("session-button-view").click();
+        await expect(sheet.getByRole("button", { name: next.parent_request_id, exact: true })).toBeVisible();
+        await expect.soft(sheet.getByText("$12.3456", { exact: true })).toHaveCount(0, { timeout: 1000 });
+
+        const summaryResponse = page.waitForResponse((response) =>
+          new URL(response.url()).pathname === "/api/logs/sessions/" + next.parent_request_id + "/summary");
+        releaseSummary();
+        await (await summaryResponse).finished();
+        await expect.soft(sheet.getByText("$12.3456", { exact: true })).toHaveCount(0, { timeout: 1000 });
+
+        if (oldResult !== "error") {
+          releaseCurrent();
+          await expect(sheet.getByRole("cell", { name: next.model, exact: true })).toBeVisible();
+        }
+        const oldRequestId = await queryObserver.capture(first.parent_request_id);
+        releaseOld();
+        expect(await queryObserver.settled(oldRequestId)).toEqual({
+          requestId: oldRequestId, status: oldResult === "error" ? "rejected" : "fulfilled",
+        });
+        // The exact old query has reduced and notified React before checking B or closing it.
+        await expect(sheet).toHaveCount(1);
+        await expect(sheet.getByRole("button", { name: next.parent_request_id, exact: true })).toBeVisible();
+        if (oldResult === "error") {
+          // An obsolete failure/finally must neither report an error nor finish B's loading state.
+          await expect.soft(sheet.getByText("Loading session...", { exact: true })).toBeVisible({ timeout: 1000 });
+          await expect.soft(page.getByText("Synthetic old session failure", { exact: true })).toHaveCount(0, { timeout: 1000 });
+          releaseCurrent();
+        }
+        await expect.soft(sheet.getByRole("cell", { name: next.model, exact: true })).toBeVisible({ timeout: 1000 });
+        await expect.soft(sheet.getByRole("cell", { name: first.model, exact: true })).toHaveCount(0, { timeout: 1000 });
+        await expect(sheet.getByRole("button", { name: next.parent_request_id, exact: true })).toBeVisible();
+        await page.keyboard.press("Escape");
+        await expect(sheet).toHaveCount(0);
+      } finally {
+        releaseOld();
+        releaseCurrent();
+        releaseSummary();
+      }
+    });
+  }
+
+  test("browser Back from a selected session restores only the URL-selected log and close clears it", async ({ page, logsPage }) => {
+    const timestamp = new Date().toISOString();
+    const rows = ["synthetic-back-first", "synthetic-back-next"].map((id) => ({
+      id, parent_request_id: id + "-session", object: "chat.completion", timestamp, created_at: timestamp,
+      provider: "openai", model: id + "-model", number_of_retries: 0, fallback_index: 0,
+      status: "success", stream: false, latency: 120, cost: 0, input_history: [], responses_input_history: [],
+    }));
+    await page.route((url) => url.pathname === "/api/logs", (route) => {
+      const logs = new URL(route.request().url()).searchParams.has("parent_request_id") ? [] : rows;
+      return route.fulfill({ json: {
+        logs, has_logs: true, pagination: { limit: 50, offset: 0, sort_by: "timestamp", order: "desc" },
+        stats: { total_requests: logs.length, success_rate: 100, user_facing_success_rate: 100,
+          user_facing_total_requests: logs.length, average_latency: 120, total_tokens: 0,
+          prompt_tokens: 0, completion_tokens: 0, total_cost: 0 },
+      } });
+    });
+    for (const log of rows) {
+      await page.route((url) => url.pathname === "/api/logs/" + log.id, (route) => route.fulfill({ json: log }));
+      await page.route((url) => url.pathname === "/api/logs/" + log.parent_request_id, (route) =>
+        route.fulfill({ json: { ...log, id: log.parent_request_id, parent_request_id: undefined } }));
+      await page.route((url) => url.pathname === "/api/logs/sessions/" + log.parent_request_id, (route) =>
+        route.fulfill({ json: { session_id: log.parent_request_id, logs: [log], count: 1, returned_count: 1, has_more: false,
+          pagination: { limit: 500, offset: 0, order: "asc" } } }));
+      await page.route((url) => url.pathname === "/api/logs/sessions/" + log.parent_request_id + "/summary", (route) =>
+        route.fulfill({ json: { session_id: log.parent_request_id, count: 1, total_cost: 0, total_tokens: 0, duration_ms: 0 } }));
+    }
+
+    const sheet = logsPage.logDetailSheet;
+    await page.goto("/workspace/logs?polling=false");
+    await expect(logsPage.tableRows).toHaveCount(2);
+    await logsPage.viewLogDetails(0);
+    await expect(sheet.getByText(rows[0].id, { exact: true })).toBeVisible();
+    await sheet.getByRole("button", { name: "Next log", exact: true }).click();
+    await expect(page).toHaveURL(new RegExp("selected_log=" + rows[1].id));
+    await sheet.getByTestId("session-button-view").click();
+    await expect(sheet.getByRole("cell", { name: rows[1].model, exact: true })).toBeVisible();
+    await page.goBack();
+    await expect(page).toHaveURL(new RegExp("selected_log=" + rows[0].id));
+    await expect(sheet.getByText(rows[0].id, { exact: true })).toBeVisible();
+    await expect.soft(sheet).toHaveCount(1, { timeout: 1000 });
+    await expect.soft(page.getByTestId("session-details-sort-btn")).toHaveCount(0, { timeout: 1000 });
+    await page.getByTestId("logdetails-close-button").click();
+    await expect(page).not.toHaveURL(/selected_log=/);
+    await expect(sheet).toHaveCount(0);
+  });
+
+
+  test("keeps session pagination, retry and sort useful and reopens a settled list from its first page", async ({ page, logsPage }) => {
+    const sessionId = "synthetic-paged-session";
+    const started = Date.now();
+    const rows = Array.from({ length: 501 }, (_, index) => ({
+      id: "synthetic-paged-" + String(index).padStart(3, "0"), parent_request_id: sessionId,
+      object: "chat.completion", timestamp: new Date(started + index * 1000).toISOString(),
+      created_at: new Date(started + index * 1000).toISOString(), provider: "openai",
+      model: "synthetic-paged-model-" + index, number_of_retries: 0, fallback_index: 0,
+      status: "success", stream: false, latency: 120, cost: 0, input_history: [], responses_input_history: [],
+    }));
+    const calls: { offset: number; order: string; limit: number }[] = [];
+    let nextPageFails = true;
+    let firstPage: "rows" | "empty" | "error" = "rows";
+    let releaseDescending!: () => void;
+    const descendingReady = new Promise<void>((resolve) => { releaseDescending = resolve; });
+    await page.route((url) => url.pathname === "/api/logs", (route) => {
+      const logs = new URL(route.request().url()).searchParams.has("parent_request_id") ? [] : [rows[0]];
+      return route.fulfill({ json: {
+        logs, has_logs: true, pagination: { limit: 50, offset: 0, sort_by: "timestamp", order: "desc" },
+        stats: { total_requests: logs.length, success_rate: 100, user_facing_success_rate: 100,
+          user_facing_total_requests: logs.length, average_latency: 120, total_tokens: 0,
+          prompt_tokens: 0, completion_tokens: 0, total_cost: 0 },
+      } });
+    });
+    for (const id of [rows[0].id, sessionId]) {
+      await page.route((url) => url.pathname === "/api/logs/" + id, (route) =>
+        route.fulfill({ json: { ...rows[0], id, ...(id === sessionId ? { parent_request_id: undefined } : {}) } }));
+    }
+    await page.route((url) => url.pathname === "/api/logs/sessions/" + sessionId, async (route) => {
+      const params = new URL(route.request().url()).searchParams;
+      const offset = Number(params.get("offset"));
+      const limit = Number(params.get("limit"));
+      const order = params.get("order") || "asc";
+      calls.push({ offset, order, limit });
+      if (order === "desc") await descendingReady;
+      if ((offset > 0 && nextPageFails) || firstPage === "error") {
+        nextPageFails = false;
+        return route.fulfill({ status: 500, json: { error: { message: "Synthetic selected session page failure" } } });
+      }
+      const ordered = order === "asc" ? rows : [...rows].reverse();
+      const logs = firstPage === "empty" ? [] : ordered.slice(offset, offset + limit);
+      return route.fulfill({ json: {
+        session_id: sessionId, logs, count: firstPage === "empty" ? 0 : rows.length, returned_count: logs.length,
+        has_more: firstPage !== "empty" && offset + logs.length < rows.length,
+        pagination: { limit, offset, order },
+      } });
+    });
+    await page.route((url) => url.pathname === "/api/logs/sessions/" + sessionId + "/summary", (route) =>
+      route.fulfill({ json: { session_id: sessionId, count: rows.length, total_cost: 0, total_tokens: 0, duration_ms: 0 } }));
+    const sheet = logsPage.logDetailSheet;
+    const tableRows = sheet.locator("tbody tr");
+    const openSession = async () => {
+      await logsPage.viewLogDetails(0);
+      await sheet.getByTestId("session-button-view").click();
+    };
+    try {
+      await page.goto("/workspace/logs?polling=false");
+      await expect(logsPage.tableRows).toHaveCount(1);
+      await openSession();
+      await expect(tableRows).toHaveCount(500);
+      const loadMore = sheet.getByTestId("session-details-load-more-btn");
+      await loadMore.click();
+      await expect(page.getByText("Synthetic selected session page failure", { exact: true })).toBeVisible();
+      await expect(tableRows).toHaveCount(500);
+      await expect(loadMore).toBeEnabled();
+      await loadMore.click();
+      await expect(tableRows).toHaveCount(501);
+      await expect(loadMore).toHaveCount(0);
+      expect(calls.slice(0, 3)).toEqual([
+        { offset: 0, order: "asc", limit: 500 },
+        { offset: 500, order: "asc", limit: 500 },
+        { offset: 500, order: "asc", limit: 500 },
+      ]);
+
+      const sortControl = sheet.getByTestId("session-details-sort-btn");
+      const dialogBeforeSort = await sheet.elementHandle();
+      for (let tabs = 0; tabs < 4 && !await sortControl.evaluate((control) => control === document.activeElement); tabs++) {
+        await page.keyboard.press("Tab");
+      }
+      await expect(sortControl).toBeFocused();
+      await page.keyboard.press("Enter");
+      await expect(sheet.getByText("Loading session...", { exact: true })).toBeVisible();
+      // Sorting has committed; keyboard focus and the existing dialog must survive it.
+      await expect(sortControl).toBeFocused();
+      expect(await dialogBeforeSort!.evaluate((dialog) => dialog.isConnected)).toBe(true);
+      await expect(sheet.getByRole("cell", { name: rows[0].model, exact: true })).toHaveCount(0);
+      releaseDescending();
+      await expect(tableRows).toHaveCount(500);
+      await expect(tableRows.first().getByRole("cell").last()).toHaveText(rows[500].model);
+      // Target the panel directly; keyboard traversal can leave a session-ID tooltip above it.
+      await page.locator('[data-slot="sheet-overlay"]').click({ position: { x: 10, y: 10 } });
+      await expect(sheet).toHaveCount(0);
+      const beforeReopen = calls.length;
+      await openSession();
+      await expect(tableRows).toHaveCount(500);
+      expect(calls.slice(beforeReopen)).toEqual([{ offset: 0, order: "desc", limit: 500 }]);
+
+      await page.keyboard.press("Escape");
+      await expect(sheet).toHaveCount(0);
+      firstPage = "empty";
+      const emptyResponse = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/logs/sessions/" + sessionId);
+      await openSession();
+      await (await emptyResponse).finished();
+      await expect(sheet).toHaveCount(0);
+
+      firstPage = "error";
+      await openSession();
+      await expect(sheet.getByRole("button", { name: sessionId, exact: true })).toBeVisible();
+      await expect(sheet.getByText("No logs found for this session.", { exact: true })).toBeVisible();
+      await expect(page.getByText("Synthetic selected session page failure", { exact: true }).last()).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(sheet).toHaveCount(0);
+    } finally {
+      releaseDescending();
+    }
+  });
+  for (const pageSize of [500, 50]) {
+    test(pageSize === 500
+      ? "refreshes the first page when reopening with Load more still pending"
+      : "advances a short session page by returned_count instead of the requested limit",
+    async ({ page, logsPage, queryObserver }) => {
+      const sessionId = "synthetic-session-lifecycle-" + pageSize;
+      const started = Date.now();
+      const rows = Array.from({ length: pageSize + 1 }, (_, index) => ({
+        id: sessionId + "-log-" + index, parent_request_id: sessionId,
+        object: "chat.completion", timestamp: new Date(started + index * 1000).toISOString(),
+        created_at: new Date(started + index * 1000).toISOString(), provider: "openai",
+        model: "synthetic-original-page-" + index, number_of_retries: 0, fallback_index: 0,
+        status: "success", stream: false, latency: 120, cost: 0, input_history: [], responses_input_history: [],
+      }));
+      const calls: { offset: number; limit: number; order: string }[] = [];
+      let firstPages = 0;
+      let nextPages = 0;
+      let releaseOldPage!: () => void;
+      let markOldPageStarted!: () => void;
+      const oldPageReady = new Promise<void>((resolve) => { releaseOldPage = resolve; });
+      const oldPageStarted = new Promise<void>((resolve) => { markOldPageStarted = resolve; });
+      await page.route((url) => url.pathname === "/api/logs", (route) => {
+        const logs = new URL(route.request().url()).searchParams.has("parent_request_id") ? [] : [rows[0]];
+        return route.fulfill({ json: {
+          logs, has_logs: true, pagination: { limit: 50, offset: 0, sort_by: "timestamp", order: "desc" },
+          stats: { total_requests: logs.length, success_rate: 100, user_facing_success_rate: 100,
+            user_facing_total_requests: logs.length, average_latency: 120, total_tokens: 0,
+            prompt_tokens: 0, completion_tokens: 0, total_cost: 0 },
+        } });
+      });
+      for (const id of [rows[0].id, sessionId]) {
+        await page.route((url) => url.pathname === "/api/logs/" + id, (route) =>
+          route.fulfill({ json: { ...rows[0], id, ...(id === sessionId ? { parent_request_id: undefined } : {}) } }));
+      }
+      await page.route((url) => url.pathname === "/api/logs/sessions/" + sessionId, async (route) => {
+        const params = new URL(route.request().url()).searchParams;
+        const offset = Number(params.get("offset"));
+        const limit = Number(params.get("limit"));
+        const order = params.get("order") || "";
+        expect([...params.keys()].sort()).toEqual(["limit", "offset", "order"]);
+        calls.push({ offset, limit, order });
+        if (offset === 0) firstPages++;
+        const fresh = firstPages > 1;
+        if (offset > 0 && ++nextPages === 1 && pageSize === 500) {
+          markOldPageStarted();
+          await oldPageReady;
+        }
+        const logs = rows.slice(offset, offset + pageSize).map((row, index) => ({
+          ...row, model: fresh ? "synthetic-fresh-page-" + (offset + index) : row.model,
+        }));
+        await route.fulfill({ json: {
+          session_id: sessionId, logs, count: rows.length, returned_count: logs.length,
+          has_more: offset + logs.length < rows.length, pagination: { limit, offset, order },
+        } });
+      });
+      await page.route((url) => url.pathname === "/api/logs/sessions/" + sessionId + "/summary", (route) =>
+        route.fulfill({ json: { session_id: sessionId, count: rows.length, total_cost: 0, total_tokens: 0, duration_ms: 0 } }));
+      const sheet = logsPage.logDetailSheet;
+      const tableRows = sheet.locator("tbody tr");
+      const loadMore = sheet.getByTestId("session-details-load-more-btn");
+      const openSession = async () => {
+        await logsPage.viewLogDetails(0);
+        await sheet.getByTestId("session-button-view").click();
+      };
+      try {
+        await page.goto("/workspace/logs?polling=false");
+        await expect(logsPage.tableRows).toHaveCount(1);
+        await openSession();
+        await expect(tableRows).toHaveCount(pageSize);
+        await loadMore.click();
+        if (pageSize === 500) {
+          await oldPageStarted;
+          const oldRequestId = await queryObserver.capture(sessionId);
+          await page.keyboard.press("Escape");
+          await expect(sheet).toHaveCount(0);
+          await openSession();
+          // The old next-page request is still held: reopening must issue offset0 now.
+          await expect(tableRows.first().getByRole("cell").last()).toHaveText("synthetic-fresh-page-0");
+          expect(calls).toEqual([
+            { offset: 0, limit: 500, order: "asc" },
+            { offset: 500, limit: 500, order: "asc" },
+            { offset: 0, limit: 500, order: "asc" },
+          ]);
+          releaseOldPage();
+          expect(await queryObserver.settled(oldRequestId)).toEqual({ requestId: oldRequestId, status: "fulfilled" });
+          await expect(tableRows).toHaveCount(500);
+          await expect(tableRows.first().getByRole("cell").last()).toHaveText("synthetic-fresh-page-0");
+          await expect(sheet.getByRole("cell", { name: rows[500].model, exact: true })).toHaveCount(0);
+          await expect(loadMore).toBeEnabled();
+          await loadMore.click();
+        }
+        await expect(tableRows).toHaveCount(pageSize + 1);
+        await expect(loadMore).toHaveCount(0);
+        expect(calls).toEqual((pageSize === 500 ? [0, 500, 0, 500] : [0, 50]).map((offset) => ({
+          offset, limit: 500, order: "asc",
+        })));
+        await page.keyboard.press("Escape");
+        await expect(sheet).toHaveCount(0);
+      } finally {
+        releaseOldPage();
+      }
+    });
+  }
+
 });
 
 test.describe("LLM Logs columns", () => {
