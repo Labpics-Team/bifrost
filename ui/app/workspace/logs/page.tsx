@@ -1046,26 +1046,6 @@ export default function LogsPage() {
 						</div>
 					</div>
 
-					{/* Log Detail Sheet */}
-					<LogDetailSheet
-						logId={selectedLogId}
-						log={selectedLogFromData}
-						open={selectedLogId !== null}
-						onOpenChange={(open) => !open && setUrlState({ selected_log: "" })}
-						handleDelete={hasDeleteAccess ? handleDelete : undefined}
-						canReveal={hasRevealAccess}
-						onNavigate={handleLogNavigate}
-						hasPrev={selectedLogIndex > 0 || (selectedLogIndex !== -1 && pagination.offset > 0)}
-						hasNext={selectedLogIndex !== -1 && (selectedLogIndex < logs.length - 1 || pagination.offset + pagination.limit < totalItems)}
-						onFilterByParentRequestId={handleFilterByParentRequestId}
-						onFilterBySessionId={handleFilterBySessionId}
-						onOpenLog={(logId) => setUrlState({ selected_log: logId })}
-						onViewSession={(sessionId, logId) => {
-							setUrlState({ selected_log: "" }, { history: "replace" });
-							setSessionHighlightedLogId(logId);
-							setSelectedSessionId(sessionId);
-						}}
-					/>
 					<SessionDetailsSheet
 						sessionId={selectedSessionId}
 						highlightedLogId={sessionHighlightedLogId}
@@ -1079,6 +1059,26 @@ export default function LogsPage() {
 					/>
 				</div>
 			)}
+			{/* A URL-selected detail stays available when the scoped list is empty. */}
+			<LogDetailSheet
+				logId={selectedLogId}
+				log={selectedLogFromData}
+				open={selectedLogId !== null}
+				onOpenChange={(open) => !open && setUrlState({ selected_log: "" })}
+				handleDelete={hasDeleteAccess ? handleDelete : undefined}
+				canReveal={hasRevealAccess}
+				onNavigate={handleLogNavigate}
+				hasPrev={selectedLogIndex > 0 || (selectedLogIndex !== -1 && pagination.offset > 0)}
+				hasNext={selectedLogIndex !== -1 && (selectedLogIndex < logs.length - 1 || pagination.offset + pagination.limit < totalItems)}
+				onFilterByParentRequestId={handleFilterByParentRequestId}
+				onFilterBySessionId={handleFilterBySessionId}
+				onOpenLog={(logId) => setUrlState({ selected_log: logId })}
+				onViewSession={(sessionId, logId) => {
+					setUrlState({ selected_log: "" }, { history: "replace" });
+					setSessionHighlightedLogId(logId);
+					setSelectedSessionId(sessionId);
+				}}
+			/>
 		</div>
 	);
 }

@@ -1764,6 +1764,95 @@ test.describe("LLM log detail identity", () => {
       });
     }
   }
+  test("keeps the selected detail independent of an empty scoped list and ignores a late error after close", async ({ page, logsPage }) => {
+    const missingId = "synthetic-missing-after-retention";
+    const closedId = "synthetic-missing-closed-pending";
+    const message = "Synthetic selected log not found";
+    let releaseList!: () => void;
+    let releaseMissing!: () => void;
+    let releaseClosed!: () => void;
+    const listReady = new Promise<void>((resolve) => { releaseList = resolve; });
+    const missingReady = new Promise<void>((resolve) => { releaseMissing = resolve; });
+    const closedReady = new Promise<void>((resolve) => { releaseClosed = resolve; });
+
+    await page.route((url) => url.pathname === "/api/logs", async (route) => {
+      await listReady;
+      await route.fulfill({ json: {
+        logs: [],
+        pagination: { limit: 50, offset: 0, sort_by: "timestamp", order: "desc" },
+        stats: {
+          total_requests: 0,
+          success_rate: 0,
+          user_facing_success_rate: 0,
+          user_facing_total_requests: 0,
+          average_latency: 0,
+          total_tokens: 0,
+          prompt_tokens: 0,
+          completion_tokens: 0,
+          total_cost: 0,
+        },
+        has_logs: false,
+      } });
+    });
+    await page.route((url) => url.pathname === `/api/logs/${missingId}`, async (route) => {
+      await missingReady;
+      await route.fulfill({ status: 404, json: { error: { message } } });
+    });
+    await page.route((url) => url.pathname === `/api/logs/${closedId}`, async (route) => {
+      await closedReady;
+      await route.fulfill({ status: 404, json: { error: { message } } });
+    });
+
+    const sheet = logsPage.logDetailSheet;
+    const emptyState = page.getByRole("heading", { name: "Integrate under 60 seconds", exact: true, includeHidden: true });
+    try {
+      await page.goto(`/workspace/logs?selected_log=${missingId}`);
+      await expect(sheet.getByText(missingId, { exact: true })).toBeVisible();
+      await expect(sheet.getByRole("heading", { name: "Loading log details", exact: true })).toBeVisible();
+
+      // has_logs=false means no visible scoped records, rather than an empty result page.
+      const emptyList = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/logs");
+      releaseList();
+      await (await emptyList).finished();
+      await expect(emptyState).toBeVisible();
+      await expect.soft(sheet.getByText(missingId, { exact: true })).toBeVisible();
+
+      const missingResponse = page.waitForResponse((response) => new URL(response.url()).pathname === `/api/logs/${missingId}`);
+      releaseMissing();
+      await (await missingResponse).finished();
+      await expect(page).toHaveURL(new RegExp(`selected_log=${missingId}`));
+      await expect(sheet.getByRole("alert")).toHaveText(message);
+      await expect(sheet.getByText(missingId, { exact: true })).toBeVisible();
+      await sheet.getByRole("button", { name: "Close", exact: true }).click();
+      await expect(page).not.toHaveURL(/selected_log=/);
+      await expect(sheet).toHaveCount(0);
+      await expect(emptyState).toBeVisible();
+
+      // Closing during a second lookup must keep the selection cleared when its 404 arrives later.
+      const closedRequest = page.waitForRequest((request) => new URL(request.url()).pathname === `/api/logs/${closedId}`);
+      await page.goto(`/workspace/logs?selected_log=${closedId}`);
+      await closedRequest;
+      await expect(emptyState).toBeVisible();
+      await expect(sheet.getByText(closedId, { exact: true })).toBeVisible();
+      await expect(sheet.getByRole("heading", { name: "Loading log details", exact: true })).toBeVisible();
+      await sheet.getByRole("button", { name: "Close", exact: true }).click();
+      await expect(page).not.toHaveURL(/selected_log=/);
+      await expect(sheet).toHaveCount(0);
+
+      const closedResponse = page.waitForResponse((response) => new URL(response.url()).pathname === `/api/logs/${closedId}`);
+      releaseClosed();
+      await (await closedResponse).finished();
+      await expect(page).not.toHaveURL(/selected_log=/);
+      await expect(sheet).toHaveCount(0);
+      await expect(page.getByRole("alert")).toHaveCount(0);
+      await expect(emptyState).toBeVisible();
+    } finally {
+      releaseList();
+      releaseMissing();
+      releaseClosed();
+    }
+  });
+
 });
 
 test.describe("LLM Logs columns", () => {
