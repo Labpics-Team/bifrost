@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -23,7 +24,10 @@ func TestRoutingModelsHTTPAdmission(t *testing.T) {
 	log := bifrost.NewNoOpLogger()
 	SetLogger(log)
 	handlers.SetLogger(log)
-	config := &lib.Config{ClientConfig: &configstore.ClientConfig{}}
+	store, err := configstore.NewConfigStore(context.Background(), &configstore.Config{Enabled: true, Type: configstore.ConfigStoreTypeSQLite, Config: &configstore.SQLiteConfig{Path: filepath.Join(t.TempDir(), "config.db")}}, log)
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close(context.Background()) })
+	config := &lib.Config{ClientConfig: &configstore.ClientConfig{}, ConfigStore: store}
 	newKey := func(id string) tables.TableVirtualKey {
 		return tables.TableVirtualKey{ID: id, Name: id, Value: *schemas.NewSecretVar("sk-bf-" + id), IsActive: bifrost.Ptr(true), ProviderConfigs: []tables.TableVirtualKeyProviderConfig{{Provider: "openai", AllowedModels: schemas.WhiteList{"*"}, AllowAllKeys: true}}}
 	}
@@ -49,12 +53,10 @@ func TestRoutingModelsHTTPAdmission(t *testing.T) {
 	}, nil, nil, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, gov.Cleanup()) })
-	routes, err := routing.Init(context.Background(), nil, log, nil, gov)
+	routes, err := routing.Init(context.Background(), nil, log, store, gov)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, routes.Cleanup()) })
-	for _, name := range []string{"B", "A"} {
-		require.NoError(t, routes.GetRuleStore().UpsertRule(context.Background(), &tables.TableRoutingRule{ID: name, Scope: "global", CelExpression: `model == "` + name + `"`, Targets: []tables.TableRoutingTarget{{Provider: bifrost.Ptr("openai"), Model: bifrost.Ptr("physical"), Weight: 1}}}))
-	}
+	require.NoError(t, routes.GetRuleStore().UpsertRule(context.Background(), &tables.TableRoutingRule{ID: "B", Scope: "global", CelExpression: `model == "B"`, Targets: []tables.TableRoutingTarget{{Provider: bifrost.Ptr("openai"), Model: bifrost.Ptr("physical"), Weight: 1}}}))
 	// The same HTTP catalog must exclude declarations that are not public
 	// terminal names and targets the caller cannot access.
 	for _, rule := range []tables.TableRoutingRule{
@@ -84,7 +86,25 @@ func TestRoutingModelsHTTPAdmission(t *testing.T) {
 		httpRouter.Handler(ctx)
 		return ctx.Response.StatusCode(), append([]byte(nil), ctx.Response.Body()...)
 	}
-	status, body := read("sk-bf-active", "?page_size=1", true)
+	// A rule persisted by the management HTTP API must become visible to the
+	// already-running catalog immediately, with no plugin restart or direct seeding.
+	management, err := handlers.NewRoutingHandler(s, store)
+	require.NoError(t, err)
+	management.RegisterRoutes(httpRouter)
+	status, body := read("sk-bf-active", "", true)
+	require.Equal(t, 200, status, string(body))
+	var before schemas.BifrostListModelsResponse
+	require.NoError(t, json.Unmarshal(body, &before))
+	require.Equal(t, []schemas.Model{{ID: "B"}}, before.Data)
+	create := &fasthttp.RequestCtx{}
+	create.Init(&fasthttp.Request{}, nil, nil)
+	create.Request.Header.SetMethod("POST")
+	create.Request.Header.SetContentType("application/json")
+	create.Request.SetRequestURI("/api/routing/rules")
+	create.Request.SetBodyString(`{"name":"catalog A","cel_expression":"model == \"A\"","targets":[{"provider":"openai","model":"physical","weight":1}]}`)
+	httpRouter.Handler(create)
+	require.Equal(t, 200, create.Response.StatusCode(), string(create.Response.Body()))
+	status, body = read("sk-bf-active", "?page_size=1", true)
 	require.Equal(t, 200, status, string(body))
 	var result schemas.BifrostListModelsResponse
 	require.NoError(t, json.Unmarshal(body, &result))
