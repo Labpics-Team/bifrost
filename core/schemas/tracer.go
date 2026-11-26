@@ -109,6 +109,8 @@ type Tracer interface {
 	// DeferTraceCompletion marks a trace as still being written by a worker, so the
 	// transport skips completing it.
 	DeferTraceCompletion(traceID string)
+	// IsTraceCompletionDeferred reports whether a worker already owns completion.
+	IsTraceCompletionDeferred(traceID string) bool
 	// ClearTraceCompletionDeferral drops the marker once the worker has completed it.
 	ClearTraceCompletionDeferral(traceID string)
 	// AwaitTransportHandoff blocks until the transport has attached its own logs.
@@ -286,6 +288,9 @@ func (n *NoOpTracer) StoreDeferredSpan(_ string, _ SpanHandle) {}
 
 // DeferTraceCompletion is a no-op.
 func (n *NoOpTracer) DeferTraceCompletion(_ string) {}
+
+// IsTraceCompletionDeferred is always false for a no-op tracer.
+func (n *NoOpTracer) IsTraceCompletionDeferred(_ string) bool { return false }
 
 // ClearTraceCompletionDeferral is a no-op.
 func (n *NoOpTracer) ClearTraceCompletionDeferral(_ string) {}

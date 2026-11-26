@@ -114,18 +114,33 @@ func (m *ChannelMessage) claimDelivery() bool {
 // message and may release it (and nil its fields) concurrently, so everything the
 // abandon needs is read before the swap.
 func (m *ChannelMessage) abandonDelivery() bool {
-	ctx := m.Context
-	if !m.handoff.CompareAndSwap(handoffOpen, handoffAbandoned) {
+	if m.handoff.Load() != handoffOpen {
 		return false
 	}
-	// The worker still writes response attributes and plugin logs, so the transport
-	// must not flush the trace yet. Set on the CAS so every abandonment marks it.
+	ctx := m.Context
+	var tracer schemas.Tracer
+	var traceID string
+	ownedDeferral := false
+	// Each inference owns its internal trace; this caller is its sole registrar.
+	// Install the deferral before publishing abandonment: the worker can finish
+	// and export as soon as it observes the CAS. Preserve an existing deferral.
 	if ctx != nil {
-		if tracer, traceID, err := GetTracerFromContext(ctx); err == nil {
+		var err error
+		tracer, traceID, err = GetTracerFromContext(ctx)
+		if err == nil && !tracer.IsTraceCompletionDeferred(traceID) {
 			tracer.DeferTraceCompletion(traceID)
+			ownedDeferral = true
 		}
 	}
-	return true
+	if m.handoff.CompareAndSwap(handoffOpen, handoffAbandoned) {
+		return true
+	}
+	// Delivery won while the deferral was being installed. The caller will
+	// receive and finish normally, so undo only the marker installed here.
+	if ownedDeferral {
+		tracer.ClearTraceCompletionDeferral(traceID)
+	}
+	return false
 }
 
 // Bifrost manages providers and maintains specified open channels for concurrent processing.

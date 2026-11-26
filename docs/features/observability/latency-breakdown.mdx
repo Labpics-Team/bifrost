@@ -189,13 +189,21 @@ A streamed response is accounted for differently, because most of its time is sp
 
 ## Cancelled requests
 
+Before publishing abandonment, the caller marks the trace as deferred. If the
+worker claims delivery during that setup, the caller removes only the deferral
+it created and receives the claimed result. An existing deferral is preserved.
+
 A caller can stop waiting before the provider finishes recording its cancelled
 attempt. When a worker owns this abandoned request, it refreshes the final
-upstream and streaming totals after the provider finishes and the transport
-hands off, before exporting the deferred trace. The caller's earlier snapshot
+upstream and streaming totals after the provider finishes and the existing
+transport-handoff wait completes, before exporting the deferred trace. The
+caller's earlier snapshot
 must not turn late upstream time into gateway overhead or drop late parse,
 conversion, and backpressure measurements. Refreshing replaces the snapshot;
 it does not add the same time twice.
+
+The existing five-second handoff budget still applies if a transport never
+signals completion. These accounting updates do not extend that wait.
 
 This corrects timing attribution in newly completed traces. It does not shorten
 the provider call or rewrite previously stored logs.

@@ -1105,3 +1105,187 @@ func TestCancelledRequestExportsLateProviderTime(t *testing.T) {
 		t.Errorf("cancelled request exported upstream = %v ms, want 149", got)
 	}
 }
+
+type abandonmentTrace struct {
+	*abandonedTimingSnapshotTracer
+	deferred     atomic.Bool
+	beforeDefer  func()
+	waitEntered  chan struct{}
+	handoff      chan struct{}
+	logs         atomic.Int64
+	exportedLogs atomic.Int64
+}
+
+func (r *abandonmentTrace) DeferTraceCompletion(traceID string) {
+	if r.beforeDefer != nil {
+		r.beforeDefer()
+	}
+	r.deferred.Store(true)
+	r.recordingTracer.DeferTraceCompletion(traceID)
+}
+
+func (r *abandonmentTrace) IsTraceCompletionDeferred(_ string) bool {
+	return r.deferred.Load()
+}
+
+func (r *abandonmentTrace) ClearTraceCompletionDeferral(traceID string) {
+	r.deferred.Store(false)
+	r.recordingTracer.ClearTraceCompletionDeferral(traceID)
+}
+
+func (r *abandonmentTrace) AwaitTransportHandoff(_ string) {
+	if r.deferred.Load() {
+		close(r.waitEntered)
+		<-r.handoff
+	}
+}
+
+func (r *abandonmentTrace) AttachPluginLogs(_ string, logs []schemas.PluginLogEntry) {
+	r.logs.Add(int64(len(logs)))
+}
+
+func (r *abandonmentTrace) CompleteAndFlushTrace(traceID string) {
+	r.exportedLogs.Store(r.logs.Load())
+	r.abandonedTimingSnapshotTracer.CompleteAndFlushTrace(traceID)
+}
+
+func TestChannelMessageAbandonTraceOwnership(t *testing.T) {
+	newMessage := func(t *testing.T) (*ChannelMessage, *abandonmentTrace) {
+		t.Helper()
+		tracer := &abandonmentTrace{
+			abandonedTimingSnapshotTracer: &abandonedTimingSnapshotTracer{recordingTracer: newRecordingTracer()},
+			waitEntered:                   make(chan struct{}),
+			handoff:                       make(chan struct{}),
+		}
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		t.Cleanup(ctx.Cancel)
+		ctx.SetValue(schemas.BifrostContextKeyTracer, tracer)
+		ctx.SetValue(schemas.BifrostContextKeyTraceID, tracer.CreateTrace(""))
+		return &ChannelMessage{Context: ctx}, tracer
+	}
+
+	t.Run("worker claims while deferral is being installed", func(t *testing.T) {
+		message, tracer := newMessage(t)
+		entered, unblock := make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		release := func() { once.Do(func() { close(unblock) }) }
+		t.Cleanup(release)
+		tracer.beforeDefer = func() {
+			close(entered)
+			<-unblock
+		}
+		abandoned := make(chan bool, 1)
+		go func() { abandoned <- message.abandonDelivery() }()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("caller never reached trace deferral")
+		}
+		// Without the deferral the worker must still be able to claim, rather
+		// than export a trace that the transport is still writing.
+		claimed := message.claimDelivery()
+		release()
+		select {
+		case got := <-abandoned:
+			if got || !claimed {
+				t.Errorf("ownership: abandoned=%v claimed=%v, want false/true", got, claimed)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("caller did not finish after trace deferral")
+		}
+		if tracer.IsTraceCompletionDeferred("") {
+			t.Error("losing abandonment left a deferral that suppresses normal transport export")
+		}
+		if got := tracer.cleared.Load(); got != 1 {
+			t.Errorf("cleared %d deferrals, want the one installed by the losing caller", got)
+		}
+	})
+
+	t.Run("abandoned worker waits for transport metadata", func(t *testing.T) {
+		message, tracer := newMessage(t)
+		if !message.abandonDelivery() || message.claimDelivery() {
+			t.Fatal("caller did not retain abandonment ownership")
+		}
+		var once sync.Once
+		release := func() { once.Do(func() { close(tracer.handoff) }) }
+		t.Cleanup(release)
+		done := make(chan struct{})
+		go func() {
+			(&Bifrost{}).completeAbandonedTrace(message.Context)
+			close(done)
+		}()
+		select {
+		case <-tracer.waitEntered:
+		case <-done:
+			t.Fatal("worker exported before transport handoff")
+		case <-time.After(5 * time.Second):
+			t.Fatal("worker did not wait for transport handoff")
+		}
+		if got := tracer.completed.Load(); got != 0 {
+			t.Fatalf("exported %d traces before transport metadata", got)
+		}
+		traceID, _ := message.Context.Value(schemas.BifrostContextKeyTraceID).(string)
+		tracer.SetAttribute("root-span", schemas.AttrHTTPResponseStatusCode, 499)
+		tracer.AttachPluginLogs(traceID, []schemas.PluginLogEntry{{PluginName: "transport", Message: "request cancelled"}})
+		release()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("worker did not finish after transport handoff")
+		}
+		if got := tracer.snapshot[schemas.AttrHTTPResponseStatusCode]; got != 499 {
+			t.Errorf("exported HTTP status=%v, want 499", got)
+		}
+		if got := tracer.exportedLogs.Load(); got != 1 {
+			t.Errorf("exported %d transport logs, want 1", got)
+		}
+		if tracer.IsTraceCompletionDeferred(traceID) || tracer.completed.Load() != 1 {
+			t.Error("abandoned trace did not finish exactly once with its deferral cleared")
+		}
+	})
+
+	t.Run("claimed delivery preserves an existing deferral", func(t *testing.T) {
+		message, tracer := newMessage(t)
+		tracer.deferred.Store(true)
+		if !message.claimDelivery() || message.abandonDelivery() {
+			t.Fatal("worker did not retain delivery ownership")
+		}
+		if !tracer.IsTraceCompletionDeferred("") || tracer.cleared.Load() != 0 {
+			t.Error("losing caller cleared a deferral it did not install")
+		}
+	})
+}
+
+func BenchmarkChannelMessageTraceHandoff(b *testing.B) {
+	for _, path := range []string{"normal", "abandoned", "claimed"} {
+		b.Run(path, func(b *testing.B) {
+			tracer := newRecordingTracer()
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			defer ctx.Cancel()
+			ctx.SetValue(schemas.BifrostContextKeyTracer, tracer)
+			ctx.SetValue(schemas.BifrostContextKeyTraceID, tracer.CreateTrace(""))
+			message := &ChannelMessage{Context: ctx}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				switch path {
+				case "normal":
+					message.handoff.Store(handoffOpen)
+					if !message.claimDelivery() {
+						b.Fatal("delivery was not claimed")
+					}
+				case "abandoned":
+					message.handoff.Store(handoffOpen)
+					if !message.abandonDelivery() {
+						b.Fatal("delivery was not abandoned")
+					}
+				case "claimed":
+					message.handoff.Store(handoffClaimed)
+					if message.abandonDelivery() {
+						b.Fatal("claimed delivery was abandoned")
+					}
+				}
+			}
+		})
+	}
+}
