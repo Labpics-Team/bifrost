@@ -12,11 +12,21 @@ var ErrAlreadyExists = errors.New("already exists")
 // ErrAuthConfigChanged means the policy used to verify a sign-in no longer applies.
 var ErrAuthConfigChanged = errors.New("authentication settings changed during sign-in")
 
+// ErrFolderHasHiddenPrompts is returned when a folder delete would cascade to prompts the caller's
+// row-visibility scope hides.
+var ErrFolderHasHiddenPrompts = errors.New("folder contains prompts you cannot access")
+
 // ErrRoutingRulePriorityTaken is returned when a routing rule's priority is already used by another
 // rule in the same scope and scope ID. It wraps ErrAlreadyExists and reads the same, so callers that
 // only ask whether something already exists are unaffected; callers that advise changing the
 // priority check for it, since a duplicate name surfaces as ErrAlreadyExists too.
 var ErrRoutingRulePriorityTaken = fmt.Errorf("%w", ErrAlreadyExists)
+
+// ErrDatasheetPricingClaimTaken is returned when a datasheet override's pricing
+// patch targets a pricing row another override already patches (for example
+// bedrock and bedrock_mantle, which share pricing rows). It wraps
+// ErrAlreadyExists.
+var ErrDatasheetPricingClaimTaken = fmt.Errorf("pricing for this datasheet row is already set by another override: %w", ErrAlreadyExists)
 
 // ErrInvalidAgentGrant marks malformed Agent grant input supplied by a caller.
 var ErrInvalidAgentGrant = errors.New("invalid agent grant")

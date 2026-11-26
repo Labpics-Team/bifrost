@@ -55,6 +55,7 @@ export default function DashboardPage() {
 			objects: parseAsSafeArrayOf.withDefault([]),
 			status: parseAsSafeArrayOf.withDefault([]),
 			routing_rule_ids: parseAsSafeArrayOf.withDefault([]),
+			model_router_ids: parseAsSafeArrayOf.withDefault([]),
 			routing_engine_used: parseAsSafeArrayOf.withDefault([]),
 			stop_reasons: parseAsSafeArrayOf.withDefault([]),
 			tool_call_names: parseAsSafeArrayOf.withDefault([]),
@@ -93,6 +94,9 @@ export default function DashboardPage() {
 			project_ids: parseAsSafeArrayOf.withDefault([]),
 			aliases: parseAsSafeArrayOf.withDefault([]),
 			apps: parseAsSafeArrayOf.withDefault([]),
+			complexity_tiers: parseAsSafeArrayOf.withDefault([]),
+			complexity_mechanisms: parseAsSafeArrayOf.withDefault([]),
+			topic_ids: parseAsSafeArrayOf.withDefault([]),
 		},
 		{
 			history: "push",
@@ -128,6 +132,7 @@ export default function DashboardPage() {
 			...(urlState.routing_rule_ids.length > 0 && {
 				routing_rule_ids: urlState.routing_rule_ids,
 			}),
+			...(urlState.model_router_ids.length > 0 && { model_router_ids: urlState.model_router_ids }),
 			...(urlState.routing_engine_used.length > 0 && {
 				routing_engine_used: urlState.routing_engine_used,
 			}),
@@ -150,6 +155,9 @@ export default function DashboardPage() {
 			...(urlState.project_ids.length > 0 && { project_ids: urlState.project_ids }),
 			...(urlState.aliases.length > 0 && { aliases: urlState.aliases }),
 			...(urlState.apps.length > 0 && { apps: urlState.apps }),
+			...(urlState.complexity_tiers.length > 0 && { complexity_tiers: urlState.complexity_tiers }),
+			...(urlState.complexity_mechanisms.length > 0 && { complexity_mechanisms: urlState.complexity_mechanisms }),
+			...(urlState.topic_ids.length > 0 && { topic_ids: urlState.topic_ids }),
 		}),
 		[
 			urlState.period,
@@ -166,6 +174,7 @@ export default function DashboardPage() {
 			urlState.objects,
 			urlState.status,
 			urlState.routing_rule_ids,
+			urlState.model_router_ids,
 			urlState.routing_engine_used,
 			urlState.stop_reasons,
 			urlState.tool_call_names,
@@ -179,6 +188,9 @@ export default function DashboardPage() {
 			urlState.project_ids,
 			urlState.aliases,
 			urlState.apps,
+			urlState.complexity_tiers,
+			urlState.complexity_mechanisms,
+			urlState.topic_ids,
 		],
 	);
 
@@ -375,6 +387,7 @@ export default function DashboardPage() {
 				objects: newFilters.objects || [],
 				status: newFilters.status || [],
 				routing_rule_ids: newFilters.routing_rule_ids || [],
+				model_router_ids: newFilters.model_router_ids || [],
 				routing_engine_used: newFilters.routing_engine_used || [],
 				stop_reasons: newFilters.stop_reasons || [],
 				tool_call_names: newFilters.tool_call_names || [],
@@ -395,6 +408,9 @@ export default function DashboardPage() {
 				project_ids: newFilters.project_ids || [],
 				aliases: newFilters.aliases || [],
 				apps: newFilters.apps || [],
+				complexity_tiers: newFilters.complexity_tiers || [],
+				complexity_mechanisms: newFilters.complexity_mechanisms || [],
+				topic_ids: newFilters.topic_ids || [],
 			});
 		},
 		[setUrlState, urlState.start_time, urlState.end_time],
@@ -598,6 +614,8 @@ export default function DashboardPage() {
 									predefinedPeriod={urlState.period || undefined}
 									onPredefinedPeriodChange={handlePeriodChange}
 									triggerTestId="dashboard-filter-daterange"
+									className="flex-1 lg:flex-none"
+									buttonClassName="w-full lg:w-auto"
 									popupAlignment="end"
 									showTimezone
 									timezone={timezone}

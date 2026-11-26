@@ -1506,3 +1506,18 @@ func TestCacheRetentionQdrantPreservesIndexSchema(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, proto.Equal(customParams, afterMismatch.GetPayloadSchema()["cache_key"].GetParams()))
 }
+
+// TestQdrantStore_DeleteFromMissingCollectionSucceeds pins deleting from a collection that does not
+// exist as a no-op, as it is on every other store: the caller wanted the point absent, and it is.
+func TestQdrantStore_DeleteFromMissingCollectionSucceeds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration tests in short mode")
+	}
+
+	setup := NewQdrantTestSetup(t)
+	defer setup.Cleanup(t)
+
+	collection := "TestDeleteFromMissingCollection"
+	_ = setup.Store.DeleteNamespace(setup.ctx, collection)
+	assert.NoError(t, setup.Store.Delete(setup.ctx, collection, generateUUID()))
+}
