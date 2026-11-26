@@ -511,6 +511,7 @@ For a new feature, create these files:
 - Use `page.getByRole()` as a secondary strategy
 - NEVER use brittle CSS selectors or chained parent locators (`.locator('..')`)
 - Methods should be async and use semantic waits
+- Mutation helpers must await their specific rendered result (created row visible or deleted row absent) before returning; a ready list alone does not prove that its refresh has finished.
 - Include `goto()`, CRUD methods, and a `cleanup` method
 - Before checking whether an item exists, wait for the completed list state, including a successfully loaded empty list. An enabled create button or a visible table shell does not establish that state.
 
@@ -577,6 +578,7 @@ export class FeaturePage extends BasePage {
     await this.waitForSuccessToast()
     await this.dismissToasts()
     await expect(this.sheet).not.toBeVisible({ timeout: 5000 })
+    await expect(this.page.getByTestId(`feature-row-${config.name}`)).toBeVisible()
   }
 
   async featureExists(name: string): Promise<boolean> {
@@ -597,6 +599,7 @@ export class FeaturePage extends BasePage {
 
     await this.waitForSuccessToast()
     await this.dismissToasts()
+    await expect(this.page.getByTestId(`feature-row-${name}`)).toHaveCount(0)
   }
 
   async closeSheet(): Promise<void> {
