@@ -8,6 +8,7 @@ import (
 // The public EE contract defines the signals and their precedence, not its
 // coefficients. Keep the fork's tuning private and in this one calculation.
 const (
+	recoveryInterval     = 30 * time.Second
 	baselineDecay        = 0.02
 	degradedLatencyRatio = 2
 )
@@ -71,4 +72,18 @@ func (c *Controller) keyWeightLocked(id routeID, now time.Time, peerBaseline flo
 		return 0
 	}
 	return r.score(peerBaseline)
+}
+
+// recoveryDueLocked grants a stale unhealthy route one live observation through
+// the existing probe lease. Ranking alone can otherwise starve a route after
+// its first success, before it has earned a healthy score again.
+func (c *Controller) recoveryDueLocked(r *route, now time.Time) bool {
+	if r == nil || r.ProbeUntil.After(now) || c.holdLocked(r.routeID, now) != nil {
+		return false
+	}
+	if !r.FailedUntil.IsZero() {
+		return !r.FailedUntil.After(now)
+	}
+	return r.Inflight == 0 && now.Sub(r.LastSeen) >= recoveryInterval &&
+		(r.Recovering || r.ErrorRate > 0.05 || r.latencyRatio(0) >= degradedLatencyRatio)
 }

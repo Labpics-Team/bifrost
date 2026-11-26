@@ -35,6 +35,12 @@ func (a *adaptiveAffinity) ResolveRoute(ctx *schemas.BifrostContext, requested s
 	// is not a failure and stays eligible.
 	var eligible []schemas.Route
 	for i, route := range chain {
+		// Hooks own the primary. Filter only routes affinity could promote,
+		// so native affinity sees the same first choice and remembers what
+		// this request actually follows.
+		if i == 0 {
+			continue
+		}
 		d := a.direction(ctx, route.Provider, route.Model, route.KeyID)
 		if d.known && d.score == 0 {
 			if eligible == nil {
@@ -75,6 +81,7 @@ func (a *adaptiveAffinity) ResolveKey(ctx *schemas.BifrostContext, provider sche
 		a.syncKey(provider, key)
 	}
 	now := a.now()
+	adaptiveKeys := a.Config().RouteSelectionEnabled
 	a.mu.Lock()
 	var eligible []schemas.Key
 	for i, key := range keys {
@@ -83,7 +90,7 @@ func (a *adaptiveAffinity) ResolveKey(ctx *schemas.BifrostContext, provider sche
 		r := a.routes[id]
 		// A due check must have a chance even if all requests are sticky.
 		if hold != nil && !hold.HoldUntil.After(now) && !hold.ProbeUntil.After(now) ||
-			hold == nil && r != nil && !r.FailedUntil.IsZero() && !r.FailedUntil.After(now) && !r.ProbeUntil.After(now) && a.Config().RouteSelectionEnabled {
+			adaptiveKeys && a.recoveryDueLocked(r, now) {
 			a.mu.Unlock()
 			return schemas.Key{}, false
 		}
@@ -91,7 +98,7 @@ func (a *adaptiveAffinity) ResolveKey(ctx *schemas.BifrostContext, provider sche
 			a.mu.Unlock()
 			return schemas.Key{}, false
 		}
-		if hold != nil || r != nil && !r.FailedUntil.IsZero() {
+		if hold != nil || adaptiveKeys && r != nil && !r.FailedUntil.IsZero() {
 			if eligible == nil {
 				eligible = make([]schemas.Key, 0, len(keys)-1)
 				eligible = append(eligible, keys[:i]...)

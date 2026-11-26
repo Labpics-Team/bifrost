@@ -175,8 +175,9 @@ func (c *Controller) weightLocked(id routeID, now time.Time) float64 {
 	return c.keyWeightLocked(id, now, 0)
 }
 
-// SelectKey receives core's already filtered pool; caller/rule pins and session
-// affinity keep their native precedence because those paths bypass this hook.
+// SelectKey receives core's already filtered pool. Caller/rule pins keep
+// native precedence; the affinity decorator limits session preferences to
+// eligible keys and yields reserved recovery checks to this hook.
 func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, provider schemas.ModelProvider, model string) (schemas.Key, error) {
 	if len(keys) == 0 {
 		return schemas.Key{}, fmt.Errorf("no eligible keys for %s/%s", provider, model)
@@ -208,7 +209,7 @@ func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, 
 		if h := c.holdLocked(id, now); h != nil && !h.HoldUntil.After(now) && !h.ProbeUntil.After(now) {
 			due = append(due, id)
 		} else if h == nil && c.config.load().RouteSelectionEnabled {
-			if r := c.routes[id]; r != nil && !r.FailedUntil.IsZero() && !r.FailedUntil.After(now) && !r.ProbeUntil.After(now) {
+			if r := c.routes[id]; c.recoveryDueLocked(r, now) {
 				recovering = append(recovering, r)
 			}
 		}
@@ -528,7 +529,7 @@ func (c *Controller) complete(a *attempt, failure schemas.FailureClass, retryAft
 		r.Recoveries = 0
 		r.FailureClass = failure
 		if (!failure.IsPerKey() || r.KeyID == "") && r.Consecutive >= 3 {
-			r.FailedUntil = now.Add(30 * time.Second)
+			r.FailedUntil = now.Add(recoveryInterval)
 			r.Recovering = true
 		}
 	}

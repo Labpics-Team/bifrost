@@ -34,6 +34,22 @@ type releasedHold struct {
 
 const reholdWindow = 10 * time.Minute
 
+func (c *Controller) rememberReleasedLocked(h *condition, now time.Time) {
+	// Recent releases are disposable telemetry, unlike unresolved holds.
+	// Keep the newest window bounded even if callers use many model names.
+	if _, exists := c.releasedHolds[h.routeID]; !exists && len(c.releasedHolds) >= maxRoutes {
+		var oldest routeID
+		var at time.Time
+		for id, previous := range c.releasedHolds {
+			if at.IsZero() || previous.at.Before(at) {
+				oldest, at = id, previous.at
+			}
+		}
+		delete(c.releasedHolds, oldest)
+	}
+	c.releasedHolds[h.routeID] = releasedHold{class: h.HoldClass, rung: h.Rung, revision: h.KeyRevision, at: now}
+}
+
 func (c *Controller) reholdRungLocked(id routeID, class schemas.FailureClass, revision string, now time.Time) int {
 	if previous, ok := c.releasedHolds[id]; ok && previous.class == class && previous.revision == revision && now.Sub(previous.at) < reholdWindow {
 		return previous.rung
@@ -402,7 +418,7 @@ func (c *Controller) completeConditions(a *attempt, failure schemas.FailureClass
 				setIncidentState(i, "recovering", now, request)
 				t.events = append(t.events, incidentEvent(i, "hold_released", request, "The check showed the previous refusal no longer applies.", now))
 				t.publish = func() {
-					c.releasedHolds[h.routeID] = releasedHold{class: h.HoldClass, rung: h.Rung, revision: h.KeyRevision, at: now}
+					c.rememberReleasedLocked(h, now)
 					r.Recovering = true
 					r.Recoveries = 0
 				}

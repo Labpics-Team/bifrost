@@ -38,7 +38,7 @@ func (c *Controller) reserveProbe(ctx *schemas.BifrostContext, d direction) bool
 	defer c.mu.Unlock()
 	r := d.recover
 	now := c.now()
-	if c.routes[r.routeID] != r || r.FailedUntil.IsZero() || r.FailedUntil.After(now) || r.ProbeUntil.After(now) || c.holdLocked(r.routeID, now) != nil {
+	if c.routes[r.routeID] != r || !c.recoveryDueLocked(r, now) {
 		return false
 	}
 	c.probeSequence++
@@ -83,7 +83,7 @@ func (c *Controller) direction(ctx *schemas.BifrostContext, provider schemas.Mod
 				latency += r.LatencyMS
 				measured++
 			}
-			if !r.FailedUntil.IsZero() && !r.FailedUntil.After(now) && !r.ProbeUntil.After(now) && c.holdLocked(id, now) == nil {
+			if c.recoveryDueLocked(r, now) && (d.recover == nil || r.LastSeen.Before(d.recover.LastSeen)) {
 				d.recover = r
 			}
 		}
@@ -97,7 +97,7 @@ func (c *Controller) direction(ctx *schemas.BifrostContext, provider schemas.Mod
 		d.score = c.weightLocked(id, now)
 		if r := c.routes[id]; r != nil {
 			d.latency = r.LatencyMS
-			if !r.FailedUntil.IsZero() && !r.FailedUntil.After(now) && !r.ProbeUntil.After(now) {
+			if c.recoveryDueLocked(r, now) {
 				d.recover = r
 			}
 		}
@@ -177,7 +177,7 @@ func (c *Controller) Route(ctx *schemas.BifrostContext, req *schemas.BifrostRequ
 		selected.Provider = directions[0].provider
 		// Bifrost ranks providers, but distributes traffic across keys.
 		// Due checks below are the exception to the healthiest-provider pick.
-		// A due hold or an expired failure cooldown gets one real recheck,
+		// A due hold, failure cooldown or stale unhealthy observation gets one real recheck,
 		// with healthy directions behind it. The slot also names the key.
 		for _, d := range directions {
 			if c.reserveProbe(ctx, d) {

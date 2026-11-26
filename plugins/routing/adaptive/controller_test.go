@@ -311,3 +311,29 @@ func BenchmarkAdaptiveKeySelection(b *testing.B) {
 		}
 	})
 }
+
+func TestAdaptiveSelfLatencyDegradesEvenWithoutPeer(t *testing.T) {
+	c, _ := testController()
+	latency := func(ms int64) {
+		a := c.BeginProviderAttempt(testContext(), schemas.ProviderAttemptInfo{Provider: "p1", Model: "m", KeyID: "a"})
+		a.Observe(&schemas.BifrostResponse{ChatResponse: &schemas.BifrostChatResponse{ExtraFields: schemas.BifrostResponseExtraFields{Latency: ms}}}, nil)
+		a.End()
+	}
+	for range 5 {
+		latency(100)
+	}
+	before := c.Status()[0]
+	for range 3 {
+		latency(1000)
+	}
+	after := c.Status()[0]
+	if before.State != "healthy" || after.State != "degraded" || after.ErrorRate != 0 || after.Score >= before.Score {
+		t.Fatalf("latency degradation not reflected in state and score: before=%+v after=%+v", before, after)
+	}
+	for range 40 {
+		latency(100)
+	}
+	if got := c.Status()[0]; got.State != "healthy" || got.Score <= after.Score {
+		t.Fatalf("latency did not recover: %+v", got)
+	}
+}

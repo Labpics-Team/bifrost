@@ -83,7 +83,8 @@ a reserved real recovery check. Explicit pins remain a separate native choice.
 
 With adaptive key selection on, errors have the strongest influence, then
 first-response latency relative to eligible peers and current load. Static key
-weights apply when adaptive key selection is off. Both modes skip held managed
+weights apply when adaptive key selection is off, including normal native
+session-key affinity; transient health alone does not override that mode. Both modes skip held managed
 keys; an all-held pool still sends a real request rather than manufacturing a
 gateway failure. Cancellation and caller faults do not reduce key health. Long
 successful streams measure the first response, not the duration of generation.
@@ -91,8 +92,12 @@ successful streams measure the first response, not the duration of generation.
 For an unnamed request the highest-scored provider is selected, with usable
 alternatives ordered by score. Keys within a provider are selected by weight.
 A due hold or expired failure cooldown gets a single real checking request
-ahead of healthy alternatives. This also lets the remaining failed keys in
-a partly recovered provider get checked even if another provider ranks higher.
+ahead of healthy alternatives. A degraded or recovering route that has not
+received an attempt for 30 seconds can use the same lease for one fresh
+observation. The next attempt resets that interval. This local recovery boost
+continues until real responses establish health, so the first successful check
+does not leave a provider stuck behind its healthy alternative. The lease
+prevents a burst of checks; healthy fallbacks remain available.
 Ordinary parsed requests remain adaptive regardless of body size, including
 requests above 10 MiB and requests with streaming responses. The native OSS
 application does not register the upstream large-payload passthrough extension.
@@ -108,8 +113,9 @@ traffic is sent. Transient failures and timeouts affect health but do not create
 credential holds. For the same scope, refusal and credential revision, a hold
 recurring within ten minutes of an automatic release resumes its previous
 ladder rung. Operator release and configuration edits reset the ladder.
-Active holds are durable; the recent-release window is node-local and expires
-in memory (it is not restored after process loss). A stream failure is observed per attempt, including failed
+Active holds are durable. Recent automatic releases retain at most 8,192 entries
+for ten minutes, evicting the oldest first at capacity; this node-local window
+is not restored after process loss. A stream failure is observed per attempt, including failed
 startup attempts that core retries before response plugins see them.
 An explicit key pin is explained by core in the same routing log; it is not
 reported as an adaptive selection.
@@ -140,7 +146,10 @@ SQLite IO. The existing configuration database uses WAL with `synchronous=FULL`;
 normal health samples do not write to the database. Health diagnostics that
 need a lifecycle write while the writer is busy are coalesced by route and
 reconciled by the existing maintenance loop; they never block an unrelated
-healthy request behind that writer. Active holds still commit synchronously.
+healthy request behind that writer. This reconciles current health rather than
+queuing every intermediate state: a brief degradation that recovers before the
+flush may be absent from optional history. Active holds and their lifecycle
+events still commit synchronously.
 Observation-only updates,
 including a new healthy model or a previously unused key, skip the writer queue.
 A failed manual release

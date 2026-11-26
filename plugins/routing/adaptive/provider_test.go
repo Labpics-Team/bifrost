@@ -495,3 +495,109 @@ func TestAdaptiveLeavesLargePayloadExtensionToNativeSelection(t *testing.T) {
 		})
 	}
 }
+
+// Ranking must let a provider earn traffic back from live outcomes even when
+// its healthy alternative never fails.
+func TestAdaptiveProviderRecoveryContinuesUntilHealthy(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		status, failures int
+	}{
+		{"hold", 401, 1}, {"transient", 503, 3}, {"degraded", 500, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, now := providerController()
+			for _, key := range testKeys {
+				for range tc.failures {
+					observe(c, "p1", "m", key.ID, responseError(tc.status))
+				}
+				observe(c, "p2", "m", key.ID, nil)
+			}
+			for range 40 {
+				*now = now.Add(time.Minute)
+				ctx := testContext()
+				req := routeRequest("")
+				if err := c.Route(ctx, req); err != nil {
+					t.Fatal(err)
+				}
+				provider, _, _ := req.GetRequestFields()
+				key, err := c.SelectKey(ctx, testKeys, provider, "m")
+				if err != nil {
+					t.Fatal(err)
+				}
+				observeWithContext(c, ctx, provider, "m", key.ID, nil)
+			}
+			for _, row := range c.Status() {
+				if row.Provider == "p1" && row.State != "healthy" {
+					t.Fatalf("provider never earned traffic back: %+v", row)
+				}
+			}
+		})
+	}
+}
+
+func TestAdaptiveRecoveryObservationUsesOneLiveLease(t *testing.T) {
+	c, now := providerController()
+	keys := testKeys[:1]
+	c.SetCatalog(func(string) []schemas.ModelProvider { return []schemas.ModelProvider{"p1", "p2"} },
+		func(context.Context, schemas.ModelProvider) ([]schemas.Key, error) { return keys, nil },
+		func(schemas.ModelProvider, schemas.Key, string) bool { return true })
+	observe(c, "p1", "m", "a", responseError(503))
+	observe(c, "p2", "m", "a", nil)
+	*now = now.Add(31 * time.Second)
+	pick := func(ctx *schemas.BifrostContext, want schemas.ModelProvider) {
+		t.Helper()
+		req := routeRequest("")
+		if err := c.Route(ctx, req); err != nil {
+			t.Fatal(err)
+		}
+		if got, _, _ := req.GetRequestFields(); got != want {
+			t.Fatalf("selected %s, want %s", got, want)
+		}
+	}
+	check := testContext()
+	pick(check, "p1")
+	for range 10 {
+		pick(testContext(), "p2")
+	}
+	key, err := c.SelectKey(check, keys, "p1", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observeWithContext(c, check, "p1", "m", key.ID, nil)
+	pick(testContext(), "p2")
+	*now = now.Add(29 * time.Second)
+	pick(testContext(), "p2")
+	*now = now.Add(2 * time.Second)
+	pick(testContext(), "p1")
+}
+
+func TestAdaptiveChoosesHealthiestProviderAndWeightsKeys(t *testing.T) {
+	c, _ := providerController()
+	for _, key := range testKeys {
+		observe(c, "p1", "m", key.ID, responseError(503))
+		observe(c, "p2", "m", key.ID, nil)
+	}
+	for range 100 {
+		req := routeRequest("")
+		if err := c.Route(testContext(), req); err != nil {
+			t.Fatal(err)
+		}
+		p, _, f := req.GetRequestFields()
+		if p != "p2" || len(f) != 1 || f[0].Provider != "p1" {
+			t.Fatalf("healthiest provider not selected: %s %+v", p, f)
+		}
+	}
+	// Unlike provider ranking, usable keys keep a share of traffic.
+	chosen := map[string]int{}
+	for range 500 {
+		k, err := c.SelectKey(testContext(), testKeys, "p1", "m")
+		if err != nil {
+			t.Fatal(err)
+		}
+		chosen[k.ID]++
+	}
+	if chosen["a"] == 0 || chosen["b"] == 0 {
+		t.Fatalf("usable key starved: %v", chosen)
+	}
+}
