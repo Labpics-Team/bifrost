@@ -149,41 +149,27 @@ def changed_test_packages(root, manifest, env, modules):
     return packages
 
 
-def test_command(package, required):
-    command = ["go", "test", "-json", "-count=1", "-race", "-timeout=5m", "-skip=^$"]
+def mandatory_test_flags(package, required):
+    flags = ["-count=1", "-race", "-timeout=5m", "-skip=^$"]
     if package.endswith("/plugins/semanticcache"):
-        command.extend(["-short", "-run=."])
+        flags.extend(["-short", "-run=."])
     else:
-        command.extend(["-short=false", "-run=^(" + "|".join(required) + ")$"])
-    return [*command, package]
+        flags.extend(["-short=false", "-run=^(" + "|".join(required) + ")$"])
+    return flags
 
 
 class TestReport:
-    """Consume Go JSON events; a parent pass cannot hide a skipped required child."""
+    """A package's result cannot be supplied by another package."""
 
-    def __init__(self, package, required):
-        self.package = package
+    def __init__(self, required):
         self.required = set(required)
         self.passed = set()
         self.skipped = set()
         self.failed = set()
         self.package_passed = False
         self.tests_seen = False
-        self.invalid = []
 
-    def accept(self, line, output=None):
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            self.invalid.append(f"invalid go test JSON: {line[:200].rstrip()}")
-            return
-        if not isinstance(event, dict):
-            self.invalid.append("go test event must be a JSON object")
-            return
-        if output is not None and isinstance(event.get("Output"), str):
-            print(event["Output"], end="", file=output, flush=True)
-        if event.get("Package") != self.package:
-            return
+    def accept(self, event):
         action, name = event.get("Action"), event.get("Test")
         if name is None:
             if action == "pass":
@@ -200,10 +186,8 @@ class TestReport:
             elif action == "skip" and name.split("/", 1)[0] in self.required:
                 self.skipped.add(name)
 
-    def errors(self, returncode):
-        errors = list(self.invalid)
-        if returncode:
-            errors.append(f"go test exited {returncode}")
+    def errors(self):
+        errors = []
         if not self.package_passed:
             errors.append("package did not pass")
         if not self.tests_seen:
@@ -217,18 +201,62 @@ class TestReport:
         return errors
 
 
-def run_test_package(root, env, package, command, required=()):
-    report = TestReport(package, required)
+class TestRun:
+    """Demultiplex Go's native package-list JSON stream, parsing each event once."""
+
+    def __init__(self, packages):
+        if not packages:
+            raise VerificationError("empty test package roster")
+        self.reports = {package: TestReport(required) for package, required in packages.items()}
+        self.invalid = []
+
+    def accept(self, line, output=None):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            self.invalid.append(f"invalid go test JSON: {line[:200].rstrip()}")
+            return
+        if not isinstance(event, dict):
+            self.invalid.append("go test event must be a JSON object")
+            return
+        if output is not None and isinstance(event.get("Output"), str):
+            # In a package-list run different test binaries can emit concurrently.
+            text = event["Output"]
+            if len(self.reports) > 1:
+                label = event.get("Package") or event.get("ImportPath")
+                if label:
+                    text = "".join(f"[{label}] {part}" for part in text.splitlines(keepends=True))
+            print(text, end="", file=output, flush=True)
+        package = event.get("Package")
+        if package is not None and not isinstance(package, str):
+            self.invalid.append("go test package must be a string")
+            return
+        report = self.reports.get(package)
+        if report is not None:
+            report.accept(event)
+
+    def errors(self, returncode):
+        errors = list(self.invalid)
+        if returncode:
+            errors.append(f"go test exited {returncode}")
+        for package, report in self.reports.items():
+            errors.extend(f"{package}: {error}" for error in report.errors())
+        return errors
+
+
+def run_test_packages(root, env, packages, flags):
+    result = TestRun(packages)
+    command = ["go", "test", "-json", *flags, *result.reports]
     with subprocess.Popen(
         command, cwd=root, env=env,
         stdout=subprocess.PIPE, text=True, encoding="utf-8",
     ) as process:
         for line in process.stdout:
-            report.accept(line, sys.stdout)
+            result.accept(line, sys.stdout)
         returncode = process.wait()
-    errors = report.errors(returncode)
+    errors = result.errors(returncode)
     if errors:
-        raise VerificationError(f"{package}:\n" + "\n".join(errors))
+        raise VerificationError("\n".join(errors))
 
 
 def check_unit(root, manifest):
@@ -236,12 +264,12 @@ def check_unit(root, manifest):
     packages = changed_test_packages(root, manifest, env, modules)
     for package in packages:
         print(f"Testing full short corpus: {package}", flush=True)
-        # Complete native HTTP suites exceed five minutes even while individual
-        # tests make progress. Keep their aggregate budget separate from the
-        # targeted mandatory-regression budget in test_command.
-        run_test_package(root, env, package, [
-            "go", "test", "-json", "-short", "-race", "-count=1", "-timeout=15m", package,
-        ])
+    # A single native package-list invocation lets Go schedule compilation and
+    # test processes within its configured -p budget. The timeout still applies
+    # to each test binary; every discovered package must report its own result.
+    run_test_packages(root, env, dict.fromkeys(packages, ()), [
+        "-short", "-race", "-count=1", "-timeout=15m",
+    ])
     print(f"All {len(packages)} changed package short suites passed", flush=True)
 
 
@@ -260,7 +288,7 @@ def check_tests(root, manifest):
         if len(parts) != 3 or parts[1:] != [module, "true"] or Path(parts[0]).resolve() != expected.resolve():
             raise VerificationError(f"{package}: expected local package {expected}, got {result!r}")
         print(f"Testing {package} ({len(required)} mandatory tests)", flush=True)
-        run_test_package(root, env, package, test_command(package, required), required)
+        run_test_packages(root, env, {package: required}, mandatory_test_flags(package, required))
     print("All required tests passed", flush=True)
 
 
