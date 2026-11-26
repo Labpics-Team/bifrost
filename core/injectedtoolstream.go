@@ -152,7 +152,11 @@ func (s *injectedChatStream) onChunk(resp *schemas.BifrostChatResponse, final bo
 			client = append(client, visible)
 		}
 	}
-	if len(injected) > 0 && s.depth < s.set.maxDepth {
+	// An interrupted generation may carry a partial call, even alongside valid
+	// JSON for another call. Preserve the provider terminal state and do not run
+	// tools or open another model turn after it.
+	interrupted := s.finish != nil && (*s.finish == string(schemas.BifrostFinishReasonLength) || *s.finish == "content_filter")
+	if !interrupted && len(injected) > 0 && s.depth < s.set.maxDepth {
 		s.more = true
 		s.usage = schemas.MergeBifrostLLMUsage(s.usage, s.turnUsage)
 		s.turnUsage = nil
@@ -165,13 +169,15 @@ func (s *injectedChatStream) onChunk(resp *schemas.BifrostChatResponse, final bo
 	s.more = false
 
 	finish := s.finish
-	if len(injected) > 0 && len(client) == 0 {
+	if !interrupted && len(injected) > 0 && len(client) == 0 {
 		finish = new(string(schemas.BifrostFinishReasonStop))
 	}
 	delta := &schemas.ChatStreamResponseChoiceDelta{ToolCalls: client}
 	if s.set.callerAgentMode && len(client) > 0 {
 		delta.Content = s.agentResults.summary()
-		finish = new(string(schemas.BifrostFinishReasonToolCalls))
+		if !interrupted {
+			finish = new(string(schemas.BifrostFinishReasonToolCalls))
+		}
 	}
 	terminal := s.clientChunk(resp, delta, finish)
 	terminal.Usage = schemas.MergeBifrostLLMUsage(s.usage, s.turnUsage)
@@ -840,10 +846,14 @@ func isCallerResponsesAction(item schemas.ResponsesMessage) bool {
 	case schemas.ResponsesMessageTypeCustomToolCall,
 		schemas.ResponsesMessageTypeComputerCall,
 		schemas.ResponsesMessageTypeLocalShellCall,
-		schemas.ResponsesMessageTypeShellCall,
 		schemas.ResponsesMessageTypeApplyPatchCall,
 		schemas.ResponsesMessageTypeMCPApprovalRequest:
 		return true
+	case schemas.ResponsesMessageTypeShellCall:
+		// Hosted shell calls already execute at the provider. Local shell calls
+		// (including older events without environment) still need the caller.
+		return item.ResponsesToolMessage == nil || item.ResponsesShellCall == nil ||
+			item.Environment == nil || item.Environment.Type != "container_reference"
 	case schemas.ResponsesMessageTypeToolSearchCall:
 		return item.ResponsesToolMessage != nil && item.Execution != nil && *item.Execution == "client"
 	default:
@@ -928,7 +938,7 @@ func (s *injectedResponsesStream) onTurnEnd(ev *schemas.BifrostResponsesStreamRe
 		turnUsage = ev.Response.Usage.ToBifrostLLMUsage()
 	}
 	s.usage = schemas.MergeBifrostLLMUsage(s.usage, turnUsage)
-	if len(s.injected) > 0 && s.depth < s.set.maxDepth && (s.set.callerAgentMode || !s.sentCall) {
+	if ev.Type == schemas.ResponsesStreamResponseTypeCompleted && len(s.injected) > 0 && s.depth < s.set.maxDepth && (s.set.callerAgentMode || !s.sentCall) {
 		s.more = true
 		if s.set.callerAgentMode && s.sentCall {
 			s.pendingClient = ev

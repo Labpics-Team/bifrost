@@ -689,3 +689,102 @@ func TestResponsesStream_GatewayToolSearch(t *testing.T) {
 	require.NotNil(t, final.Usage)
 	assert.Equal(t, 30, final.Usage.InputTokens, "usage summed across turns")
 }
+
+func TestAdmittedMCPStreamShellOwnership(t *testing.T) {
+	for _, environment := range []string{"local", "container_reference"} {
+		t.Run(environment, func(t *testing.T) {
+			set := testInjectedSet(t)
+			set.callerAgentMode = true
+			s := newInjectedResponsesStream(set)
+			shell := schemas.ResponsesMessage{
+				ID: schemas.Ptr("shell-1"), Type: schemas.Ptr(schemas.ResponsesMessageTypeShellCall),
+				ResponsesToolMessage: &schemas.ResponsesToolMessage{
+					CallID:             schemas.Ptr("shell-call"),
+					ResponsesShellCall: &schemas.ResponsesShellCall{Environment: &schemas.ResponsesShellCallEnvironment{Type: environment}},
+				},
+			}
+			events := &responsesEvents{respID: "shell-response"}
+			feedResponses(s,
+				events.created(),
+				events.item(schemas.ResponsesStreamResponseTypeOutputItemAdded, 0, shell),
+				events.item(schemas.ResponsesStreamResponseTypeOutputItemDone, 0, shell),
+				events.item(schemas.ResponsesStreamResponseTypeOutputItemAdded, 1, responsesFunctionCall("auto", "web_search")),
+				events.item(schemas.ResponsesStreamResponseTypeOutputItemDone, 1, responsesFunctionCall("auto", "web_search")),
+				events.completed(10),
+			)
+			require.True(t, s.continues(), "the admitted MCP call must execute")
+			replay, calls := s.endTurn()
+			require.Len(t, calls, 1)
+			results := []*schemas.ChatMessage{{
+				Role:            schemas.ChatMessageRoleTool,
+				Content:         &schemas.ChatMessageContent{ContentStr: schemas.Ptr("search result")},
+				ChatToolMessage: &schemas.ChatToolMessage{ToolCallID: calls[0].ID},
+			}}
+			emits := s.finishAgentTurn(calls, results)
+			if environment == "local" {
+				require.NotEmpty(t, emits, "a local shell action waits for the caller")
+				assert.True(t, emits[len(emits)-1].terminal)
+				require.Len(t, replay, 1, "the unresolved caller action must not be replayed")
+			} else {
+				assert.Empty(t, emits, "a hosted shell action must not stop automatic continuation")
+				require.Len(t, replay, 2, "the hosted shell action stays in the next model input")
+				assert.Equal(t, shell, replay[0])
+			}
+		})
+	}
+}
+
+// Measure a complete mixed turn through client projection. The fixtures are
+// reused; timings include per-stream state, usage merging and result formatting.
+func BenchmarkAdmittedMCPStreamTerminal(b *testing.B) {
+	set := &injectedToolSet{
+		targets:  map[string]injectedTarget{"web_search": {toolName: "web_search"}},
+		maxDepth: 4, callerAgentMode: true,
+	}
+	local := callStart(0, "caller", "local_read")
+	auto := callStart(1, "auto", "web_search")
+	local.Function.Arguments, auto.Function.Arguments = "{}", "{}"
+	results := []*schemas.ChatMessage{{
+		Role:            schemas.ChatMessageRoleTool,
+		Content:         &schemas.ChatMessageContent{ContentStr: schemas.Ptr("search result")},
+		ChatToolMessage: &schemas.ChatToolMessage{ToolCallID: auto.ID},
+	}}
+	b.Run("chat", func(b *testing.B) {
+		chunk := chatStreamChunk("mixed", chatDelta{finish: "tool_calls", usage: usage(10)})
+		chunk.Choices[0].Delta.ToolCalls = []schemas.ChatAssistantMessageToolCall{*local, *auto}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			s := newInjectedChatStream(set)
+			s.onChunk(chunk, true)
+			_, calls := s.endTurn()
+			s.finishAgentTurn(calls, results)
+		}
+	})
+	b.Run("responses", func(b *testing.B) {
+		e := &responsesEvents{respID: "mixed"}
+		shell := schemas.ResponsesMessage{
+			ID: schemas.Ptr("shell-1"), Type: schemas.Ptr(schemas.ResponsesMessageTypeShellCall),
+			ResponsesToolMessage: &schemas.ResponsesToolMessage{
+				CallID:             schemas.Ptr("shell-call"),
+				ResponsesShellCall: &schemas.ResponsesShellCall{Environment: &schemas.ResponsesShellCallEnvironment{Type: "local"}},
+			},
+		}
+		events := []*schemas.BifrostResponsesStreamResponse{
+			e.created(),
+			e.item(schemas.ResponsesStreamResponseTypeOutputItemAdded, 0, shell),
+			e.item(schemas.ResponsesStreamResponseTypeOutputItemDone, 0, shell),
+			e.item(schemas.ResponsesStreamResponseTypeOutputItemAdded, 1, responsesFunctionCall("auto", "web_search")),
+			e.item(schemas.ResponsesStreamResponseTypeOutputItemDone, 1, responsesFunctionCall("auto", "web_search")),
+			e.completed(10),
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			s := newInjectedResponsesStream(set)
+			feedResponses(s, events...)
+			_, calls := s.endTurn()
+			s.finishAgentTurn(calls, results)
+		}
+	})
+}

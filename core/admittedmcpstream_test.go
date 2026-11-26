@@ -150,11 +150,16 @@ type admittedFixtureCall struct {
 
 // Send real OpenAI-shaped SSE through the provider parser; the fixture does not
 // call the stream state machine directly or use an external provider.
-func admittedMixedTurn(responses bool, turn int, calls []admittedFixtureCall) http.HandlerFunc {
+func admittedMixedTurn(responses bool, turn int, calls []admittedFixtureCall, interrupted string) http.HandlerFunc {
 	id := fmt.Sprintf("r%d", turn)
 	var events []string
 	if responses {
 		events = append(events, fmt.Sprintf(`{"type":"response.created","sequence_number":0,"response":{"id":%q,"object":"response","created_at":1,"status":"in_progress","model":"gpt-4o","output":[]}}`, id))
+		status, terminalType, details := "completed", "response.completed", ""
+		if interrupted != "" {
+			status, terminalType = "incomplete", "response.incomplete"
+			details = fmt.Sprintf(`,"incomplete_details":{"reason":%q}`, interrupted)
+		}
 		var output []string
 		for i, c := range calls {
 			itemID := "fc_" + c.id
@@ -165,18 +170,22 @@ func admittedMixedTurn(responses bool, turn int, calls []admittedFixtureCall) ht
 			for _, fragment := range []string{c.args[:1], c.args[1:]} {
 				events = append(events, fmt.Sprintf(`{"type":"response.function_call_arguments.delta","sequence_number":%d,"output_index":%d,"item_id":%q,"delta":%q}`, len(events), i, itemID, fragment))
 			}
-			events = append(events, fmt.Sprintf(`{"type":"response.output_item.done","sequence_number":%d,"output_index":%d,"item":%s}`, len(events), i, item("completed", c.args)))
-			output = append(output, item("completed", c.args))
+			events = append(events, fmt.Sprintf(`{"type":"response.output_item.done","sequence_number":%d,"output_index":%d,"item":%s}`, len(events), i, item(status, c.args)))
+			output = append(output, item(status, c.args))
 		}
-		events = append(events, fmt.Sprintf(`{"type":"response.completed","sequence_number":%d,"response":{"id":%q,"object":"response","created_at":1,"status":"completed","model":"gpt-4o","output":[%s],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}`, len(events), id, strings.Join(output, ",")))
+		events = append(events, fmt.Sprintf(`{"type":%q,"sequence_number":%d,"response":{"id":%q,"object":"response","created_at":1,"status":%q,"model":"gpt-4o","output":[%s],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}%s}}`, terminalType, len(events), id, status, strings.Join(output, ","), details))
 	} else {
+		finish := "tool_calls"
+		if interrupted != "" {
+			finish = interrupted
+		}
 		for i, c := range calls {
 			events = append(events, fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":%d,"id":%q,"type":"function","function":{"name":%q,"arguments":""}}]},"finish_reason":null}]}`, id, i, c.id, c.name))
 			for _, fragment := range []string{c.args[:1], c.args[1:]} {
 				events = append(events, fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"tool_calls":[{"index":%d,"function":{"arguments":%q}}]},"finish_reason":null}]}`, id, i, fragment))
 			}
 		}
-		events = append(events, fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`, id))
+		events = append(events, fmt.Sprintf(`{"id":%q,"object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":%q}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`, id, finish))
 	}
 	return sseHandler(events...)
 }
@@ -210,7 +219,7 @@ func TestAdmittedMCPMixedStream(t *testing.T) {
 						http.Error(w, "unexpected inference after caller action", http.StatusBadRequest)
 						return
 					}
-					admittedMixedTurn(responses, n, scenario.turns[n-1])(w, r)
+					admittedMixedTurn(responses, n, scenario.turns[n-1], "")(w, r)
 				}))
 				defer recorder.Close()
 				account := NewMockAccount()
@@ -335,4 +344,136 @@ func TestAdmittedMCPStreamPreservesCustomCall(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(wire), `"custom":`)
 	assert.NotContains(t, string(wire), `"function":`)
+}
+
+// An upstream interruption is terminal even when a tool's JSON happens to be
+// valid. Partial caller calls stay inspectable; no new tool or model turn runs.
+func TestAdmittedMCPInterruptedStream(t *testing.T) {
+	auto := admittedFixtureCall{"auto-1", "alpha-echo_tool", `{"text":"gateway-first"}`}
+	partial := admittedFixtureCall{"caller-1", "local_read", `{"file":`}
+	for _, responses := range []bool{false, true} {
+		api, length := "chat", "length"
+		if responses {
+			api, length = "responses", "max_output_tokens"
+		}
+		for _, reason := range []string{length, "content_filter"} {
+			for _, scenario := range []struct {
+				name      string
+				calls     []admittedFixtureCall
+				priorAuto bool
+			}{
+				{"caller-only", []admittedFixtureCall{partial}, false},
+				{"mixed", []admittedFixtureCall{auto, partial}, false},
+				{"auto-only", []admittedFixtureCall{auto}, false},
+				{"after-auto-turn", []admittedFixtureCall{auto, partial}, true},
+			} {
+				t.Run(api+"/"+reason+"/"+scenario.name, func(t *testing.T) {
+					alpha := newAlphaServer(t)
+					recorder := &recordingServer{}
+					turnCount := 1
+					if scenario.priorAuto {
+						turnCount++
+					}
+					recorder.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						body, _ := io.ReadAll(r.Body)
+						n := recorder.record(string(body))
+						if n > turnCount {
+							http.Error(w, "unexpected inference after interruption", http.StatusBadRequest)
+							return
+						}
+						if scenario.priorAuto && n == 1 {
+							admittedMixedTurn(responses, n, []admittedFixtureCall{auto}, "")(w, r)
+							return
+						}
+						admittedMixedTurn(responses, n, scenario.calls, reason)(w, r)
+					}))
+					defer recorder.Close()
+					account := NewMockAccount()
+					configureUpstream(account, schemas.OpenAI, "openai-key", recorder.URL, 0)
+					mcp := alphaClient(alpha.url)
+					mcp.ToolsToAutoExecute = schemas.WhiteList{"echo_tool"}
+					client := newSDKClient(t, schemas.BifrostConfig{Account: account, MCPConfig: &schemas.MCPConfig{ClientConfigs: []*schemas.MCPClientConfig{mcp}}})
+					client.ConnectConfiguredMCPClients(context.Background(), nil)
+					ctx := schemas.NewBifrostContext(context.Background(), time.Now().Add(10*time.Second))
+					defer ctx.Cancel()
+					ctx.SetValue(schemas.MCPContextKeyIncludeTools, []string{"alpha-echo_tool"})
+					var stream chan *schemas.BifrostStreamChunk
+					var err *schemas.BifrostError
+					if responses {
+						stream, err = client.ResponsesStreamRequest(ctx, &schemas.BifrostResponsesRequest{
+							Provider: schemas.OpenAI, Model: "gpt-4o",
+							Input:  []schemas.ResponsesMessage{{Role: schemas.Ptr(schemas.ResponsesInputMessageRoleUser), Content: &schemas.ResponsesMessageContent{ContentStr: schemas.Ptr("Read and report")}}},
+							Params: &schemas.ResponsesParameters{Tools: []schemas.ResponsesTool{{Type: schemas.ResponsesToolTypeFunction, Name: schemas.Ptr("local_read")}}},
+						})
+					} else {
+						stream, err = client.ChatCompletionStreamRequest(ctx, &schemas.BifrostChatRequest{
+							Provider: schemas.OpenAI, Model: "gpt-4o",
+							Input:  []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("Read and report")}}},
+							Params: &schemas.ChatParameters{Tools: []schemas.ChatTool{{Type: schemas.ChatToolTypeFunction, Function: &schemas.ChatToolFunction{Name: "local_read"}}}},
+						})
+					}
+					require.Nil(t, err)
+					var observed []admittedFixtureCall
+					var text strings.Builder
+					terminalCount := 0
+					for chunk := range stream {
+						assert.Nil(t, chunk.BifrostError)
+						if resp := chunk.BifrostChatResponse; resp != nil {
+							for _, choice := range resp.Choices {
+								if choice.Delta != nil {
+									if choice.Delta.Content != nil {
+										text.WriteString(*choice.Delta.Content)
+									}
+									for _, call := range choice.Delta.ToolCalls {
+										require.NotNil(t, call.ID)
+										require.NotNil(t, call.Function.Name)
+										observed = append(observed, admittedFixtureCall{*call.ID, *call.Function.Name, call.Function.Arguments})
+									}
+								}
+								if choice.FinishReason != nil {
+									terminalCount++
+									assert.Equal(t, reason, *choice.FinishReason)
+									require.NotNil(t, resp.Usage)
+									assert.Equal(t, 10*turnCount, resp.Usage.PromptTokens)
+								}
+							}
+						}
+						if ev := chunk.BifrostResponsesStreamResponse; ev != nil {
+							if ev.Type == schemas.ResponsesStreamResponseTypeOutputTextDelta && ev.Delta != nil {
+								text.WriteString(*ev.Delta)
+							}
+							if ev.Type == schemas.ResponsesStreamResponseTypeIncomplete || ev.Type == schemas.ResponsesStreamResponseTypeCompleted {
+								terminalCount++
+								assert.Equal(t, schemas.ResponsesStreamResponseTypeIncomplete, ev.Type)
+								require.NotNil(t, ev.Response)
+								require.NotNil(t, ev.Response.IncompleteDetails)
+								assert.Equal(t, reason, string(ev.Response.IncompleteDetails.Reason))
+								require.NotNil(t, ev.Response.Usage)
+								assert.Equal(t, 10*turnCount, ev.Response.Usage.InputTokens)
+								for _, item := range ev.Response.Output {
+									if isFunctionCall(item) {
+										require.NotNil(t, item.CallID)
+										require.NotNil(t, item.Name)
+										require.NotNil(t, item.Arguments)
+										observed = append(observed, admittedFixtureCall{*item.CallID, *item.Name, *item.Arguments})
+									}
+								}
+							}
+						}
+					}
+					assert.Equal(t, 1, terminalCount)
+					if scenario.name == "auto-only" {
+						assert.Empty(t, observed)
+					} else {
+						assert.Equal(t, []admittedFixtureCall{partial}, observed)
+					}
+					assert.Len(t, recorder.snapshot(), turnCount)
+					assert.Equal(t, turnCount-1, alpha.callCount("echo_tool"), "interrupted turns never execute tools")
+					if scenario.priorAuto {
+						assert.Contains(t, text.String(), "gateway-first", "retain results from earlier successful turns")
+					}
+				})
+			}
+		}
+	}
 }
