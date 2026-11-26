@@ -2260,7 +2260,8 @@ test.describe("LLM log detail identity", () => {
       releaseDescending();
       await expect(tableRows).toHaveCount(500);
       await expect(tableRows.first().getByRole("cell").last()).toHaveText(rows[500].model);
-      await page.keyboard.press("Escape");
+      // Target the panel directly; keyboard traversal can leave a session-ID tooltip above it.
+      await page.locator('[data-slot="sheet-overlay"]').click({ position: { x: 10, y: 10 } });
       await expect(sheet).toHaveCount(0);
       const beforeReopen = calls.length;
       await openSession();
