@@ -1597,128 +1597,172 @@ test.describe("LLM Logs", () => {
 test.describe("LLM log detail identity", () => {
   test.use({ viewport: { width: 1440, height: 900 } });
 
-  for (const detailStatus of [500, 200]) {
-    test(`keeps the selected record when the next detail request returns ${detailStatus}`, async ({ page, logsPage }) => {
-      const timestamp = new Date().toISOString();
-      const row = (id: string) => ({
-        id,
-        object: "chat.completion",
-        timestamp,
-        created_at: timestamp,
-        provider: "openai",
-        model: `${id}-listed-model`,
-        number_of_retries: 0,
-        fallback_index: 0,
-        status: "success",
-        stream: false,
-        latency: 120,
-        cost: 0,
-        input_history: [],
-        responses_input_history: [],
-        selected_prompt_id: `${id}-prompt`,
-        selected_prompt_name: `${id}-listed-prompt`,
-      });
-      const first = row("synthetic-identity-first");
-      const next = row("synthetic-identity-next");
-      const fullFirst = { ...first, model: "first-full-model" };
-      const fullNext = { ...next, model: "next-full-model", status: "processing" };
-      let releaseDetail!: () => void;
-      let releasePrompt!: () => void;
-      let releaseRefetch!: () => void;
-      let markRefetchStarted!: () => void;
-      let nextRequests = 0;
-      const detailReady = new Promise<void>((resolve) => { releaseDetail = resolve; });
-      const promptReady = new Promise<void>((resolve) => { releasePrompt = resolve; });
-      const refetchReady = new Promise<void>((resolve) => { releaseRefetch = resolve; });
-      const refetchStarted = new Promise<void>((resolve) => { markRefetchStarted = resolve; });
-
-      await page.route((url) => url.pathname === "/api/logs", (route) => route.fulfill({ json: {
-        logs: [first, next],
-        pagination: { limit: 50, offset: 0, sort_by: "timestamp", order: "desc" },
-        stats: {
-          total_requests: 2,
-          success_rate: 100,
-          user_facing_success_rate: 100,
-          user_facing_total_requests: 2,
-          average_latency: 120,
-          total_tokens: 0,
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_cost: 0,
-        },
-        has_logs: true,
-      } }));
-      await page.route((url) => url.pathname === `/api/logs/${first.id}`, (route) =>
-        route.fulfill({ json: fullFirst }));
-      await page.route((url) => url.pathname === `/api/logs/${next.id}`, async (route) => {
-        if (++nextRequests > 1) {
-          markRefetchStarted();
-          await refetchReady;
-          await route.fulfill({ status: 500, json: { error: { message: "Synthetic polling failure" } } });
-          return;
-        }
-        await detailReady;
-        await route.fulfill({
-          status: detailStatus,
-          json: detailStatus === 200 ? fullNext : { error: { message: "Synthetic detail failure" } },
+  for (const offList of [false, true]) {
+    for (const detailStatus of [500, 200]) {
+      test(`keeps the selected record ${offList ? "outside the table" : "in the table"} when detail returns ${detailStatus}`, async ({ page, logsPage }) => {
+        const timestamp = new Date().toISOString();
+        const row = (id: string) => ({
+          id,
+          object: "chat.completion",
+          timestamp,
+          created_at: timestamp,
+          provider: "openai",
+          model: `${id}-listed-model`,
+          number_of_retries: 0,
+          fallback_index: 0,
+          status: "success",
+          stream: false,
+          latency: 120,
+          cost: 0,
+          input_history: [],
+          responses_input_history: [],
+          selected_prompt_id: `${id}-prompt`,
+          selected_prompt_name: `${id}-listed-prompt`,
         });
-      });
-      await page.route((url) => url.pathname === `/api/prompt-repo/prompts/${first.selected_prompt_id}`, (route) =>
-        route.fulfill({ json: { prompt: { id: first.selected_prompt_id, name: "first-resolved-prompt" } } }));
-      await page.route((url) => url.pathname === `/api/prompt-repo/prompts/${next.selected_prompt_id}`, async (route) => {
-        await promptReady;
-        await route.fulfill({ json: { prompt: { id: next.selected_prompt_id, name: "next-resolved-prompt" } } });
-      });
+        const first = {
+          ...row("synthetic-identity-first"),
+          ...(offList ? {
+            status: "error",
+            child_count: 1,
+            error_details: { status_code: 429, error: { message: "Synthetic provider failure" } },
+          } : {}),
+        };
+        const next = {
+          ...row("synthetic-identity-next"),
+          ...(offList ? { parent_request_id: first.id, fallback_index: 1 } : {}),
+        };
+        const fullFirst = { ...first, model: "first-full-model" };
+        const fullNext = { ...next, model: "next-full-model", status: "processing" };
+        let releaseDetail!: () => void;
+        let releasePrompt!: () => void;
+        let releaseRefetch!: () => void;
+        let markRefetchStarted!: () => void;
+        let nextRequests = 0;
+        const detailReady = new Promise<void>((resolve) => { releaseDetail = resolve; });
+        const promptReady = new Promise<void>((resolve) => { releasePrompt = resolve; });
+        const refetchReady = new Promise<void>((resolve) => { releaseRefetch = resolve; });
+        const refetchStarted = new Promise<void>((resolve) => { markRefetchStarted = resolve; });
 
-      try {
-        await logsPage.goto();
-        await expect(logsPage.tableRows).toHaveCount(2);
-        await logsPage.viewLogDetails(0);
-        const sheet = logsPage.logDetailSheet;
-        const prompt = sheet.getByTestId("logdetails-selected-prompt-link");
-        await expect(sheet.getByText(first.id, { exact: true })).toBeVisible();
-        await expect(sheet.getByText(fullFirst.model, { exact: true }).first()).toBeVisible();
-        await expect(prompt).toHaveText("first-resolved-prompt");
+        await page.route((url) => url.pathname === "/api/logs", (route) => {
+          const parent = new URL(route.request().url()).searchParams.get("parent_request_id");
+          const logs = parent
+            ? (offList && parent === first.id ? [next] : [])
+            : (offList ? [row("synthetic-visible-row")] : [first, next]);
+          return route.fulfill({ json: {
+            logs,
+            pagination: { limit: 50, offset: 0, sort_by: "timestamp", order: "desc" },
+            stats: {
+              total_requests: logs.length,
+              success_rate: 100,
+              user_facing_success_rate: 100,
+              user_facing_total_requests: logs.length,
+              average_latency: 120,
+              total_tokens: 0,
+              prompt_tokens: 0,
+              completion_tokens: 0,
+              total_cost: 0,
+            },
+            has_logs: true,
+          } });
+        });
+        await page.route((url) => url.pathname === `/api/logs/${first.id}`, (route) =>
+          route.fulfill({ json: fullFirst }));
+        await page.route((url) => url.pathname === `/api/logs/${next.id}`, async (route) => {
+          if (++nextRequests > 1) {
+            markRefetchStarted();
+            await refetchReady;
+            await route.fulfill({ status: 500, json: { error: { message: "Synthetic polling failure" } } });
+            return;
+          }
+          await detailReady;
+          await route.fulfill({
+            status: detailStatus,
+            json: detailStatus === 200 ? fullNext : { error: { message: "Synthetic detail failure" } },
+          });
+        });
+        await page.route((url) => url.pathname === `/api/prompt-repo/prompts/${first.selected_prompt_id}`, (route) =>
+          route.fulfill({ json: { prompt: { id: first.selected_prompt_id, name: "first-resolved-prompt" } } }));
+        await page.route((url) => url.pathname === `/api/prompt-repo/prompts/${next.selected_prompt_id}`, async (route) => {
+          await promptReady;
+          await route.fulfill({ json: { prompt: { id: next.selected_prompt_id, name: "next-resolved-prompt" } } });
+        });
 
-        const nextRequested = page.waitForRequest((request) => new URL(request.url()).pathname === `/api/logs/${next.id}`);
-        await sheet.getByRole("button", { name: "Next log", exact: true }).click();
-        await nextRequested;
-        await expect(page).toHaveURL(new RegExp(`selected_log=${next.id}`));
-        await expect(sheet.getByRole("heading", { name: "Loading log details", exact: true })).toBeAttached();
-        await expect(sheet.getByText(first.id, { exact: true })).toHaveCount(0);
+        try {
+          if (offList) {
+            await page.goto(`/workspace/logs?selected_log=${first.id}`);
+            await expect(logsPage.tableRows).toHaveCount(1);
+          } else {
+            await logsPage.goto();
+            await expect(logsPage.tableRows).toHaveCount(2);
+            await logsPage.viewLogDetails(0);
+          }
+          const sheet = logsPage.logDetailSheet;
+          const prompt = sheet.getByTestId("logdetails-selected-prompt-link");
+          await expect(sheet.getByText(first.id, { exact: true })).toBeVisible();
+          await expect(sheet.getByText(fullFirst.model, { exact: true }).first()).toBeVisible();
+          await expect(prompt).toHaveText("first-resolved-prompt");
 
-        releaseDetail();
-        await expect(sheet.getByText(next.id, { exact: true })).toBeVisible();
-        await expect(sheet.getByText(first.id, { exact: true })).toHaveCount(0);
-        await expect(sheet.getByText(fullFirst.model, { exact: true })).toHaveCount(0);
-        await expect(sheet.getByText(detailStatus === 200 ? fullNext.model : next.model, { exact: true }).first()).toBeVisible();
-        // A pending prompt for the current row must not reuse the previous row's name.
-        await expect(prompt).toHaveText(next.selected_prompt_name);
-        releasePrompt();
-        await expect(prompt).toHaveText("next-resolved-prompt");
-
-        if (detailStatus === 200) {
-          // Cached details for this same ID remain usable while polling and after its error.
-          await refetchStarted;
-          await expect(sheet.getByText(fullNext.model, { exact: true }).first()).toBeVisible();
-          const failedPoll = page.waitForResponse((response) =>
-            new URL(response.url()).pathname === `/api/logs/${next.id}` && response.status() === 500);
-          releaseRefetch();
-          await (await failedPoll).finished();
+          const nextRequested = page.waitForRequest((request) => new URL(request.url()).pathname === `/api/logs/${next.id}`);
+          if (offList) {
+            await sheet.getByTestId("logdetails-fallback-open-final").click();
+          } else {
+            await sheet.getByRole("button", { name: "Next log", exact: true }).click();
+          }
+          await nextRequested;
+          await expect(page).toHaveURL(new RegExp(`selected_log=${next.id}`));
+          await expect.soft(sheet.getByRole("heading", { name: "Loading log details", exact: true })).toBeAttached();
+          await expect.soft(sheet.getByText(first.id, { exact: true })).toHaveCount(0);
           await expect(sheet.getByText(next.id, { exact: true })).toBeVisible();
-          await expect(sheet.getByText(fullNext.model, { exact: true }).first()).toBeVisible();
-        }
+          await expect(sheet.getByRole("button", { name: "Close", exact: true })).toBeEnabled();
 
-        await sheet.getByRole("button", { name: "Previous log", exact: true }).click();
-        await expect(sheet.getByText(first.id, { exact: true })).toBeVisible();
-        await expect(sheet.getByText(fullFirst.model, { exact: true }).first()).toBeVisible();
-        await expect(prompt).toHaveText("first-resolved-prompt");
-      } finally {
-        releaseDetail();
-        releasePrompt();
-        releaseRefetch();
-      }
-    });
+          releaseDetail();
+          if (offList && detailStatus === 500) {
+            // No row or successful response belongs to this ID: show its load error, not the previous request.
+            await expect.soft(sheet.getByText(first.id, { exact: true })).toHaveCount(0);
+            await expect(sheet.getByRole("alert")).toHaveText("Synthetic detail failure");
+            await expect(sheet.getByText(next.id, { exact: true })).toBeVisible();
+            await expect(prompt).toHaveCount(0);
+          } else {
+            await expect(sheet.getByText(next.id, { exact: true })).toBeVisible();
+            // A fallback may legitimately name its parent A; its own model and prompt must belong to B.
+            await expect(sheet.getByText(fullFirst.model, { exact: true })).toHaveCount(0);
+            await expect(sheet.getByText(detailStatus === 200 ? fullNext.model : next.model, { exact: true }).first()).toBeVisible();
+            // A pending prompt for the current row must not reuse the previous row's name.
+            await expect(prompt).toHaveText(next.selected_prompt_name);
+            releasePrompt();
+            await expect(prompt).toHaveText("next-resolved-prompt");
+          }
+
+          if (detailStatus === 200) {
+            // Cached details for this same ID remain usable while polling and after its error.
+            await refetchStarted;
+            await expect(sheet.getByText(fullNext.model, { exact: true }).first()).toBeVisible();
+            const failedPoll = page.waitForResponse((response) =>
+              new URL(response.url()).pathname === `/api/logs/${next.id}` && response.status() === 500);
+            releaseRefetch();
+            await (await failedPoll).finished();
+            await expect(sheet.getByText(next.id, { exact: true })).toBeVisible();
+            await expect(sheet.getByText(fullNext.model, { exact: true }).first()).toBeVisible();
+          }
+
+          await expect(page).toHaveURL(new RegExp(`selected_log=${next.id}`));
+          if (offList) {
+            await page.goBack();
+          } else {
+            await sheet.getByRole("button", { name: "Previous log", exact: true }).click();
+          }
+          await expect(page).toHaveURL(new RegExp(`selected_log=${first.id}`));
+          await expect(sheet.getByText(first.id, { exact: true })).toBeVisible();
+          await expect(sheet.getByText(fullFirst.model, { exact: true }).first()).toBeVisible();
+          await expect(prompt).toHaveText("first-resolved-prompt");
+          await expect(sheet.getByRole("alert")).toHaveCount(0);
+        } finally {
+          releaseDetail();
+          releasePrompt();
+          releaseRefetch();
+        }
+      });
+    }
   }
 });
 

@@ -20,7 +20,7 @@ import {
 	useGetLogsStatsQuery,
 	useGetUserAgentMappingsQuery,
 } from "@/lib/store";
-import { useLazyGetLogByIdQuery, useLazyGetLogsQuery } from "@/lib/store/apis/logsApi";
+import { useLazyGetLogsQuery } from "@/lib/store/apis/logsApi";
 import type { DisplayLogEntry, LogEntry, LogFilters, Pagination } from "@/lib/types/logs";
 import { dateUtils } from "@/lib/types/logs";
 import { RbacOperation, RbacResource, useRbac } from "@enterprise/lib";
@@ -64,8 +64,6 @@ export default function LogsPage() {
 		}
 	}, []);
 	const [isChartOpen, setIsChartOpen] = useState(true);
-	const [triggerGetLogById] = useLazyGetLogByIdQuery();
-	const [fetchedLog, setFetchedLog] = useState<LogEntry | null>(null);
 
 	// Track if user has manually modified the time range
 	const userModifiedTimeRange = useRef<boolean>(false);
@@ -137,9 +135,8 @@ export default function LogsPage() {
 		},
 	);
 
-	// Derive selectedLog: find in current logs array, or fetch by ID from API
+	// The URL owns the active record, even when it is outside the current page.
 	const selectedLogId = urlState.selected_log || null;
-	const activeLogFetchId = useRef<string | null>(null);
 	const polling = urlState.polling;
 	// Grouped view collapses fallback chains under their root. Disabled while a
 	// session filter is active — that view is already scoped to one chain/session.
@@ -842,12 +839,9 @@ export default function LogsPage() {
 		}),
 		[expandedChainIds, loadingChainIds, handleToggleChain, expandedSessionIds, loadingSessionIds, handleToggleSession],
 	);
-	// Resolve the selected log from data already on screen — the page of roots
-	// first, then the children of any expanded chain. Children live outside
-	// `logs`, so without this second lookup clicking a child would fall through
-	// to the fetch-by-id effect below and the sheet would only appear after that
-	// round trip. Resolving locally opens the sheet immediately; the sheet still
-	// fetches the full record and shows its own loader while that lands.
+	// Pass an optional row to the sheet for its timestamp and error fallback.
+	// The selected URL ID owns the detail query, including records outside this
+	// page, expanded chains, and sessions; no previous lookup is kept here.
 	const selectedLogFromData = useMemo(() => {
 		if (!selectedLogId) return null;
 		const root = logs.find((l) => l.id === selectedLogId);
@@ -862,27 +856,6 @@ export default function LogsPage() {
 		}
 		return null;
 	}, [selectedLogId, logs, chainChildren, sessionMembers]);
-
-	useEffect(() => {
-		if (!selectedLogId || selectedLogFromData) {
-			setFetchedLog(null);
-			activeLogFetchId.current = null;
-			return;
-		}
-		const fetchId = selectedLogId;
-		activeLogFetchId.current = fetchId;
-		triggerGetLogById(selectedLogId).then((result) => {
-			if (activeLogFetchId.current === fetchId) {
-				if (result.data) {
-					setFetchedLog(result.data);
-				} else if (result.error) {
-					setError(getErrorMessage(result.error));
-				}
-			}
-		});
-	}, [selectedLogId, selectedLogFromData, triggerGetLogById]);
-
-	const selectedLog = selectedLogFromData ?? fetchedLog;
 
 	const selectedLogIndex = useMemo(() => (selectedLogId ? logs.findIndex((l) => l.id === selectedLogId) : -1), [selectedLogId, logs]);
 
@@ -1075,8 +1048,9 @@ export default function LogsPage() {
 
 					{/* Log Detail Sheet */}
 					<LogDetailSheet
-						log={selectedLog}
-						open={selectedLog !== null}
+						logId={selectedLogId}
+						log={selectedLogFromData}
+						open={selectedLogId !== null}
 						onOpenChange={(open) => !open && setUrlState({ selected_log: "" })}
 						handleDelete={hasDeleteAccess ? handleDelete : undefined}
 						canReveal={hasRevealAccess}

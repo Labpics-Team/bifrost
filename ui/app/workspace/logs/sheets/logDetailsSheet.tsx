@@ -1,16 +1,19 @@
 import { SheetNavigationButtons } from "@/components/sheetNavigationButtons";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { useSheetNavigation } from "@/hooks/useSheetNavigation";
+import { getErrorMessage } from "@/lib/store/apis/baseApi";
 import { useGetLogByIdQuery } from "@/lib/store/apis/logsApi";
 import { useGetPromptQuery } from "@/lib/store/apis/promptsApi";
 import type { LogEntry } from "@/lib/types/logs";
-import { Loader2 } from "lucide-react";
+import { AlertCircle, Loader2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { LogDetailView } from "./logDetailView";
 
 interface LogDetailSheetProps {
+	logId: string | null;
 	log: LogEntry | null;
 	open: boolean;
 	onOpenChange: (open: boolean) => void;
@@ -26,6 +29,7 @@ interface LogDetailSheetProps {
 }
 
 export function LogDetailSheet({
+	logId,
 	log,
 	open,
 	onOpenChange,
@@ -41,20 +45,24 @@ export function LogDetailSheet({
 }: LogDetailSheetProps) {
 	const { t } = useTranslation("observability");
 	const [pollingInterval, setPollingInterval] = useState(0);
+	const matchingLog = log?.id === logId ? log : null;
 	const {
 		currentData: fullLog,
 		isLoading,
 		isError,
-	} = useGetLogByIdQuery(log ? { id: log.id, timestamp: log.timestamp } : "", {
-		skip: !open || !log?.id,
+		error,
+	} = useGetLogByIdQuery(matchingLog ? { id: matchingLog.id, timestamp: matchingLog.timestamp } : (logId ?? ""), {
+		skip: !open || !logId,
 		pollingInterval,
 	});
 
 	const shouldPoll = isError || fullLog?.status === "processing";
 
-	const isFullDataReady = log != null && (isError || (fullLog?.id === log.id && !isLoading));
-	// Prefer full log when loaded; otherwise list row — enables prompt fetch in parallel with getLogById
-	const selectedPromptId = log ? (fullLog?.id === log.id ? fullLog : log).selected_prompt_id : undefined;
+	// A successful current-ID cache remains usable during polling and after its error.
+	const displayLog = fullLog?.id === logId ? fullLog : matchingLog;
+	const isFullDataReady = displayLog != null && (isError || (fullLog?.id === logId && !isLoading));
+	// The matching list row lets prompt and detail requests start in parallel.
+	const selectedPromptId = displayLog?.selected_prompt_id;
 	const { currentData: selectedPromptData } = useGetPromptQuery(selectedPromptId ?? "", {
 		skip: !open || !selectedPromptId,
 	});
@@ -71,20 +79,34 @@ export function LogDetailSheet({
 		onNavigate: (direction) => onNavigate?.(direction),
 	});
 
-	if (!log) return null;
+	if (!logId) return null;
 
-	// Show a loader only on the initial fetch, not during background polling refetches.
-	const displayLog: LogEntry = isFullDataReady && fullLog?.id === log.id ? fullLog : log;
-	const resolvedSelectedPromptName = selectedPromptData?.prompt?.name ?? displayLog.selected_prompt_name ?? "";
+	const resolvedSelectedPromptName = selectedPromptData?.prompt?.name ?? displayLog?.selected_prompt_name ?? "";
 
 	return (
 		<Sheet open={open} onOpenChange={onOpenChange}>
 			<SheetContent className="border-secondary flex w-full flex-col gap-2 overflow-x-hidden border p-0 sm:max-w-[60%] 2xl:max-w-[40%]">
-				{!isFullDataReady ? (
-					<div className="flex h-full items-center justify-center">
-						<SheetTitle className="sr-only">{t("logs.detail.loadingDetails")}</SheetTitle>
-						<Loader2 className="text-muted-foreground h-6 w-6 animate-spin" />
-					</div>
+				{!isFullDataReady || !displayLog ? (
+					<>
+						<SheetHeader headerClassName="mb-0 px-4 pt-4 md:px-8 md:pt-8">
+							<div className="flex min-w-0 flex-col gap-1">
+								<SheetTitle>{isError ? t("logs.detail.requestDetails") : t("logs.detail.loadingDetails")}</SheetTitle>
+								<p className="text-muted-foreground font-mono text-xs break-all">{logId}</p>
+							</div>
+						</SheetHeader>
+						{isError ? (
+							<div className="px-4 md:px-8">
+								<Alert variant="destructive">
+									<AlertCircle className="h-4 w-4" />
+									<AlertDescription>{getErrorMessage(error)}</AlertDescription>
+								</Alert>
+							</div>
+						) : (
+							<div className="flex min-h-0 flex-1 items-center justify-center">
+								<Loader2 className="text-muted-foreground h-6 w-6 animate-spin" />
+							</div>
+						)}
+					</>
 				) : (
 					<LogDetailView
 						log={displayLog}
