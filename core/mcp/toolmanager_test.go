@@ -29,6 +29,7 @@ import (
 type mockToolClientManager struct {
 	tools        []schemas.ChatTool
 	instructions []schemas.MCPServerInstructions
+	autoExecute  schemas.WhiteList
 }
 
 func (m *mockToolClientManager) GetClientByName(clientName string) *schemas.MCPClientState {
@@ -36,10 +37,11 @@ func (m *mockToolClientManager) GetClientByName(clientName string) *schemas.MCPC
 		return &schemas.MCPClientState{
 			Name: "test-client",
 			ExecutionConfig: &schemas.MCPClientConfig{
-				ID:               "test-client",
-				Name:             "test-client",
-				IsCodeModeClient: false,
-				ToolsToExecute:   []string{"*"},
+				ID:                 "test-client",
+				Name:               "test-client",
+				IsCodeModeClient:   false,
+				ToolsToExecute:     []string{"*"},
+				ToolsToAutoExecute: m.autoExecute,
 			},
 		}
 	}
@@ -1929,4 +1931,44 @@ func TestGetToolPerClient_AppOnlyToolsOfPerUserClients(t *testing.T) {
 	_, err := m.GetInjectedTool(userContext("alice"), "notes", "refresh")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "only callable from an MCP App")
+}
+
+func TestStreamingMCPDeclarationOwnership(t *testing.T) {
+	for _, requestType := range []schemas.RequestType{schemas.ChatCompletionStreamRequest, schemas.ResponsesStreamRequest} {
+		t.Run(string(requestType), func(t *testing.T) {
+			cm := &mockToolClientManager{
+				tools:       []schemas.ChatTool{makeTool("test-client-auto"), makeTool("test-client-local"), makeTool("test-client-manual")},
+				autoExecute: schemas.WhiteList{"auto", "local"},
+			}
+			tm := newToolsManagerForTest(cm)
+			req := buildChatRequest("test-client-local")
+			if requestType == schemas.ResponsesStreamRequest {
+				req = buildResponsesRequest("test-client-local")
+			}
+			req.RequestType = requestType
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			// Repeated merges must keep the exact declaration ownership.
+			req = tm.ParseAndAddToolsToRequest(ctx, req)
+			req = tm.ParseAndAddToolsToRequest(ctx, req)
+			got := map[string]bool{}
+			if req.ChatRequest != nil {
+				for _, tool := range req.ChatRequest.Params.Tools {
+					got[tool.Function.Name] = tool.GatewayAutoExecute
+				}
+				require.Len(t, req.ChatRequest.Params.Tools, 3)
+			} else {
+				for _, tool := range req.ResponsesRequest.Params.Tools {
+					got[*tool.Name] = tool.GatewayAutoExecute
+				}
+				require.Len(t, req.ResponsesRequest.Params.Tools, 3)
+			}
+			assert.Equal(t, map[string]bool{"test-client-auto": true, "test-client-local": false, "test-client-manual": false}, got)
+			for _, tool := range cm.tools {
+				assert.False(t, tool.GatewayAutoExecute, "shared discovery must not gain request ownership")
+			}
+			for _, tool := range tm.GetAvailableTools(ctx) {
+				assert.False(t, tool.GatewayAutoExecute, "a discovery is not a declaration")
+			}
+		})
+	}
 }

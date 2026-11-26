@@ -3505,10 +3505,12 @@ func ToolSearchVariantName(rawType string) string {
 
 // ResponsesTool represents a tool
 type ResponsesTool struct {
-	Type        ResponsesToolType `json:"type"`                  // "function" | "file_search" | "computer_use_preview" | "web_search" | "web_search_2025_08_26" | "mcp" | "code_interpreter" | "image_generation" | "local_shell" | "custom" | "web_search_preview" | "web_search_preview_2025_03_11" | "x_search"
-	Name        *string           `json:"name,omitempty"`        // Common name field (Function, Custom tools)
-	Description *string           `json:"description,omitempty"` // Common description field (Function, Custom tools)
-	Async       *bool             `json:"async,omitempty"`       // OpenAI async tool calling (Function, Custom tools)
+	// Same internal declaration ownership as ChatTool.GatewayAutoExecute.
+	GatewayAutoExecute bool              `json:"-"`
+	Type               ResponsesToolType `json:"type"`                  // "function" | "file_search" | "computer_use_preview" | "web_search" | "web_search_2025_08_26" | "mcp" | "code_interpreter" | "image_generation" | "local_shell" | "custom" | "web_search_preview" | "web_search_preview_2025_03_11" | "x_search"
+	Name               *string           `json:"name,omitempty"`        // Common name field (Function, Custom tools)
+	Description        *string           `json:"description,omitempty"` // Common description field (Function, Custom tools)
+	Async              *bool             `json:"async,omitempty"`       // OpenAI async tool calling (Function, Custom tools)
 
 	// Not in OpenAI's schemas, but sent by a few providers (Anthropic, Bedrock are some of them)
 	CacheControl *CacheControl `json:"cache_control,omitempty"`
@@ -3713,6 +3715,8 @@ func (t ResponsesTool) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON implements custom JSON unmarshaling for ResponsesTool
 // It unmarshals common fields first, then the appropriate embedded struct based on type
 func (t *ResponsesTool) UnmarshalJSON(data []byte) error {
+	// Ownership is assigned by the gateway, never inherited by a decoded tool.
+	t.GatewayAutoExecute = false
 	// gjson never validates its input, so the malformed-JSON rejection the
 	// previous map decode gave us for free has to be explicit here.
 	if !gjson.ValidBytes(data) {

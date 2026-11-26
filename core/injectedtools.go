@@ -39,6 +39,9 @@ type injectedToolSet struct {
 type injectedTarget struct {
 	clientName string // owning MCP client
 	toolName   string // prefixed "<client>-<tool>" name the MCP manager executes
+	// Only an explicit provider configuration carries the existing operator vouch.
+	// A tool admitted via the caller must pass ordinary MCP authorization.
+	providerConfigured bool
 }
 
 func (s *injectedToolSet) isInjected(name string) bool {
@@ -61,7 +64,7 @@ func (s *injectedToolSet) duplicates(name string) bool {
 		return false
 	}
 	_, mcp := s.mcpNames[name]
-	return mcp || s.isInjected(name)
+	return mcp || s.targets[name].providerConfigured || (s.search != nil && name == toolsearch.ToolName)
 }
 
 // resolveInjectedTools returns the tools to inject for one attempt, or nil when the
@@ -108,7 +111,7 @@ func resolveInjectedTools(ctx context.Context, src injectedToolSource, config *s
 			}
 			continue
 		}
-		set.targets[ref.Name] = injectedTarget{clientName: ref.MCPClientName, toolName: tool.Function.Name}
+		set.targets[ref.Name] = injectedTarget{clientName: ref.MCPClientName, toolName: tool.Function.Name, providerConfigured: true}
 		set.mcpNames[tool.Function.Name] = ref.Name
 		// GetInjectedTool returns a copy, so renaming it never touches the stored schema.
 		tool.Function.Name = ref.Name
@@ -147,7 +150,7 @@ func nativeToolName(name string) string {
 // applyInjectedToolsChat returns a copy of r with the native web search removed and the
 // injected tools declared. r and its Params are never written.
 func applyInjectedToolsChat(r *schemas.BifrostChatRequest, set *injectedToolSet) *schemas.BifrostChatRequest {
-	if r == nil || set == nil {
+	if r == nil || set == nil || len(set.tools) == 0 {
 		return r
 	}
 	cp := *r
@@ -350,7 +353,7 @@ func pinInjectedResponsesAllowedTools(choice *schemas.ResponsesToolChoice, set *
 
 // applyInjectedToolsResponses is the Responses API parallel of applyInjectedToolsChat.
 func applyInjectedToolsResponses(r *schemas.BifrostResponsesRequest, set *injectedToolSet) *schemas.BifrostResponsesRequest {
-	if r == nil || set == nil {
+	if r == nil || set == nil || len(set.tools) == 0 {
 		return r
 	}
 	cp := *r
@@ -739,8 +742,53 @@ func (bifrost *Bifrost) injectedToolsForAttempt(ctx *schemas.BifrostContext, con
 	var set *injectedToolSet
 	if bifrost.MCPManager != nil {
 		set = resolveInjectedTools(ctx, bifrost.MCPManager, config, req.RequestType, bifrost.logger)
+		if req.RequestType == schemas.ChatCompletionStreamRequest || req.RequestType == schemas.ResponsesStreamRequest {
+			set = withAdmittedStreamingMCP(set, req, bifrost.MCPManager.GetMaxAgentDepth())
+		}
 	}
 	return withGatewayToolSearch(set, req, baseProvider, schemas.ResolveCanonicalModel(ctx, model))
+}
+
+// withAdmittedStreamingMCP reuses the native injected-tool streaming loop for
+// direct, auto-executable MCP declarations that Bifrost actually added. The
+// original declaration stays in place: unlike provider injection, this never
+// replaces a caller's tool, aliases its name, or grants additional permissions.
+// The existing non-streaming MCP agent loop remains unchanged.
+func withAdmittedStreamingMCP(set *injectedToolSet, req *schemas.BifrostRequest, maxDepth int) *injectedToolSet {
+	if maxDepth <= 0 {
+		maxDepth = schemas.DefaultMaxAgentDepth
+	}
+	add := func(name string) {
+		if name == "" || set.duplicates(name) {
+			return
+		}
+		if set == nil {
+			set = &injectedToolSet{maxDepth: maxDepth}
+		}
+		if set.targets == nil {
+			set.targets = make(map[string]injectedTarget)
+		}
+		set.targets[name] = injectedTarget{toolName: name}
+	}
+	switch req.RequestType {
+	case schemas.ChatCompletionStreamRequest:
+		if r := req.ChatRequest; r != nil && r.Params != nil {
+			for _, tool := range r.Params.Tools {
+				if tool.GatewayAutoExecute && tool.Type == schemas.ChatToolTypeFunction && tool.Function != nil {
+					add(tool.Function.Name)
+				}
+			}
+		}
+	case schemas.ResponsesStreamRequest:
+		if r := req.ResponsesRequest; r != nil && r.Params != nil {
+			for _, tool := range r.Params.Tools {
+				if tool.GatewayAutoExecute && tool.Type == schemas.ResponsesToolTypeFunction && tool.Name != nil {
+					add(*tool.Name)
+				}
+			}
+		}
+	}
+	return set
 }
 
 // withGatewayToolSearch adds the gateway tool search to set when the attempt needs it.
@@ -793,9 +841,9 @@ func (bifrost *Bifrost) runInjectedTools(provider schemas.Provider, config *sche
 
 // executeInjectedCall runs one injected tool call through the MCP plugin pipeline.
 //
-// The call runs in its own context marked with the tool it is allowed to run, so the
-// client's tools_to_execute, the caller's include lists and the virtual key's tool
-// permits do not refuse a tool the operator configured. A failure goes back to the
+// The call runs in its own context. Only explicitly provider-configured tools
+// retain the operator vouch; caller-admitted tools use ordinary MCP authorization
+// and unattended-execution approval checks. A failure goes back to the
 // model as an error result rather than failing the request: the model can answer
 // without search, and a search outage must not become an outage of the provider.
 func (bifrost *Bifrost) executeInjectedCall(ctx *schemas.BifrostContext, set *injectedToolSet, call schemas.ChatAssistantMessageToolCall) *schemas.ChatMessage {
@@ -808,7 +856,12 @@ func (bifrost *Bifrost) executeInjectedCall(ctx *schemas.BifrostContext, set *in
 	toolCtx := schemas.NewBifrostContext(ctx, schemas.NoDeadline)
 	toolCtx.SetValue(schemas.BifrostContextKeyMCPLogID, uuid.New().String())
 	call, target := mcpInjectedCall(set, call)
-	mcpvouch.Set(toolCtx, schemas.MCPToolCallKindInjected, target.clientName, target.toolName)
+	if target.providerConfigured {
+		mcpvouch.Set(toolCtx, schemas.MCPToolCallKindInjected, target.clientName, target.toolName)
+	} else {
+		// An admitted auto-execute tool uses the same permissions as Agent Mode.
+		toolCtx.SetValue(schemas.BifrostContextKeyMCPUnattendedExecution, true)
+	}
 	result, bifrostErr := bifrost.MCPManager.ExecuteChatTool(toolCtx, &call)
 	if bifrostErr == nil && result != nil {
 		return result

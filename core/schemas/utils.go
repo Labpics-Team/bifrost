@@ -994,7 +994,8 @@ func deepCopyChatContentBlock(original ChatContentBlock) ChatContentBlock {
 // to prevent shared data mutation between different plugin accumulators
 func DeepCopyChatTool(original ChatTool) ChatTool {
 	copyTool := ChatTool{
-		Type: original.Type,
+		Type:               original.Type,
+		GatewayAutoExecute: original.GatewayAutoExecute,
 		// Anthropic server tools (shape 3) carry their identity at the top level:
 		// Name for computer/text_editor/bash/memory/web_* tools, MCPServerName for
 		// mcp_toolset. Copying these is required or the cloned request loses the

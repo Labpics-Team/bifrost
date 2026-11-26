@@ -36,7 +36,8 @@ func (ct *ChatTool) ToResponsesTool() *ResponsesTool {
 	}
 
 	rt := &ResponsesTool{
-		Type: ResponsesToolType(ct.Type),
+		Type:               ResponsesToolType(ct.Type),
+		GatewayAutoExecute: ct.GatewayAutoExecute,
 	}
 
 	// Convert function tools
@@ -82,7 +83,8 @@ func (rt *ResponsesTool) ToChatTool() *ChatTool {
 	}
 
 	ct := &ChatTool{
-		Type: ChatToolType(rt.Type),
+		Type:               ChatToolType(rt.Type),
+		GatewayAutoExecute: rt.GatewayAutoExecute,
 	}
 
 	// Convert function tools
