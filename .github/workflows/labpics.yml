@@ -17,7 +17,10 @@ jobs:
   verify:
     name: Fork verification
     runs-on: ${{ fromJSON(github.event.repository.visibility == 'public' && '["ubuntu-latest"]' || vars.CI_RUNNER || '') }}
-    timeout-minutes: 45
+    # Full short suites plus mandatory regressions on the 2.6 workspace were
+    # still making progress at 45 minutes. Individual Go runs retain their
+    # 15-minute corpus and 5-minute regression timeouts in ci/verify.py.
+    timeout-minutes: 90
     env:
       VERIFY_CONTAINER: bifrost-verify-${{ github.run_id }}-${{ github.run_attempt }}
       GO_IMAGE: golang:1.27.4-alpine3.24@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf
