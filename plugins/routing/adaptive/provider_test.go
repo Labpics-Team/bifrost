@@ -3,6 +3,7 @@ package adaptive
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"strings"
@@ -142,7 +143,7 @@ func TestAdaptiveProviderRecoversFromTransientFailureOnRealTraffic(t *testing.T)
 	}
 }
 
-func TestAdaptiveProviderRecoveryProbeKeepsOtherRequestsOnHealthyAlternative(t *testing.T) {
+func TestAdaptiveProviderRecoveryPreservesNativeRouting(t *testing.T) {
 	for _, provider := range []schemas.ModelProvider{"", "p1"} {
 		name := "bare model"
 		if provider != "" {
@@ -166,8 +167,14 @@ func TestAdaptiveProviderRecoveryProbeKeepsOtherRequestsOnHealthyAlternative(t *
 				t.Fatal(err)
 			}
 			p, model, fallbacks := probe.GetRequestFields()
-			if p != "p1" || len(fallbacks) != 1 || fallbacks[0].Provider != "p2" {
-				t.Fatalf("due check lost its healthy fallback: %s %+v", p, fallbacks)
+			if p != "p1" {
+				t.Fatalf("recovering provider was skipped: %s", p)
+			}
+			if provider == "" && (len(fallbacks) != 1 || fallbacks[0].Provider != "p2") {
+				t.Fatalf("due check lost its healthy fallback: %+v", fallbacks)
+			}
+			if provider != "" && len(fallbacks) != 0 {
+				t.Fatalf("recovering named provider added unrequested fallbacks: %+v", fallbacks)
 			}
 			key, err := c.SelectKey(ctx, keys, p, model)
 			if err != nil {
@@ -184,11 +191,11 @@ func TestAdaptiveProviderRecoveryProbeKeepsOtherRequestsOnHealthyAlternative(t *
 				t.Fatal(err)
 			}
 			p, _, fallbacks = other.GetRequestFields()
-			if p != "p2" {
-				t.Fatalf("provider received ordinary traffic while its recovery check was in flight: %s", p)
+			if provider == "" && (p != "p2" || len(fallbacks) != 1 || fallbacks[0].Provider != "p1") {
+				t.Fatalf("ordinary traffic lost the healthiest provider or usable recovery fallback: %s %+v", p, fallbacks)
 			}
-			if provider == "" && len(fallbacks) != 0 {
-				t.Fatalf("in-flight check was offered as a healthy fallback: %+v", fallbacks)
+			if provider != "" && (p != "p1" || len(fallbacks) != 0) {
+				t.Fatalf("recovering named provider was redirected or given unrequested fallbacks: %s %+v", p, fallbacks)
 			}
 
 			attempt.Observe(&schemas.BifrostResponse{}, nil)
@@ -493,5 +500,334 @@ func TestAdaptiveLeavesLargePayloadExtensionToNativeSelection(t *testing.T) {
 				t.Error("extension request changed adaptive state")
 			}
 		})
+	}
+}
+
+// Ranking must let a provider earn traffic back from live outcomes even when
+// its healthy alternative never fails.
+func TestAdaptiveProviderRecoveryContinuesUntilHealthy(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		status, failures int
+	}{
+		{"hold", 401, 1}, {"transient", 503, 3}, {"degraded", 500, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, now := providerController()
+			for _, key := range testKeys {
+				for range tc.failures {
+					observe(c, "p1", "m", key.ID, responseError(tc.status))
+				}
+				observe(c, "p2", "m", key.ID, nil)
+			}
+			for range 40 {
+				*now = now.Add(time.Minute)
+				ctx := testContext()
+				req := routeRequest("")
+				if err := c.Route(ctx, req); err != nil {
+					t.Fatal(err)
+				}
+				provider, _, _ := req.GetRequestFields()
+				key, err := c.SelectKey(ctx, testKeys, provider, "m")
+				if err != nil {
+					t.Fatal(err)
+				}
+				observeWithContext(c, ctx, provider, "m", key.ID, nil)
+			}
+			for _, row := range c.Status() {
+				if row.Provider == "p1" && row.State != "healthy" {
+					t.Fatalf("provider never earned traffic back: %+v", row)
+				}
+			}
+		})
+	}
+}
+
+func TestAdaptiveRecoveryObservationUsesOneLiveLease(t *testing.T) {
+	c, now := providerController()
+	keys := testKeys[:1]
+	c.SetCatalog(func(string) []schemas.ModelProvider { return []schemas.ModelProvider{"p1", "p2"} },
+		func(context.Context, schemas.ModelProvider) ([]schemas.Key, error) { return keys, nil },
+		func(schemas.ModelProvider, schemas.Key, string) bool { return true })
+	observe(c, "p1", "m", "a", responseError(503))
+	observe(c, "p2", "m", "a", nil)
+	*now = now.Add(31 * time.Second)
+	pick := func(ctx *schemas.BifrostContext, want schemas.ModelProvider) {
+		t.Helper()
+		req := routeRequest("")
+		if err := c.Route(ctx, req); err != nil {
+			t.Fatal(err)
+		}
+		if got, _, _ := req.GetRequestFields(); got != want {
+			t.Fatalf("selected %s, want %s", got, want)
+		}
+	}
+	check := testContext()
+	pick(check, "p1")
+	for range 10 {
+		pick(testContext(), "p2")
+	}
+	key, err := c.SelectKey(check, keys, "p1", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observeWithContext(c, check, "p1", "m", key.ID, nil)
+	pick(testContext(), "p2")
+	*now = now.Add(29 * time.Second)
+	pick(testContext(), "p2")
+	*now = now.Add(2 * time.Second)
+	pick(testContext(), "p1")
+}
+
+func TestAdaptiveChoosesHealthiestProviderAndWeightsKeys(t *testing.T) {
+	c, _ := providerController()
+	for _, key := range testKeys {
+		observe(c, "p1", "m", key.ID, responseError(503))
+		observe(c, "p2", "m", key.ID, nil)
+	}
+	for range 100 {
+		req := routeRequest("")
+		if err := c.Route(testContext(), req); err != nil {
+			t.Fatal(err)
+		}
+		p, _, f := req.GetRequestFields()
+		if p != "p2" || len(f) != 1 || f[0].Provider != "p1" {
+			t.Fatalf("healthiest provider not selected: %s %+v", p, f)
+		}
+	}
+	// Unlike provider ranking, usable keys keep a share of traffic.
+	chosen := map[string]int{}
+	for range 500 {
+		k, err := c.SelectKey(testContext(), testKeys, "p1", "m")
+		if err != nil {
+			t.Fatal(err)
+		}
+		chosen[k.ID]++
+	}
+	if chosen["a"] == 0 || chosen["b"] == 0 {
+		t.Fatalf("usable key starved: %v", chosen)
+	}
+}
+
+func staticProviderRecovery(t *testing.T) (*Controller, *time.Time, []schemas.Key) {
+	t.Helper()
+	c, now := providerController()
+	cfg := c.Config()
+	cfg.RouteSelectionEnabled = false
+	if err := c.Apply(cfg); err != nil {
+		t.Fatal(err)
+	}
+	keys := []schemas.Key{{ID: "a", Name: "A", Weight: 0}, {ID: "b", Name: "B", Weight: 1}}
+	c.SetCatalog(func(string) []schemas.ModelProvider { return []schemas.ModelProvider{"p1", "p2"} },
+		func(context.Context, schemas.ModelProvider) ([]schemas.Key, error) { return keys, nil },
+		func(schemas.ModelProvider, schemas.Key, string) bool { return true })
+	for _, key := range keys {
+		for range 3 {
+			observe(c, "p1", "m", key.ID, responseError(503))
+		}
+		observe(c, "p2", "m", key.ID, nil)
+	}
+	*now = now.Add(31 * time.Second)
+	return c, now, keys
+}
+
+func requireRecoveryProvider(t *testing.T, c *Controller, ctx *schemas.BifrostContext, want schemas.ModelProvider) {
+	t.Helper()
+	req := routeRequest("")
+	if err := c.Route(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ := req.GetRequestFields(); got != want {
+		t.Fatalf("selected %s, want %s", got, want)
+	}
+}
+
+func beginStaticRecoveryAttempt(t *testing.T, c *Controller, ctx *schemas.BifrostContext, keys []schemas.Key) schemas.ProviderAttempt {
+	t.Helper()
+	key, err := c.SelectKey(ctx, keys, "p1", "m")
+	if err != nil || key.ID != "b" {
+		t.Fatalf("provider recovery changed configured key selection: key=%s error=%v", key.ID, err)
+	}
+	a := c.BeginProviderAttempt(ctx, schemas.ProviderAttemptInfo{Provider: "p1", Model: "m", KeyID: key.ID, KeyName: key.Name})
+	if a == nil {
+		t.Fatal("selected key lost its real attempt observer")
+	}
+	return a
+}
+
+func TestAdaptiveProviderRecoveryPreservesStaticKeyAndAdmission(t *testing.T) {
+	c, now, keys := staticProviderRecovery(t)
+	ctx := testContext()
+	requireRecoveryProvider(t, c, ctx, "p1")
+	a := beginStaticRecoveryAttempt(t, c, ctx, keys)
+	defer a.End()
+
+	// Both keys failed, but concurrent requests share one provider check.
+	results := make(chan error, 8)
+	for range cap(results) {
+		go func() {
+			req := routeRequest("")
+			err := c.Route(testContext(), req)
+			if got, _, _ := req.GetRequestFields(); err == nil && got != "p2" {
+				err = fmt.Errorf("active provider check admitted another request to %s", got)
+			}
+			results <- err
+		}()
+	}
+	for range cap(results) {
+		if err := <-results; err != nil {
+			t.Error(err)
+		}
+	}
+
+	a.Observe(&schemas.BifrostResponse{}, nil)
+	a.End()
+	status := make(map[string]RouteStatus)
+	for _, row := range c.Status() {
+		if row.Provider == "p1" && row.Model == "m" {
+			status[row.KeyID] = row
+		}
+	}
+	if got := status["a"]; got.Samples != 3 || got.ErrorRate != 1 || got.State != "recovering" {
+		t.Fatalf("unattempted key received recovery: %+v", got)
+	}
+	if got := status["b"]; got.Samples != 4 || got.ErrorRate >= 1 || got.State != "recovering" || got.Inflight != 0 {
+		t.Fatalf("actual static key did not receive its successful observation: %+v", got)
+	}
+	requireRecoveryProvider(t, c, testContext(), "p2")
+	*now = now.Add(29 * time.Second)
+	requireRecoveryProvider(t, c, testContext(), "p2")
+	*now = now.Add(2 * time.Second)
+	requireRecoveryProvider(t, c, testContext(), "p1")
+}
+
+func TestAdaptiveProviderRecoveryStaleCompletionKeepsNewAdmission(t *testing.T) {
+	c, now, keys := staticProviderRecovery(t)
+	oldCtx := testContext()
+	requireRecoveryProvider(t, c, oldCtx, "p1")
+	old := beginStaticRecoveryAttempt(t, c, oldCtx, keys)
+	defer old.End()
+
+	*now = now.Add(5*time.Minute + time.Second)
+	currentCtx := testContext()
+	requireRecoveryProvider(t, c, currentCtx, "p1")
+	current := beginStaticRecoveryAttempt(t, c, currentCtx, keys)
+	defer current.End()
+	old.Observe(&schemas.BifrostResponse{}, nil)
+	old.End()
+
+	// A stale completion must not turn the new five-minute admission into
+	// a thirty-second cooldown while the replacement call is still running.
+	*now = now.Add(31 * time.Second)
+	requireRecoveryProvider(t, c, testContext(), "p2")
+	current.End()
+	*now = now.Add(31 * time.Second)
+	requireRecoveryProvider(t, c, testContext(), "p1")
+}
+
+func TestAdaptiveProviderRecoveryAbandonedAttemptReleasesAdmission(t *testing.T) {
+	for _, name := range []string{"cancelled", "no response", "empty model", "fallback provider", "different model"} {
+		t.Run(name, func(t *testing.T) {
+			c, now, keys := staticProviderRecovery(t)
+			parent, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ctx := schemas.NewBifrostContext(parent, schemas.NoDeadline)
+			requireRecoveryProvider(t, c, ctx, "p1")
+			info := schemas.ProviderAttemptInfo{Provider: "p1", Model: "m", KeyID: "b", KeyName: "B"}
+			switch name {
+			case "empty model":
+				info.Model = ""
+			case "fallback provider":
+				info.Provider = "p2"
+			case "different model":
+				info.Model = "other"
+			}
+			a := c.BeginProviderAttempt(ctx, info)
+			if name == "empty model" {
+				if a != nil {
+					t.Fatal("invalid route unexpectedly began an observation")
+				}
+			} else {
+				if a == nil {
+					t.Fatal("actual route lost its attempt observer")
+				}
+				defer a.End()
+				switch name {
+				case "cancelled":
+					a.Observe(&schemas.BifrostResponse{}, nil)
+					cancel()
+					a.End()
+				case "no response":
+					a.End()
+				}
+			}
+			requireRecoveryProvider(t, c, testContext(), "p2")
+			*now = now.Add(31 * time.Second)
+			// A fallback on another provider/model may still be running.
+			// It must release the original admission at dispatch, not at End.
+			requireRecoveryProvider(t, c, testContext(), "p1")
+			observed := 0
+			for _, row := range c.Status() {
+				if row.Provider != "p1" || row.Model != "m" {
+					continue
+				}
+				observed++
+				if row.Samples != 3 || row.ErrorRate != 1 || row.State != "recovering" || row.Inflight != 0 {
+					t.Fatalf("abandoned or different attempt changed original key health: %+v", row)
+				}
+			}
+			if observed != len(keys) {
+				t.Fatalf("lost original key observations: got %d, want %d", observed, len(keys))
+			}
+		})
+	}
+}
+
+func TestAdaptiveProviderRecoveryCapacityPreservesLiveChecks(t *testing.T) {
+	c, now := testController()
+	reserve := func(model string) (probeReservation, bool) {
+		ctx := testContext()
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		ok := c.reserveProviderCheckLocked(ctx, routeID{Provider: "p1", Model: model}, *now)
+		lease, _ := ctx.Value(probeContextKey{}).(probeReservation)
+		return lease, ok
+	}
+	leases := make([]probeReservation, maxRoutes)
+	for i := range leases {
+		var ok bool
+		leases[i], ok = reserve(fmt.Sprint(i))
+		if !ok {
+			t.Fatalf("admission refused before its capacity at %d", i)
+		}
+	}
+	if _, ok := reserve("overflow"); ok || len(c.providerChecks) > maxRoutes {
+		t.Fatal("provider admission exceeded its memory bound")
+	}
+	if err := c.maintain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, lease := range leases {
+		if !c.reservationCurrentLocked(lease, *now) {
+			t.Fatalf("capacity pressure or maintenance evicted a live check for %s", lease.Model)
+		}
+	}
+	*now = now.Add(5*time.Minute + time.Second)
+	current, ok := reserve("overflow")
+	if !ok {
+		t.Fatal("expired admissions prevented a new real check")
+	}
+	if err := c.maintain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.providerChecks) != 1 || !c.reservationCurrentLocked(current, *now) {
+		t.Fatal("maintenance did not discard expired checks while retaining the live one")
+	}
+	*now = now.Add(5*time.Minute + time.Second)
+	if err := c.maintain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.providerChecks) != 0 {
+		t.Fatal("expired provider admissions were retained without further traffic")
 	}
 }

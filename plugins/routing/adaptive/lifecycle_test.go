@@ -349,11 +349,16 @@ func adaptiveHealthyTrafficDuringSQLiteWait(t *testing.T, due, routeProvider boo
 					served <- err
 					return
 				}
-				if chosen, _, _ := req.GetRequestFields(); chosen != "p2" {
-					served <- fmt.Errorf("expected healthy provider p2, got %s", chosen)
+				want := schemas.ModelProvider("p2")
+				if provider == "p1" && status == 503 && due {
+					want = "p1" // A recovering named provider retains its requests.
+				}
+				chosen, _, _ := req.GetRequestFields()
+				if chosen != want || ctx.Value(probeContextKey{}) != nil {
+					served <- fmt.Errorf("expected ordinary provider %s while writer is busy, got %s", want, chosen)
 					return
 				}
-				observeWithContext(c, ctx, "p2", "m", "b", nil)
+				observeWithContext(c, ctx, chosen, "m", "b", nil)
 			}
 			served <- nil
 			return
@@ -361,9 +366,9 @@ func adaptiveHealthyTrafficDuringSQLiteWait(t *testing.T, due, routeProvider boo
 		for _, model := range []string{"m", "new-model"} {
 			ctx := testContext()
 			key, err := c.SelectKey(ctx, testKeys, "p1", model)
-			// A transient failure only affects m. A new model can use either
-			// key, while a credential refusal holds a across every model.
-			mustUseB := status == 401 || model == "m"
+			// A transient cooldown only affects m until it expires. A held
+			// credential remains excluded across every model.
+			mustUseB := status == 401 || model == "m" && !due
 			if err != nil || key.ID != "a" && key.ID != "b" || mustUseB && key.ID != "b" {
 				served <- fmt.Errorf("expected healthy key for %s after %d, got %s: %v", model, status, key.ID, err)
 				return
@@ -805,5 +810,113 @@ func TestAdaptiveNativeKeyRoundTripPreservesHold(t *testing.T) {
 	}
 	if len(loaded.conditions) != 1 {
 		t.Fatal("native default materialization released the persisted hold")
+	}
+}
+
+func TestAdaptivePartialHoldDegradesProviderAndDefersDiagnostic(t *testing.T) {
+	c, _ := providerController()
+	observe(c, "p1", "m", "a", responseError(401))
+	// A whole-key refusal applies to another model even when no failing
+	// attempt was observed on that model. Its healthy sibling still serves.
+	c.lifeMu.Lock()
+	served := make(chan struct{})
+	go func() {
+		observe(c, "p1", "new-model", "b", nil)
+		close(served)
+	}()
+	select {
+	case <-served:
+		c.lifeMu.Unlock()
+	case <-time.After(time.Second):
+		c.lifeMu.Unlock()
+		<-served
+		t.Fatal("healthy attempt waited for diagnostic persistence")
+	}
+	c.mu.Lock()
+	pending := len(c.pendingDiagnostics)
+	c.mu.Unlock()
+	if pending == 0 {
+		t.Fatal("partial hold diagnostic was lost instead of deferred")
+	}
+	c.flushDiagnostics()
+	i := c.incidentLocked(routeID{Provider: "p1", Model: "new-model"})
+	if i == nil || i.State != "degraded" {
+		t.Fatalf("partial provider failure not recorded: %+v", i)
+	}
+}
+
+func TestAdaptiveReholdResumesAndResetsLadder(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    int
+		nextModel string
+	}{
+		{"whole-key", 401, "other"},
+		{"model", 429, "m"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, now := testController()
+			id := routeID{Provider: "p1", Model: "m", KeyID: "a"}
+			refuse := func(model string) { observe(c, "p1", model, "a", responseError(tc.status)) }
+			refuse("m")
+			h := c.holdLocked(id, *now)
+			*now = h.HoldUntil.Add(time.Second)
+			refuse("m")
+			h = c.holdLocked(id, *now)
+			if h.Rung != 2 {
+				t.Fatalf("first failed check rung=%d", h.Rung)
+			}
+			*now = h.HoldUntil.Add(time.Second)
+			observe(c, "p1", "m", "a", nil)
+			*now = now.Add(time.Minute)
+			refuse(tc.nextModel)
+			h = c.holdLocked(routeID{Provider: "p1", Model: tc.nextModel, KeyID: "a"}, *now)
+			if h == nil || h.Rung != 2 {
+				t.Fatalf("flapping hold reset its ladder: %+v", h)
+			}
+			if err := c.Release(context.Background(), "p1", "a", ""); err != nil {
+				t.Fatal(err)
+			}
+			refuse("m")
+			h = c.holdLocked(id, *now)
+			if h == nil || h.Rung != 1 {
+				t.Fatalf("operator release did not reset ladder: %+v", h)
+			}
+			*now = h.HoldUntil.Add(time.Second)
+			refuse("m")
+			h = c.holdLocked(id, *now)
+			*now = h.HoldUntil.Add(time.Second)
+			observe(c, "p1", "m", "a", nil)
+			*now = now.Add(11 * time.Minute)
+			refuse("m")
+			h = c.holdLocked(id, *now)
+			if h == nil || h.Rung != 1 {
+				t.Fatalf("expired release window retained ladder: %+v", h)
+			}
+		})
+	}
+}
+
+func TestAdaptiveRecentReleaseMemoryIsBounded(t *testing.T) {
+	c, now := testController()
+	observe(c, "p1", "m", "a", responseError(401))
+	held := c.holdLocked(routeID{Provider: "p1", Model: "m", KeyID: "a"}, *now)
+	for i := range maxRoutes + 1 {
+		c.rememberReleasedLocked(&condition{
+			routeID:   routeID{Provider: "p2", Model: fmt.Sprint(i), KeyID: "b"},
+			HoldClass: schemas.FailureClassRateLimit, Rung: 2, KeyRevision: "revision",
+		}, now.Add(time.Duration(i)*time.Millisecond))
+	}
+	if len(c.releasedHolds) != maxRoutes {
+		t.Fatalf("unbounded recent releases: %d", len(c.releasedHolds))
+	}
+	if _, exists := c.releasedHolds[routeID{Provider: "p2", Model: "0", KeyID: "b"}]; exists {
+		t.Fatal("oldest release was retained")
+	}
+	if got := c.reholdRungLocked(routeID{Provider: "p2", Model: fmt.Sprint(maxRoutes), KeyID: "b"}, schemas.FailureClassRateLimit, "revision", now.Add(time.Minute)); got != 2 {
+		t.Fatalf("newest release lost its rung: %d", got)
+	}
+	if c.holdLocked(routeID{Provider: "p1", Model: "m", KeyID: "a"}, *now) != held {
+		t.Fatal("disposable history evicted an active hold")
 	}
 }

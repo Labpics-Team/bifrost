@@ -31,21 +31,22 @@ type routeID struct {
 
 type route struct {
 	routeID
-	KeyRevision  string               `json:"key_revision"`
-	Epoch        uint64               `json:"-"`
-	KeyName      string               `json:"key_name"`
-	Samples      uint64               `json:"samples"`
-	ErrorRate    float64              `json:"error_rate"`
-	LatencyMS    float64              `json:"latency_ms"`
-	Inflight     int                  `json:"inflight"`
-	Consecutive  int                  `json:"consecutive_failures"`
-	Recoveries   int                  `json:"recoveries"`
-	LastSeen     time.Time            `json:"last_seen"`
-	ProbeUntil   time.Time            `json:"-"`
-	ProbeID      uint64               `json:"-"`
-	Recovering   bool                 `json:"recovering"`
-	FailedUntil  time.Time            `json:"failed_until,omitempty"`
-	FailureClass schemas.FailureClass `json:"failure_class,omitempty"`
+	KeyRevision       string               `json:"key_revision"`
+	Epoch             uint64               `json:"-"`
+	KeyName           string               `json:"key_name"`
+	Samples           uint64               `json:"samples"`
+	ErrorRate         float64              `json:"error_rate"`
+	LatencyMS         float64              `json:"latency_ms"`
+	BaselineLatencyMS float64              `json:"baseline_latency_ms,omitempty"`
+	Inflight          int                  `json:"inflight"`
+	Consecutive       int                  `json:"consecutive_failures"`
+	Recoveries        int                  `json:"recoveries"`
+	LastSeen          time.Time            `json:"last_seen"`
+	ProbeUntil        time.Time            `json:"-"`
+	ProbeID           uint64               `json:"-"`
+	Recovering        bool                 `json:"recovering"`
+	FailedUntil       time.Time            `json:"failed_until,omitempty"`
+	FailureClass      schemas.FailureClass `json:"failure_class,omitempty"`
 }
 
 type RouteStatus struct {
@@ -70,32 +71,35 @@ type Controller struct {
 	keyless        func(schemas.ModelProvider) bool
 	providerExists func(schemas.ModelProvider) bool
 	// lifeMu serializes durable transitions. mu is never held over database IO.
-	lifeMu            sync.Mutex
-	conditions        map[routeID]*condition
-	keyStates         map[routeID]*keyState
-	providerRevisions map[schemas.ModelProvider]string
-	pendingResets     map[routeID]uint64
-	resetSequence     uint64
-	incidents         map[routeID]*Incident
-	revision          uint64
-	probeSequence     uint64
-	persistence       PersistenceStatus
-	stateStore        *configstore.AdaptiveRoutingStore
-	enabled           atomic.Bool
-	startOnce         sync.Once
-	stop              context.CancelFunc
-	wg                sync.WaitGroup
-	config            configValue
-	mu                sync.Mutex
-	routes            map[routeID]*route
-	now               func() time.Time
-	keys              func(context.Context, schemas.ModelProvider) ([]schemas.Key, error)
-	providers         func(string) []schemas.ModelProvider
-	supports          func(schemas.ModelProvider, schemas.Key, string) bool
+	lifeMu             sync.Mutex
+	conditions         map[routeID]*condition
+	releasedHolds      map[routeID]releasedHold
+	keyStates          map[routeID]*keyState
+	providerRevisions  map[schemas.ModelProvider]string
+	providerChecks     map[routeID]providerCheck
+	pendingResets      map[routeID]uint64
+	pendingDiagnostics map[routeID]pendingDiagnostic
+	resetSequence      uint64
+	incidents          map[routeID]*Incident
+	revision           uint64
+	probeSequence      uint64
+	persistence        PersistenceStatus
+	stateStore         *configstore.AdaptiveRoutingStore
+	enabled            atomic.Bool
+	startOnce          sync.Once
+	stop               context.CancelFunc
+	wg                 sync.WaitGroup
+	config             configValue
+	mu                 sync.Mutex
+	routes             map[routeID]*route
+	now                func() time.Time
+	keys               func(context.Context, schemas.ModelProvider) ([]schemas.Key, error)
+	providers          func(string) []schemas.ModelProvider
+	supports           func(schemas.ModelProvider, schemas.Key, string) bool
 }
 
 func New(config Config) *Controller {
-	c := &Controller{routes: make(map[routeID]*route), conditions: make(map[routeID]*condition), keyStates: make(map[routeID]*keyState), incidents: make(map[routeID]*Incident), persistence: PersistenceStatus{Healthy: true}, now: time.Now}
+	c := &Controller{routes: make(map[routeID]*route), conditions: make(map[routeID]*condition), releasedHolds: make(map[routeID]releasedHold), keyStates: make(map[routeID]*keyState), incidents: make(map[routeID]*Incident), persistence: PersistenceStatus{Healthy: true}, now: time.Now}
 	c.providerRevisions = make(map[schemas.ModelProvider]string)
 	c.pendingResets = make(map[routeID]uint64)
 	c.config.store(config)
@@ -150,6 +154,7 @@ func (c *Controller) routeLocked(id routeID, name string, now time.Time) *route 
 			return nil
 		}
 		delete(c.routes, oldest.routeID)
+		delete(c.pendingDiagnostics, oldest.routeID)
 	}
 	r := &route{routeID: id, KeyName: name, LastSeen: now}
 	c.routes[id] = r
@@ -168,28 +173,12 @@ func (c *Controller) holdLocked(id routeID, now time.Time) *condition {
 }
 
 func (c *Controller) weightLocked(id routeID, now time.Time) float64 {
-	if c.holdLocked(id, now) != nil {
-		return 0
-	}
-	r := c.routes[id]
-	if r == nil {
-		return 1
-	}
-	if !r.FailedUntil.IsZero() {
-		return 0
-	}
-	// Success probability dominates latency and queueing. A usable route keeps
-	// a small share of real traffic, so it can recover without synthetic probes.
-	w := math.Max(0.05, math.Pow(1-r.ErrorRate, 3))
-	w /= float64(1 + r.Inflight)
-	if r.Recovering && r.Recoveries < 5 {
-		w *= 0.1 + 0.18*float64(r.Recoveries)
-	}
-	return w
+	return c.keyWeightLocked(id, now, 0)
 }
 
-// SelectKey receives core's already filtered pool; caller/rule pins and session
-// affinity keep their native precedence because those paths bypass this hook.
+// SelectKey receives core's already filtered pool. Caller/rule pins keep
+// native precedence; the affinity decorator limits session preferences to
+// eligible keys and yields reserved recovery checks to this hook.
 func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, provider schemas.ModelProvider, model string) (schemas.Key, error) {
 	if len(keys) == 0 {
 		return schemas.Key{}, fmt.Errorf("no eligible keys for %s/%s", provider, model)
@@ -203,7 +192,7 @@ func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, 
 	now := c.now()
 	c.mu.Lock()
 	reserved, hasReservation := ctx.Value(probeContextKey{}).(probeReservation)
-	if hasReservation && reserved.Provider == provider && reserved.Model == model {
+	if hasReservation && !reserved.providerOnly && reserved.Provider == provider && reserved.Model == model {
 		if c.reservationCurrentLocked(reserved, now) {
 			for _, key := range keys {
 				if key.ID == reserved.KeyID {
@@ -221,7 +210,7 @@ func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, 
 		if h := c.holdLocked(id, now); h != nil && !h.HoldUntil.After(now) && !h.ProbeUntil.After(now) {
 			due = append(due, id)
 		} else if h == nil && c.config.load().RouteSelectionEnabled {
-			if r := c.routes[id]; r != nil && !r.FailedUntil.IsZero() && !r.FailedUntil.After(now) && !r.ProbeUntil.After(now) {
+			if r := c.routes[id]; c.recoveryDueLocked(r, now) {
 				recovering = append(recovering, r)
 			}
 		}
@@ -266,11 +255,7 @@ func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, 
 			}
 			return 0
 		}
-		w := c.weightLocked(id, now)
-		if r := c.routes[id]; r != nil && baseline > 0 {
-			w /= math.Sqrt(math.Max(1, r.LatencyMS/baseline))
-		}
-		return w
+		return c.keyWeightLocked(id, now, baseline)
 	}
 	total, maxWeight := 0.0, 0.0
 	for _, key := range keys {
@@ -333,6 +318,21 @@ func (c *Controller) SelectKey(ctx *schemas.BifrostContext, keys []schemas.Key, 
 // BeginProviderAttempt observes actual provider calls, including retries and
 // streaming teardown. Direct caller credentials never enter managed-key health.
 func (c *Controller) BeginProviderAttempt(ctx *schemas.BifrostContext, info schemas.ProviderAttemptInfo) schemas.ProviderAttempt {
+	var providerProbe *probeReservation
+	if lease, ok := ctx.Value(probeContextKey{}).(probeReservation); ok && lease.providerOnly {
+		ctx.ClearValue(probeContextKey{})
+		providerProbe = new(probeReservation)
+		*providerProbe = lease
+		// Every early return and a different actual route release admission.
+		// A stale ticket never suppresses an otherwise current observation.
+		defer func() {
+			if providerProbe != nil {
+				c.mu.Lock()
+				c.finishProviderCheckLocked(*providerProbe, c.now())
+				c.mu.Unlock()
+			}
+		}()
+	}
 	if !c.enabled.Load() || info.Model == "" || ctx.Value(schemas.BifrostContextKeyDirectKey) != nil || !supportsRequest(ctx) {
 		return nil
 	}
@@ -401,6 +401,10 @@ func (c *Controller) BeginProviderAttempt(ctx *schemas.BifrostContext, info sche
 	r.Inflight++
 	r.LastSeen = now
 	a := &attempt{controller: c, ctx: ctx, route: r, start: now, key: k, keyEpoch: k.epoch, modelEpoch: r.Epoch, probeID: probeID, providerRevision: info.ProviderRevision}
+	if providerProbe != nil && providerProbe.Provider == id.Provider && providerProbe.Model == id.Model && c.reservationCurrentLocked(*providerProbe, now) {
+		a.providerProbe = providerProbe
+		providerProbe = nil
+	}
 	for _, scope := range []routeID{{Provider: id.Provider, KeyID: id.KeyID}, id} {
 		if i := c.incidentLocked(scope); i != nil && i.State == "recovering" && r.Samples == 0 {
 			r.Recovering = true
@@ -429,6 +433,7 @@ type attempt struct {
 	keyEpoch, modelEpoch, probeID uint64
 	holdID                        string
 	providerRevision              string
+	providerProbe                 *probeReservation
 }
 
 func (a *attempt) Observe(result *schemas.BifrostResponse, err *schemas.BifrostError) {
@@ -502,6 +507,9 @@ func holdDuration(class schemas.FailureClass, failures int, retryAfter int64) ti
 func (c *Controller) complete(a *attempt, failure schemas.FailureClass, retryAfter int64, latency time.Duration, now time.Time) {
 	r := a.route
 	c.mu.Lock()
+	if a.providerProbe != nil {
+		c.finishProviderCheckLocked(*a.providerProbe, now)
+	}
 	r.Inflight--
 	if !c.attemptCurrentLocked(a) {
 		c.mu.Unlock()
@@ -509,8 +517,8 @@ func (c *Controller) complete(a *attempt, failure schemas.FailureClass, retryAft
 	}
 	r.LastSeen = now
 	if r.ProbeID == a.probeID && a.probeID != 0 {
+		// End admission, retaining the generation to reject older outcomes.
 		r.ProbeUntil = time.Time{}
-		r.ProbeID = 0
 	}
 	if failure == schemas.FailureClassCancelled || failure == schemas.FailureClassCallerFault {
 		c.mu.Unlock()
@@ -519,7 +527,14 @@ func (c *Controller) complete(a *attempt, failure schemas.FailureClass, retryAft
 		}
 		return
 	}
+	// Ordinary traffic also supplies a fresh provider observation. Extend an
+	// existing cooldown without creating admission state for healthy providers.
+	providerID := routeID{Provider: r.Provider, Model: r.Model}
+	if check, exists := c.providerChecks[providerID]; exists && check.token == 0 {
+		c.providerChecks[providerID] = providerCheck{until: now.Add(recoveryInterval)}
+	}
 	before := c.stateLocked(r, now)
+	cooldownElapsed := !r.FailedUntil.IsZero() && !r.failed(now)
 	r.Samples++
 	sample := 0.0
 	if failure != "" {
@@ -532,11 +547,7 @@ func (c *Controller) complete(a *attempt, failure schemas.FailureClass, retryAft
 	}
 	if failure == "" {
 		measured := float64(latency) / float64(time.Millisecond)
-		if r.LatencyMS == 0 {
-			r.LatencyMS = measured
-		} else {
-			r.LatencyMS += decay * (measured - r.LatencyMS)
-		}
+		r.observeLatency(measured)
 		r.Consecutive = 0
 		r.Recoveries++
 		r.FailedUntil = time.Time{}
@@ -549,16 +560,20 @@ func (c *Controller) complete(a *attempt, failure schemas.FailureClass, retryAft
 		r.Recoveries = 0
 		r.FailureClass = failure
 		if (!failure.IsPerKey() || r.KeyID == "") && r.Consecutive >= 3 {
-			r.FailedUntil = now.Add(30 * time.Second)
+			r.FailedUntil = now.Add(recoveryInterval)
 			r.Recovering = true
 		}
 	}
 	after := c.stateLocked(r, now)
-	incidentNeedsUpdate := false
+	// A real outcome may arrive after expiry but before maintenance records
+	// the transition. Capture expiry before a success clears FailedUntil.
+	incidentNeedsUpdate := cooldownElapsed
 	scopes := [3]routeID{r.routeID, {Provider: r.Provider, KeyID: r.KeyID}, {Provider: r.Provider, Model: r.Model}}
 	for _, scope := range scopes {
 		if i := c.incidents[scope]; i != nil {
-			incidentNeedsUpdate = incidentNeedsUpdate || i.Status == "waiting_for_traffic"
+			// A model's history must match its own state. Whole-key and provider
+			// incidents aggregate several models/keys and can legitimately differ.
+			incidentNeedsUpdate = incidentNeedsUpdate || i.Status == "waiting_for_traffic" || scope == r.routeID && i.State != after
 			i.LastSeen = now
 			if request := requestID(a.ctx); request != "" {
 				i.LastRequestID = request
@@ -585,20 +600,20 @@ func (c *Controller) stateLocked(r *route, now time.Time) string {
 	switch {
 	case c.holdLocked(r.routeID, now) != nil:
 		return "held"
-	case !r.FailedUntil.IsZero():
+	case r.failed(now):
 		return "failed"
-	case r.Recovering && r.Recoveries < 5:
+	case r.recovering():
 		return "recovering"
 	case r.Samples == 0:
 		return "unknown"
-	case r.ErrorRate > 0.05:
+	case r.ErrorRate > 0.05 || r.latencyRatio(0) >= degradedLatencyRatio:
 		return "degraded"
 	}
 	return "healthy"
 }
 
-func (c *Controller) statusLocked(r *route, now time.Time) RouteStatus {
-	status := RouteStatus{Provider: r.Provider, Model: r.Model, KeyID: r.KeyID, KeyName: r.KeyName, State: c.stateLocked(r, now), Score: 100 * c.weightLocked(r.routeID, now), Samples: r.Samples, ErrorRate: r.ErrorRate, LatencyMS: r.LatencyMS, Inflight: r.Inflight, LastSeen: r.LastSeen, FailureClass: r.FailureClass}
+func (c *Controller) statusLocked(r *route, now time.Time, baseline float64) RouteStatus {
+	status := RouteStatus{Provider: r.Provider, Model: r.Model, KeyID: r.KeyID, KeyName: r.KeyName, State: c.stateLocked(r, now), Score: 100 * c.keyWeightLocked(r.routeID, now, baseline), Samples: r.Samples, ErrorRate: r.ErrorRate, LatencyMS: r.LatencyMS, Inflight: r.Inflight, LastSeen: r.LastSeen, FailureClass: r.FailureClass}
 	if h := c.holdLocked(r.routeID, now); h != nil {
 		until := h.HoldUntil
 		status.HoldUntil = &until
@@ -613,8 +628,18 @@ func (c *Controller) Status() []RouteStatus {
 	defer c.mu.Unlock()
 	result := make([]RouteStatus, 0, len(c.routes)+len(c.conditions))
 	seen := make(map[routeID]bool)
+	// The dashboard and selection use the same key score. The dashboard's
+	// peers are the observed, usable keys of the provider/model; a request
+	// can narrow that set further through governance or explicit key pins.
+	baselines := make(map[routeID]float64)
 	for id, r := range c.routes {
-		result = append(result, c.statusLocked(r, now))
+		scope := routeID{Provider: id.Provider, Model: id.Model}
+		if r.LatencyMS > 0 && c.weightLocked(id, now) > 0 && (baselines[scope] == 0 || r.LatencyMS < baselines[scope]) {
+			baselines[scope] = r.LatencyMS
+		}
+	}
+	for id, r := range c.routes {
+		result = append(result, c.statusLocked(r, now, baselines[routeID{Provider: id.Provider, Model: id.Model}]))
 		seen[id] = true
 		if c.wholeKeyHoldLocked(id, now) != nil {
 			seen[routeID{Provider: id.Provider, KeyID: id.KeyID}] = true

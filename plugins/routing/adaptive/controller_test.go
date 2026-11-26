@@ -311,3 +311,64 @@ func BenchmarkAdaptiveKeySelection(b *testing.B) {
 		}
 	})
 }
+
+func TestAdaptiveSelfLatencyDegradesEvenWithoutPeer(t *testing.T) {
+	c, _ := testController()
+	latency := func(ms int64) {
+		a := c.BeginProviderAttempt(testContext(), schemas.ProviderAttemptInfo{Provider: "p1", Model: "m", KeyID: "a"})
+		a.Observe(&schemas.BifrostResponse{ChatResponse: &schemas.BifrostChatResponse{ExtraFields: schemas.BifrostResponseExtraFields{Latency: ms}}}, nil)
+		a.End()
+	}
+	for range 5 {
+		latency(100)
+	}
+	before := c.Status()[0]
+	for range 3 {
+		latency(1000)
+	}
+	after := c.Status()[0]
+	if before.State != "healthy" || after.State != "degraded" || after.ErrorRate != 0 || after.Score >= before.Score {
+		t.Fatalf("latency degradation not reflected in state and score: before=%+v after=%+v", before, after)
+	}
+	for range 40 {
+		latency(100)
+	}
+	if got := c.Status()[0]; got.State != "healthy" || got.Score <= after.Score {
+		t.Fatalf("latency did not recover: %+v", got)
+	}
+}
+
+func TestAdaptiveTransientCooldownReturnsReducedTrafficWithoutObservation(t *testing.T) {
+	c, now := testController()
+	for range 3 {
+		observe(c, "p", "m", "a", responseError(503))
+	}
+	id := routeID{"p", "m", "a"}
+	before := *c.routes[id]
+	for _, tc := range []struct {
+		at     time.Time
+		state  string
+		usable bool
+	}{
+		{before.FailedUntil.Add(-time.Nanosecond), "failed", false},
+		{before.FailedUntil, "recovering", true},
+		{before.FailedUntil.Add(time.Hour), "recovering", true},
+	} {
+		*now = tc.at
+		for range 2 {
+			status := c.Status()[0]
+			if status.State != tc.state || (status.Score > 0) != tc.usable || status.Score >= 100 {
+				t.Fatalf("cooldown state at %s: %+v", tc.at, status)
+			}
+			if after := *c.routes[id]; after != before {
+				t.Fatalf("reading timed recovery changed observations: before=%+v after=%+v", before, after)
+			}
+		}
+	}
+	// The same timer never releases a provider refusal.
+	observe(c, "p", "m", "a", responseError(401))
+	*now = now.Add(time.Hour)
+	if status := c.Status()[0]; status.State != "held" || status.Score != 0 {
+		t.Fatalf("cooldown released a held key: %+v", status)
+	}
+}
