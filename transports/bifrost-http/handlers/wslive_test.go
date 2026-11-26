@@ -353,7 +353,8 @@ func TestLiveRelayStartupErrorFailsTheSession(t *testing.T) {
 }
 
 func TestReadLiveSessionStart(t *testing.T) {
-	t.Parallel()
+	// Keep the full-size, race-instrumented frame write separate from parallel
+	// relay tests with short wall-clock deadlines.
 
 	for _, tc := range []struct {
 		name    string
