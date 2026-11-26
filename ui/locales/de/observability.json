@@ -51,7 +51,7 @@
 		"configured": "Konfiguriert",
 		"unconfigured": "Nicht konfiguriert",
 		"unconfiguredHelp": "Einstellungen speichern, um ein adaptives Routing-Profil zu aktivieren. Bis dahin verwendet Bifrost seine native Anbieter- und Schlüsselauswahl.",
-		"healthHelp": "Der Zustand wird aus dem Verkehr dieses Knotens gemessen. Der Wert von 0–100 bildet Fehler ab; das Routing berücksichtigt auch relative Latenz und aktuelle Last.",
+		"healthHelp": "Der Zustand wird aus dem Verkehr dieses Knotens gemessen. Der Schlüsselwert von 0–100 berücksichtigt Fehler, relative Latenz, Last und Erholung.",
 		"routeHealth": "Aktueller Routenzustand",
 		"historyDisabled": "Die Ereignisaufzeichnung ist aus. Vorhandene Vorfälle und aktive Sperren bleiben erhalten.",
 		"routes": "Beobachtete Routen",

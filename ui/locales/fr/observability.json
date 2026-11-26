@@ -51,7 +51,7 @@
 		"configured": "Configuré",
 		"unconfigured": "Non configuré",
 		"unconfiguredHelp": "Enregistrez les paramètres pour activer un profil de routage adaptatif. D'ici là, Bifrost conserve sa sélection native des fournisseurs et clés.",
-		"healthHelp": "L'état est mesuré à partir du trafic de ce nœud. Le score de 0 à 100 reflète les erreurs ; le routage tient aussi compte de la latence relative et de la charge actuelle.",
+		"healthHelp": "L’état est mesuré à partir du trafic de ce nœud. Le score de clé de 0 à 100 combine erreurs, latence relative, charge et récupération.",
 		"routeHealth": "État actuel des routes",
 		"historyDisabled": "L’enregistrement des événements est désactivé. Les incidents existants et suspensions actives sont conservés.",
 		"routes": "Routes observées",

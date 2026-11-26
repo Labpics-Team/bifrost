@@ -3839,9 +3839,11 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 	account := lib.NewBaseAccount(s.Config)
 	var adaptiveKeySelector schemas.KeySelector
 	var adaptiveObserver schemas.ProviderAttemptObserver
+	var adaptiveAffinity schemas.SessionAffinity
 	if s.Config.AdaptiveRouter != nil {
 		adaptiveKeySelector = s.Config.AdaptiveRouter.SelectKey
 		adaptiveObserver = s.Config.AdaptiveRouter
+		adaptiveAffinity = s.Config.AdaptiveRouter.SessionAffinity(bifrost.NewSessionAffinity(s.Config.KVStore, logger))
 	}
 	// An interface holding a nil store pointer would not read as unset.
 	var sharedDiscoveryStore, perUserDiscoveryStore schemas.MCPDiscoveryStore
@@ -3855,6 +3857,7 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 		Account:                 account,
 		KeySelector:             adaptiveKeySelector,
 		ProviderAttemptObserver: adaptiveObserver,
+		SessionAffinity:         adaptiveAffinity,
 		InitialPoolSize:         s.Config.ClientConfig.InitialPoolSize,
 		DropExcessRequests:      s.Config.ClientConfig.DropExcessRequests,
 		LLMPlugins:              s.Config.GetLoadedLLMPlugins(),

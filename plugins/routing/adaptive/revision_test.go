@@ -364,9 +364,13 @@ func TestAdaptiveKeyTransientRecoveryReservesSingleCheck(t *testing.T) {
 	if err != nil || key.ID != "a" {
 		t.Fatalf("due failed key was not checked: %s %v", key.ID, err)
 	}
-	key, err = c.SelectKey(testContext(), testKeys, "p", "m")
-	if err != nil || key.ID != "b" {
-		t.Fatalf("ordinary traffic bypassed the single failed-key check: %s %v", key.ID, err)
+	ordinary := testContext()
+	key, err = c.SelectKey(ordinary, testKeys, "p", "m")
+	if err != nil || key.ID != "a" && key.ID != "b" || ordinary.Value(probeContextKey{}) != nil {
+		t.Fatalf("ordinary recovery traffic duplicated a priority check: %s %v", key.ID, err)
+	}
+	if c.weightLocked(routeID{"p", "m", "a"}, *now) <= 0 {
+		t.Fatal("expired transient cooldown still excluded ordinary recovery traffic")
 	}
 	observeWithContext(c, ctx, "p", "m", "a", nil)
 	if c.weightLocked(routeID{"p", "m", "a"}, *now) == 0 {
@@ -565,5 +569,63 @@ func TestAdaptiveTransientCheckCannotOverrideNewHold(t *testing.T) {
 	}
 	if h := c.holdLocked(r.routeID, *now); h == nil || h.ProbeID != 0 {
 		t.Fatal("new credential hold acquired an unsolicited check")
+	}
+}
+
+func TestAdaptiveRecoveryReplacementPreservesOrdinaryOutcomesAndProgress(t *testing.T) {
+	c, now := providerController()
+	keys := testKeys[:1]
+	c.SetCatalog(c.providers, func(context.Context, schemas.ModelProvider) ([]schemas.Key, error) { return keys, nil }, c.supports)
+	for range 3 {
+		observe(c, "p1", "m", "a", responseError(503))
+	}
+	beginCheck := func() schemas.ProviderAttempt {
+		t.Helper()
+		ctx := testContext()
+		requireRecoveryProvider(t, c, ctx, "p1")
+		key, err := c.SelectKey(ctx, keys, "p1", "m")
+		if err != nil || key.ID != "a" {
+			t.Fatalf("recovery key not selected: %s %v", key.ID, err)
+		}
+		a := c.BeginProviderAttempt(ctx, schemas.ProviderAttemptInfo{Provider: "p1", Model: "m", KeyID: key.ID})
+		if a == nil {
+			t.Fatal("real check was not observed")
+		}
+		return a
+	}
+	*now = now.Add(31 * time.Second)
+	old := beginCheck()
+	defer old.End()
+	*now = now.Add(time.Second)
+	ordinary := c.BeginProviderAttempt(testContext(), schemas.ProviderAttemptInfo{Provider: "p1", Model: "m", KeyID: "a"})
+	defer ordinary.End()
+	*now = now.Add(6 * time.Minute)
+	current := beginCheck()
+	defer current.End()
+	current.Observe(&schemas.BifrostResponse{}, nil)
+	current.End()
+	ordinary.Observe(&schemas.BifrostResponse{}, nil)
+	ordinary.End()
+	id := routeID{"p1", "m", "a"}
+	if got := c.routes[id]; got.Samples != 5 || got.Inflight != 1 {
+		t.Fatalf("replacement discarded an ordinary real outcome: %+v", got)
+	}
+	// The obsolete physical request is still running. It cannot permanently
+	// block the next admission after the current check has completed.
+	*now = now.Add(31 * time.Second)
+	next := beginCheck()
+	defer next.End()
+	before := *c.routes[id]
+	old.Observe(nil, responseError(503))
+	old.End()
+	after := *c.routes[id]
+	before.Inflight--
+	if after != before {
+		t.Fatalf("obsolete check affected current observations or admission: before=%+v after=%+v", before, after)
+	}
+	next.Observe(&schemas.BifrostResponse{}, nil)
+	next.End()
+	if got := c.routes[id]; got.Samples != 6 || got.Inflight != 0 {
+		t.Fatalf("current check failed to advance recovery: %+v", got)
 	}
 }

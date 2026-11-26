@@ -51,7 +51,7 @@
 		"configured": "Configured",
 		"unconfigured": "Not configured",
 		"unconfiguredHelp": "Save these settings to enable an adaptive routing profile. Until then, Bifrost keeps its native provider and key selection.",
-		"healthHelp": "Health is measured from this node's traffic. The 0–100 score reflects errors; routing also uses relative latency and current load.",
+		"healthHelp": "Health is measured from this node's traffic. The 0–100 key score combines errors, relative latency, load and recovery.",
 		"routeHealth": "Current route health",
 		"historyDisabled": "Event recording is off. Existing incidents and active holds are still retained.",
 		"routes": "Observed routes",

@@ -51,7 +51,7 @@
 		"configured": "Configurado",
 		"unconfigured": "Sin configurar",
 		"unconfiguredHelp": "Guarda los ajustes para activar un perfil de enrutamiento adaptativo. Hasta entonces, Bifrost usa su selección nativa de proveedores y claves.",
-		"healthHelp": "El estado se mide a partir del tráfico de este nodo. La puntuación de 0 a 100 refleja errores; el enrutamiento también considera la latencia relativa y la carga actual.",
+		"healthHelp": "El estado se mide a partir del tráfico de este nodo. La puntuación de clave de 0 a 100 combina errores, latencia relativa, carga y recuperación.",
 		"routeHealth": "Estado actual de las rutas",
 		"historyDisabled": "El registro de eventos está desactivado. Se conservan los incidentes existentes y las retenciones activas.",
 		"routes": "Rutas observadas",

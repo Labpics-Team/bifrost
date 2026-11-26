@@ -200,11 +200,13 @@ func (c *Controller) syncKeyState(provider schemas.ModelProvider, key schemas.Ke
 		t := c.retireKeyLocked(provider, key.ID, "The configured credential changed; previous observations no longer apply.")
 		t.advance = c.keyStates[id] != nil
 		t.publish = func() {
+			c.forgetReleasedLocked(provider, key.ID, "")
 			accepted = &keyState{revision: revision, snapshot: frozen, providerRevision: providerRevision}
 			c.keyStates[id] = accepted
 			for rid := range c.routes {
 				if rid.Provider == provider && rid.KeyID == key.ID {
 					delete(c.routes, rid)
+					delete(c.pendingDiagnostics, rid)
 				}
 			}
 		}
@@ -257,6 +259,11 @@ func (c *Controller) reset(provider schemas.ModelProvider, keyID string) error {
 }
 
 func (c *Controller) markResetLocked(id routeID) uint64 {
+	for scope := range c.providerChecks {
+		if scope.Provider == id.Provider {
+			delete(c.providerChecks, scope)
+		}
+	}
 	c.resetSequence++
 	c.pendingResets[id] = c.resetSequence
 	c.persistence.Healthy = false
@@ -273,12 +280,14 @@ func (c *Controller) retryReset(ctx context.Context, scope routeID, generation u
 		t := c.retireKeyLocked(provider, keyID, "The key or provider was edited or removed; its previous observations no longer apply.")
 		t.advance = true
 		t.publish = func() {
+			c.forgetReleasedLocked(provider, keyID, "")
 			if c.pendingResets[scope] == generation {
 				delete(c.pendingResets, scope)
 			}
 			for id := range c.routes {
 				if id.Provider == provider && (keyID == "" || id.KeyID == keyID) {
 					delete(c.routes, id)
+					delete(c.pendingDiagnostics, id)
 				}
 			}
 			for id := range c.keyStates {
@@ -310,6 +319,7 @@ func (c *Controller) Release(ctx context.Context, provider schemas.ModelProvider
 			}
 		}
 		t.publish = func() {
+			c.forgetReleasedLocked(provider, keyID, model)
 			for _, h := range t.remove {
 				for id, r := range c.routes {
 					if id.Provider == h.Provider && id.KeyID == h.KeyID && (h.Model == "" || id.Model == h.Model) {
