@@ -8,13 +8,10 @@ concrete before/after example and mention any compatibility or data migration.
 Use the fork workspace and describe the checks actually completed:
 
 ```sh
-python3 ci/verify.py workspace
-python3 ci/verify.py format
-python3 ci/verify.py unit
-python3 ci/verify.py test
+python3 ci/verify.py all
 ```
 
-The last command needs an isolated Qdrant fixture, as configured in CI.
+The full check needs an isolated Qdrant fixture, as configured in CI.
 Add screenshots for UI changes and measurements for performance claims.
 Image/UI builds and runtime qualification run in Infra when its source pin is
 updated; link that delivery PR when this change is being released.

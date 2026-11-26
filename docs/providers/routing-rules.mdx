@@ -61,22 +61,27 @@ First match → Decision
 
 ## Discover public model names
 
-`GET /v1/routing/models` (`GET /bifrost/v1/routing/models` when `server.base_path`
-is `/bifrost`) lists public names declared by enabled global rules such as
-`model == "fast-chat"`. A rule must be terminal and have a selectable target;
-rules with additional conditions, chained rules and rules scoped to a virtual
-key, team or customer are not advertised. The response uses the same `data` and
-`next_page_token` fields as `/v1/models` (`/bifrost/v1/models` with that prefix),
-with `page_size` and `page_token` for pagination. Each model's `id` is its public
-routing name. Duplicate names follow the first declaration with a selectable
-target in routing priority order.
+In the Labpics fork, use `GET /v1/models` (or `GET /openai/v1/models`) for the
+combined model catalog. It includes authorized names declared by enabled global
+terminal rules such as `model == "fast-chat"`, alongside native provider
+models. A rule must have a selectable target; rules with additional conditions,
+chained rules and rules scoped to a virtual key, team or customer are not
+advertised. Duplicate rule names follow the first declaration with a selectable
+target in routing priority order. The combined catalog is paginated after
+merging the names; a provider-specific list retains its native behavior.
 
 The catalog applies the caller's identity and provider, model and key
-restrictions. A name is visible only when all of its selectable targets are
-allowed. Reading it does not consume inference quota, so an exhausted budget or
-rate limit does not hide otherwise permitted names. The catalog describes
-configured routing declarations; it does not contact providers or promise that a
-subsequent inference request will succeed.
+restrictions. A routing name is visible only when all of its selectable targets
+are allowed. Reading it does not consume inference quota, so an exhausted budget
+or rate limit does not hide otherwise permitted names. A published routing name
+describes a configured declaration, not a guarantee of successful inference.
+
+The legacy `GET /v1/routing/models` endpoint returns only the routing-name
+subset, without contacting providers. It has the same `data`,
+`next_page_token`, `page_size` and `page_token` conventions. It remains
+available for existing clients; new integrations should use the combined
+catalog instead. With a configured base path, prepend that path to either
+endpoint (for example, `/bifrost/v1/models`).
 
 ## CEL Expression Guide
 

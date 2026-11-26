@@ -74,7 +74,7 @@ class TestEventTests(unittest.TestCase):
             event = {"Package": self.package, "Action": action}
             if name is not None:
                 event["Test"] = name
-            report.accept(json.dumps(event))
+            report.accept(event)
         return report
 
     def test_missing_skipped_failed_or_incomplete_required_test_is_rejected(self):
@@ -89,7 +89,7 @@ class TestEventTests(unittest.TestCase):
         ]
         for events in variants:
             with self.subTest(events=events):
-                self.assertTrue(self.report(events).errors(0))
+                self.assertTrue(self.report(events).errors())
 
     def test_unrelated_backend_skip_is_allowed(self):
         report = self.report([
@@ -99,20 +99,18 @@ class TestEventTests(unittest.TestCase):
             ("pass", "TestRequired"),
             ("pass", None),
         ])
-        self.assertEqual(report.errors(0), [])
-        self.assertTrue(report.errors(1))
+        self.assertEqual(report.errors(), [])
 
     def test_events_from_another_package_cannot_satisfy_required_test(self):
         report = self.report([("pass", None)])
-        report.accept(json.dumps({"Package": "example.org/other", "Action": "pass", "Test": "TestRequired"}))
-        self.assertTrue(report.errors(0))
+        report.accept({"Package": "example.org/other", "Action": "pass", "Test": "TestRequired"})
+        self.assertTrue(report.errors())
 
     def test_malformed_json_cannot_report_success(self):
         for line in ("not json", "[]"):
             with self.subTest(line=line):
-                report = self.report([("pass", "TestRequired"), ("pass", None)])
-                report.accept(line)
-                self.assertTrue(report.errors(0))
+                with self.assertRaises(verify.VerificationError):
+                    verify.decode_test_event(line)
 
     def test_semanticcache_runs_the_full_short_corpus_and_vectorstore_is_not_short(self):
         semantic = verify.test_command("github.com/maximhq/bifrost/plugins/semanticcache", ["TestRequired"])
@@ -125,6 +123,100 @@ class TestEventTests(unittest.TestCase):
             self.assertIn("-count=1", command)
             self.assertIn("-race", command)
             self.assertIn("-skip=^$", command)
+
+
+class CombinedVerificationTests(unittest.TestCase):
+    semantic = "github.com/maximhq/bifrost/plugins/semanticcache"
+
+    def test_combined_check_only_merges_identical_short_corpora(self):
+        value = manifest()
+        value["required_tests"][self.semantic] = ["TestCache"]
+        root, env, modules = Path("."), {}, {}
+        with patch.object(verify, "workspace", return_value=(env, modules)) as workspace, \
+                patch.object(verify, "check_format") as formatting, \
+                patch.object(verify, "changed_test_packages", return_value=["example.org/core", self.semantic, "example.org/other"]), \
+                patch.object(verify, "check_short_corpus") as short, \
+                patch.object(verify, "check_required_corpus") as required:
+            verify.check_all(root, value)
+        workspace.assert_called_once_with(root)
+        formatting.assert_called_once_with(root, value)
+        short.assert_called_once_with(root, env, ["example.org/core", "example.org/other"])
+        required.assert_called_once_with(root, env, modules, value["required_tests"])
+
+    def test_semanticcache_without_required_entry_keeps_short_coverage(self):
+        value = manifest()
+        with patch.object(verify, "workspace", return_value=({}, {})), \
+                patch.object(verify, "check_format"), \
+                patch.object(verify, "changed_test_packages", return_value=[self.semantic]), \
+                patch.object(verify, "check_short_corpus") as short, \
+                patch.object(verify, "check_required_corpus"):
+            verify.check_all(Path("."), value)
+        short.assert_called_once_with(Path("."), {}, [self.semantic])
+
+    def test_interleaved_package_events_are_independent_and_complete(self):
+        packages = {"example.org/a": ["TestRequired"], "example.org/b": ["TestRequired"]}
+        def event(package, action, name=None):
+            value = {"Package": package, "Action": action}
+            if name is not None:
+                value["Test"] = name
+            return json.dumps(value) + "\n"
+
+        a, b = packages
+        good = [
+            event(a, "run", "TestRequired"), event(b, "run", "TestRequired"),
+            event(b, "pass", "TestRequired"), event(a, "pass", "TestRequired"),
+            event(a, "pass"), event(b, "pass"),
+        ]
+        variants = [
+            (good, 0, True),
+            (good[:-1], 0, False),
+            ([line for line in good if not (b in line and '"Test":' in line)], 0, False),
+            (good + [event(b, "skip", "TestRequired/subtest")], 0, False),
+            (good + ["not JSON\\n"], 0, False),
+            (good + [event([], "pass")], 0, False),
+            (good, 1, False),
+        ]
+        for events, code, success in variants:
+            with self.subTest(events=events, code=code):
+                with patch.object(verify.subprocess, "Popen") as popen:
+                    process = popen.return_value.__enter__.return_value
+                    process.stdout = events
+                    process.wait.return_value = code
+                    if success:
+                        verify.run_test_packages(Path("."), {}, packages, ["go", "test"])
+                        self.assertEqual(popen.call_args.args[0], ["go", "test", *packages])
+                    else:
+                        with self.assertRaises(verify.VerificationError):
+                            verify.run_test_packages(Path("."), {}, packages, ["go", "test"])
+
+    def test_empty_roster_rejected_before_spawn(self):
+        with patch.object(verify.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(verify.VerificationError, "empty test package roster"):
+                verify.run_test_packages(Path("."), {}, {}, ["go", "test"])
+            popen.assert_not_called()
+
+
+@unittest.skipUnless(shutil.which("go"), "Go is needed for native JSON verification")
+class NativeMultiPackageTests(unittest.TestCase):
+    def test_actual_go_events_and_missing_required_test(self):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root = Path(directory).resolve()
+            (root / "go.mod").write_text("module example.org/testplan\n\ngo 1.20\n", encoding="utf-8")
+            for name in ("a", "b"):
+                pkg = root / name
+                pkg.mkdir()
+                (pkg / "value_test.go").write_text(
+                    f'package {name}\nimport "testing"\nfunc TestRequired(t *testing.T) {{}}\n',
+                    encoding="utf-8",
+                )
+            env = {**os.environ, "GOWORK": "off", "GOTOOLCHAIN": "local", "GOPROXY": "off",
+                   "GOSUMDB": "off", "GOFLAGS": "-p=2", "GOMAXPROCS": "2"}
+            packages = {"example.org/testplan/a": ["TestRequired"], "example.org/testplan/b": ["TestRequired"]}
+            command = ["go", "test", "-json", "-short", "-count=1"]
+            verify.run_test_packages(root, env, packages, command)
+            packages["example.org/testplan/b"] = ["TestMissing"]
+            with self.assertRaisesRegex(verify.VerificationError, "example.org/testplan/b: required tests did not pass: TestMissing"):
+                verify.run_test_packages(root, env, packages, command)
 
 
 @unittest.skipUnless(shutil.which("go"), "Go is needed for local workspace checks")
@@ -303,16 +395,16 @@ class ChangedPackageTests(unittest.TestCase):
             git(root, "add", ".")
             git(root, "commit", "--quiet", "-m", "Add tests")
             self.assertEqual(git(root, "status", "--porcelain"), "")
-            with patch.object(verify, "run_test_package") as execute:
+            with patch.object(verify, "run_test_packages") as execute:
                 verify.check_unit(root, value)
-            self.assertCountEqual([call.args[2] for call in execute.call_args_list], [
+            execute.assert_called_once()
+            packages, command = execute.call_args.args[2:]
+            self.assertCountEqual(packages, [
                 "example.org/core/current", "example.org/core/new_package", "example.org/plugins/new_plugin",
             ])
-            for call in execute.call_args_list:
-                command = call.args[3]
-                self.assertTrue({"-short", "-race", "-count=1"}.issubset(command))
-                self.assertFalse(any(arg.startswith("-run") for arg in command))
-                self.assertEqual(command[-1], call.args[2])
+            self.assertTrue({"-short", "-race", "-count=1"}.issubset(command))
+            self.assertFalse(any(arg.startswith("-run") for arg in command))
+            self.assertEqual(command, verify.short_command())
 
     def test_untracked_new_package_is_included_in_unit_verification(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
@@ -321,9 +413,10 @@ class ChangedPackageTests(unittest.TestCase):
             self.write_files(root, {
                 "core/new_package/new_test.go": "package new_package\nimport \"testing\"\nfunc TestNew(t *testing.T) { t.Fatal(\"must run\") }\n",
             })
-            with patch.object(verify, "run_test_package") as execute:
+            with patch.object(verify, "run_test_packages") as execute:
                 verify.check_unit(root, value)
-            self.assertEqual([call.args[2] for call in execute.call_args_list], ["example.org/core/new_package"])
+            execute.assert_called_once()
+            self.assertEqual(list(execute.call_args.args[2]), ["example.org/core/new_package"])
 
     def test_deletions_run_remaining_package_tests_and_ignore_removed_packages(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
@@ -350,8 +443,8 @@ class ChangedPackageTests(unittest.TestCase):
             with self.assertRaisesRegex(verify.VerificationError, "no changed local Go packages with tests"):
                 verify.changed_test_packages(root, value, env, modules)
             report = verify.TestReport("example.org/core", [])
-            report.accept(json.dumps({"Package": "example.org/core", "Action": "pass"}))
-            self.assertIn("no tests executed", report.errors(0))
+            report.accept({"Package": "example.org/core", "Action": "pass"})
+            self.assertIn("no tests executed", report.errors())
 
 
 if __name__ == "__main__":
