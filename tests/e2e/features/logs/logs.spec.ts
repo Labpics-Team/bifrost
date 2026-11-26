@@ -2260,8 +2260,16 @@ test.describe("LLM log detail identity", () => {
       releaseDescending();
       await expect(tableRows).toHaveCount(500);
       await expect(tableRows.first().getByRole("cell").last()).toHaveText(rows[500].model);
-      // Target the panel directly; keyboard traversal can leave a session-ID tooltip above it.
-      await page.locator('[data-slot="sheet-overlay"]').click({ position: { x: 10, y: 10 } });
+      // Escape dismisses the session-ID tooltip before the panel when it is still present.
+      const tooltip = page.getByRole("tooltip");
+      if (await tooltip.count() > 0) {
+        await page.keyboard.press("Escape");
+        await expect(tooltip).toHaveCount(0);
+      }
+      // The tooltip may disappear before Escape, allowing that key to close the panel.
+      const sessionStillOpen = await sheet.evaluateAll((dialogs) =>
+        dialogs.some((dialog) => dialog.getAttribute("data-state") === "open"));
+      if (sessionStillOpen) await page.keyboard.press("Escape");
       await expect(sheet).toHaveCount(0);
       const beforeReopen = calls.length;
       await openSession();
