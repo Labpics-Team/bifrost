@@ -42,7 +42,7 @@ export function LogDetailSheet({
 	const { t } = useTranslation("observability");
 	const [pollingInterval, setPollingInterval] = useState(0);
 	const {
-		data: fullLog,
+		currentData: fullLog,
 		isLoading,
 		isError,
 	} = useGetLogByIdQuery(log ? { id: log.id, timestamp: log.timestamp } : "", {
@@ -55,7 +55,7 @@ export function LogDetailSheet({
 	const isFullDataReady = log != null && (isError || (fullLog?.id === log.id && !isLoading));
 	// Prefer full log when loaded; otherwise list row — enables prompt fetch in parallel with getLogById
 	const selectedPromptId = log ? (fullLog?.id === log.id ? fullLog : log).selected_prompt_id : undefined;
-	const { data: selectedPromptData } = useGetPromptQuery(selectedPromptId ?? "", {
+	const { currentData: selectedPromptData } = useGetPromptQuery(selectedPromptId ?? "", {
 		skip: !open || !selectedPromptId,
 	});
 
@@ -74,7 +74,7 @@ export function LogDetailSheet({
 	if (!log) return null;
 
 	// Show a loader only on the initial fetch, not during background polling refetches.
-	const displayLog: LogEntry = isFullDataReady && fullLog ? fullLog : log;
+	const displayLog: LogEntry = isFullDataReady && fullLog?.id === log.id ? fullLog : log;
 	const resolvedSelectedPromptName = selectedPromptData?.prompt?.name ?? displayLog.selected_prompt_name ?? "";
 
 	return (
