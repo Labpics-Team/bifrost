@@ -69,7 +69,7 @@ class TestEventTests(unittest.TestCase):
     package = "example.org/core"
 
     def report(self, events):
-        report = verify.TestReport(self.package, ["TestRequired"])
+        report = verify.TestRun({self.package: ["TestRequired"]})
         for action, name in events:
             event = {"Package": self.package, "Action": action}
             if name is not None:
@@ -114,11 +114,37 @@ class TestEventTests(unittest.TestCase):
                 report.accept(line)
                 self.assertTrue(report.errors(0))
 
+    def test_interleaved_packages_must_each_finish_their_own_corpus(self):
+        one, two = "example.org/one", "example.org/two"
+        result = verify.TestRun({one: ["TestRequired"], two: ["TestRequired"]})
+        def accept(package, action, name=None):
+            event = {"Package": package, "Action": action}
+            if name is not None:
+                event["Test"] = name
+            result.accept(json.dumps(event))
+
+        accept(one, "run", "TestRequired")
+        accept(two, "run", "TestRequired")
+        accept(one, "pass", "TestRequired")
+        accept(one, "pass")
+        self.assertTrue(any(two in error for error in result.errors(0)))
+        self.assertTrue(any("required tests did not pass" in error for error in result.errors(0)))
+        accept(two, "pass", "TestRequired")
+        accept(two, "pass")
+        self.assertEqual(result.errors(0), [])
+        self.assertTrue(result.errors(1))
+        result.accept("invalid")
+        self.assertTrue(result.errors(0))
+
+    def test_empty_package_roster_is_rejected(self):
+        with self.assertRaisesRegex(verify.VerificationError, "empty test package roster"):
+            verify.TestRun({})
+
     def test_semanticcache_runs_the_full_short_corpus_and_vectorstore_is_not_short(self):
-        semantic = verify.test_command("github.com/maximhq/bifrost/plugins/semanticcache", ["TestRequired"])
+        semantic = verify.mandatory_test_flags("github.com/maximhq/bifrost/plugins/semanticcache", ["TestRequired"])
         self.assertIn("-short", semantic)
         self.assertIn("-run=.", semantic)
-        vectorstore = verify.test_command("github.com/maximhq/bifrost/framework/vectorstore", ["TestRequired", "TestOther"])
+        vectorstore = verify.mandatory_test_flags("github.com/maximhq/bifrost/framework/vectorstore", ["TestRequired", "TestOther"])
         self.assertIn("-short=false", vectorstore)
         self.assertIn("-run=^(TestRequired|TestOther)$", vectorstore)
         for command in (semantic, vectorstore):
@@ -303,16 +329,15 @@ class ChangedPackageTests(unittest.TestCase):
             git(root, "add", ".")
             git(root, "commit", "--quiet", "-m", "Add tests")
             self.assertEqual(git(root, "status", "--porcelain"), "")
-            with patch.object(verify, "run_test_package") as execute:
+            with patch.object(verify, "run_test_packages") as execute:
                 verify.check_unit(root, value)
-            self.assertCountEqual([call.args[2] for call in execute.call_args_list], [
+            execute.assert_called_once()
+            roster, command = execute.call_args.args[2:]
+            self.assertCountEqual(roster, [
                 "example.org/core/current", "example.org/core/new_package", "example.org/plugins/new_plugin",
             ])
-            for call in execute.call_args_list:
-                command = call.args[3]
-                self.assertTrue({"-short", "-race", "-count=1"}.issubset(command))
-                self.assertFalse(any(arg.startswith("-run") for arg in command))
-                self.assertEqual(command[-1], call.args[2])
+            self.assertTrue({"-short", "-race", "-count=1", "-timeout=15m"}.issubset(command))
+            self.assertFalse(any(arg.startswith("-run") for arg in command))
 
     def test_untracked_new_package_is_included_in_unit_verification(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
@@ -321,9 +346,28 @@ class ChangedPackageTests(unittest.TestCase):
             self.write_files(root, {
                 "core/new_package/new_test.go": "package new_package\nimport \"testing\"\nfunc TestNew(t *testing.T) { t.Fatal(\"must run\") }\n",
             })
-            with patch.object(verify, "run_test_package") as execute:
+            with patch.object(verify, "run_test_packages") as execute:
                 verify.check_unit(root, value)
-            self.assertEqual([call.args[2] for call in execute.call_args_list], ["example.org/core/new_package"])
+            execute.assert_called_once()
+            self.assertEqual(list(execute.call_args.args[2]), ["example.org/core/new_package"])
+
+    def test_native_go_package_list_executes_each_expected_package(self):
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+            root = Path(directory).resolve()
+            self.write_files(root, {
+                "go.mod": "module example.org/proof\n\ngo 1.20\n",
+                "one/one_test.go": 'package one\nimport "testing"\nfunc TestRequired(t *testing.T) {}\n',
+                "two/two_test.go": 'package two\nimport "testing"\nfunc TestRequired(t *testing.T) {}\n',
+            })
+            packages = {f"example.org/proof/{name}": ["TestRequired"] for name in ("one", "two")}
+            env = {**os.environ, "GOWORK": "off", "CGO_ENABLED": "0"}
+            flags = ["-count=1", "-p=2", "-timeout=30s"]
+            verify.run_test_packages(root, env, packages, flags)
+            self.write_files(root, {
+                "two/two_test.go": 'package two\nimport "testing"\nfunc TestOther(t *testing.T) {}\n',
+            })
+            with self.assertRaisesRegex(verify.VerificationError, "example.org/proof/two: required tests did not pass"):
+                verify.run_test_packages(root, env, packages, flags)
 
     def test_deletions_run_remaining_package_tests_and_ignore_removed_packages(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
@@ -349,9 +393,9 @@ class ChangedPackageTests(unittest.TestCase):
             env, modules = verify.workspace(root)
             with self.assertRaisesRegex(verify.VerificationError, "no changed local Go packages with tests"):
                 verify.changed_test_packages(root, value, env, modules)
-            report = verify.TestReport("example.org/core", [])
+            report = verify.TestRun({"example.org/core": []})
             report.accept(json.dumps({"Package": "example.org/core", "Action": "pass"}))
-            self.assertIn("no tests executed", report.errors(0))
+            self.assertTrue(any("no tests executed" in error for error in report.errors(0)))
 
 
 if __name__ == "__main__":
