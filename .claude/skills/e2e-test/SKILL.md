@@ -562,7 +562,7 @@ export class FeaturePage extends BasePage {
   }
 
   private async waitForListReady(): Promise<void> {
-    await expect(this.rows.first().or(this.emptyState)).toBeVisible()
+    await expect(this.rows.filter({ visible: true }).first().or(this.emptyState.filter({ visible: true }))).toBeVisible()
   }
 
   async createFeature(config: FeatureConfig): Promise<void> {
