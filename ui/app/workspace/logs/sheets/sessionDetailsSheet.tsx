@@ -9,12 +9,12 @@ import type { ProviderName } from "@/lib/constants/logs";
 import { getRequestTypeLabel, RequestTypeColors, Status, StatusBarColors } from "@/lib/constants/logs";
 import { getErrorMessage } from "@/lib/store";
 import { useGetLogSessionByIdInfiniteQuery, useGetLogSessionSummaryByIdQuery } from "@/lib/store/apis/logsApi";
-import { LogEntry } from "@/lib/types/logs";
+import { LogEntry, LogSessionSummaryResponse } from "@/lib/types/logs";
 import { cn } from "@/lib/utils";
 import { format } from "date-fns";
 import { dateFnsLocale } from "@/lib/i18n/dateLocale";
 import { ArrowDown, ArrowUp, Loader2 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 import { LogMessageCell } from "../views/columns";
@@ -55,17 +55,52 @@ interface SessionDetailsSheetProps {
 	onFilterByParentRequestId?: (parentRequestId: string) => void;
 }
 
-export function SessionDetailsSheet({
+export function SessionDetailsSheet(props: SessionDetailsSheetProps) {
+	const { sessionId, open } = props;
+	const [sortOrder, setSortOrder] = useState<"asc" | "desc">("asc");
+	const { currentData: sessionSummary } = useGetLogSessionSummaryByIdQuery(sessionId || "", {
+		skip: !open || !sessionId,
+		pollingInterval: 5000,
+		refetchOnMountOrArgChange: true,
+	});
+
+	if (!open || !sessionId) return null;
+
+	return (
+		<OpenSessionDetailsSheet
+			key={sessionId + ":" + sortOrder}
+			{...props}
+			sessionId={sessionId}
+			sortOrder={sortOrder}
+			onSortOrderChange={() => setSortOrder((previous) => (previous === "asc" ? "desc" : "asc"))}
+			sessionSummary={sessionSummary}
+		/>
+	);
+}
+
+interface OpenSessionDetailsSheetProps extends SessionDetailsSheetProps {
+	sessionId: string;
+	sortOrder: "asc" | "desc";
+	onSortOrderChange: () => void;
+	sessionSummary?: LogSessionSummaryResponse;
+}
+
+function OpenSessionDetailsSheet({
 	sessionId,
 	highlightedLogId,
 	open,
 	onOpenChange,
 	onLogClick,
 	onFilterByParentRequestId,
-}: SessionDetailsSheetProps) {
+	sortOrder,
+	onSortOrderChange,
+	sessionSummary,
+}: OpenSessionDetailsSheetProps) {
 	const { t, i18n } = useTranslation("observability");
 	const dateLocale = dateFnsLocale(i18n.language);
-	const [sortOrder, setSortOrder] = useState<"asc" | "desc">("asc");
+	// This committed opening owns its pages. Closing or changing session/order
+	// unmounts it, so an unfinished Load more cannot suppress the next offset0.
+	const openingId = useId();
 	const {
 		currentData: sessionPages,
 		isFetching: loadingSession,
@@ -73,15 +108,7 @@ export function SessionDetailsSheet({
 		error: sessionError,
 		hasNextPage,
 		fetchNextPage,
-	} = useGetLogSessionByIdInfiniteQuery(
-		{ sessionId: sessionId || "", order: sortOrder },
-		{ skip: !open || !sessionId, refetchOnMountOrArgChange: true },
-	);
-	const { currentData: sessionSummary } = useGetLogSessionSummaryByIdQuery(sessionId || "", {
-		skip: !open || !sessionId,
-		pollingInterval: 5000,
-		refetchOnMountOrArgChange: true,
-	});
+	} = useGetLogSessionByIdInfiniteQuery({ sessionId, order: sortOrder, openingId });
 	const sessionLogs = useMemo(() => {
 		const seen = new Map<string, LogEntry>();
 		for (const page of sessionPages?.pages ?? []) {
@@ -171,12 +198,7 @@ export function SessionDetailsSheet({
 						)}
 					</div>
 					<div className="flex items-center gap-3">
-						<Button
-							variant="outline"
-							size="sm"
-							data-testid="session-details-sort-btn"
-							onClick={() => setSortOrder((prev) => (prev === "asc" ? "desc" : "asc"))}
-						>
+						<Button variant="outline" size="sm" data-testid="session-details-sort-btn" onClick={onSortOrderChange}>
 							{sortOrder === "asc" ? <ArrowUp className="mr-2 h-4 w-4" /> : <ArrowDown className="mr-2 h-4 w-4" />}
 							{sortOrder === "asc" ? t("logs.session.earliestFirst") : t("logs.session.latestFirst")}
 						</Button>

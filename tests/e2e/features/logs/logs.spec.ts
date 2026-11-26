@@ -1,5 +1,5 @@
 import type { Locator, Page } from "@playwright/test";
-import { expect, test } from "../../core/fixtures/base.fixture";
+import { expect, test } from "../../core/fixtures/query-observer.fixture";
 import {
   createLogSearchQuery,
   SAMPLE_MODELS,
@@ -2021,7 +2021,7 @@ test.describe("LLM log detail identity", () => {
 
 
   for (const oldResult of ["rows", "empty", "error"] as const) {
-    test("keeps session B data and effects when an old session returns " + oldResult, async ({ page, logsPage }) => {
+    test("keeps session B data and effects when an old session returns " + oldResult, async ({ page, logsPage, queryObserver }) => {
       const timestamp = new Date().toISOString();
       const row = (id: string, parent: string) => ({
         id, parent_request_id: parent, object: "chat.completion", timestamp, created_at: timestamp,
@@ -2097,10 +2097,14 @@ test.describe("LLM log detail identity", () => {
           releaseCurrent();
           await expect(sheet.getByRole("cell", { name: next.model, exact: true })).toBeVisible();
         }
-        const oldResponse = page.waitForResponse((response) =>
-          new URL(response.url()).pathname === "/api/logs/sessions/" + first.parent_request_id);
+        const oldRequestId = await queryObserver.capture(first.parent_request_id);
         releaseOld();
-        await (await oldResponse).finished();
+        expect(await queryObserver.settled(oldRequestId)).toEqual({
+          requestId: oldRequestId, status: oldResult === "error" ? "rejected" : "fulfilled",
+        });
+        // The exact old query has reduced and notified React before checking B or closing it.
+        await expect(sheet).toHaveCount(1);
+        await expect(sheet.getByRole("button", { name: next.parent_request_id, exact: true })).toBeVisible();
         if (oldResult === "error") {
           // An obsolete failure/finally must neither report an error nor finish B's loading state.
           await expect.soft(sheet.getByText("Loading session...", { exact: true })).toBeVisible({ timeout: 1000 });
@@ -2273,7 +2277,109 @@ test.describe("LLM log detail identity", () => {
       releaseDescending();
     }
   });
-
+  for (const pageSize of [500, 50]) {
+    test(pageSize === 500
+      ? "refreshes the first page when reopening with Load more still pending"
+      : "advances a short session page by returned_count instead of the requested limit",
+    async ({ page, logsPage, queryObserver }) => {
+      const sessionId = "synthetic-session-lifecycle-" + pageSize;
+      const started = Date.now();
+      const rows = Array.from({ length: pageSize + 1 }, (_, index) => ({
+        id: sessionId + "-log-" + index, parent_request_id: sessionId,
+        object: "chat.completion", timestamp: new Date(started + index * 1000).toISOString(),
+        created_at: new Date(started + index * 1000).toISOString(), provider: "openai",
+        model: "synthetic-original-page-" + index, number_of_retries: 0, fallback_index: 0,
+        status: "success", stream: false, latency: 120, cost: 0, input_history: [], responses_input_history: [],
+      }));
+      const calls: { offset: number; limit: number; order: string }[] = [];
+      let firstPages = 0;
+      let nextPages = 0;
+      let releaseOldPage!: () => void;
+      let markOldPageStarted!: () => void;
+      const oldPageReady = new Promise<void>((resolve) => { releaseOldPage = resolve; });
+      const oldPageStarted = new Promise<void>((resolve) => { markOldPageStarted = resolve; });
+      await page.route((url) => url.pathname === "/api/logs", (route) => {
+        const logs = new URL(route.request().url()).searchParams.has("parent_request_id") ? [] : [rows[0]];
+        return route.fulfill({ json: {
+          logs, has_logs: true, pagination: { limit: 50, offset: 0, sort_by: "timestamp", order: "desc" },
+          stats: { total_requests: logs.length, success_rate: 100, user_facing_success_rate: 100,
+            user_facing_total_requests: logs.length, average_latency: 120, total_tokens: 0,
+            prompt_tokens: 0, completion_tokens: 0, total_cost: 0 },
+        } });
+      });
+      for (const id of [rows[0].id, sessionId]) {
+        await page.route((url) => url.pathname === "/api/logs/" + id, (route) =>
+          route.fulfill({ json: { ...rows[0], id, ...(id === sessionId ? { parent_request_id: undefined } : {}) } }));
+      }
+      await page.route((url) => url.pathname === "/api/logs/sessions/" + sessionId, async (route) => {
+        const params = new URL(route.request().url()).searchParams;
+        const offset = Number(params.get("offset"));
+        const limit = Number(params.get("limit"));
+        const order = params.get("order") || "";
+        expect([...params.keys()].sort()).toEqual(["limit", "offset", "order"]);
+        calls.push({ offset, limit, order });
+        if (offset === 0) firstPages++;
+        const fresh = firstPages > 1;
+        if (offset > 0 && ++nextPages === 1 && pageSize === 500) {
+          markOldPageStarted();
+          await oldPageReady;
+        }
+        const logs = rows.slice(offset, offset + pageSize).map((row, index) => ({
+          ...row, model: fresh ? "synthetic-fresh-page-" + (offset + index) : row.model,
+        }));
+        await route.fulfill({ json: {
+          session_id: sessionId, logs, count: rows.length, returned_count: logs.length,
+          has_more: offset + logs.length < rows.length, pagination: { limit, offset, order },
+        } });
+      });
+      await page.route((url) => url.pathname === "/api/logs/sessions/" + sessionId + "/summary", (route) =>
+        route.fulfill({ json: { session_id: sessionId, count: rows.length, total_cost: 0, total_tokens: 0, duration_ms: 0 } }));
+      const sheet = logsPage.logDetailSheet;
+      const tableRows = sheet.locator("tbody tr");
+      const loadMore = sheet.getByTestId("session-details-load-more-btn");
+      const openSession = async () => {
+        await logsPage.viewLogDetails(0);
+        await sheet.getByTestId("session-button-view").click();
+      };
+      try {
+        await page.goto("/workspace/logs?polling=false");
+        await expect(logsPage.tableRows).toHaveCount(1);
+        await openSession();
+        await expect(tableRows).toHaveCount(pageSize);
+        await loadMore.click();
+        if (pageSize === 500) {
+          await oldPageStarted;
+          const oldRequestId = await queryObserver.capture(sessionId);
+          await page.keyboard.press("Escape");
+          await expect(sheet).toHaveCount(0);
+          await openSession();
+          // The old next-page request is still held: reopening must issue offset0 now.
+          await expect(tableRows.first().getByRole("cell").last()).toHaveText("synthetic-fresh-page-0");
+          expect(calls).toEqual([
+            { offset: 0, limit: 500, order: "asc" },
+            { offset: 500, limit: 500, order: "asc" },
+            { offset: 0, limit: 500, order: "asc" },
+          ]);
+          releaseOldPage();
+          expect(await queryObserver.settled(oldRequestId)).toEqual({ requestId: oldRequestId, status: "fulfilled" });
+          await expect(tableRows).toHaveCount(500);
+          await expect(tableRows.first().getByRole("cell").last()).toHaveText("synthetic-fresh-page-0");
+          await expect(sheet.getByRole("cell", { name: rows[500].model, exact: true })).toHaveCount(0);
+          await expect(loadMore).toBeEnabled();
+          await loadMore.click();
+        }
+        await expect(tableRows).toHaveCount(pageSize + 1);
+        await expect(loadMore).toHaveCount(0);
+        expect(calls).toEqual((pageSize === 500 ? [0, 500, 0, 500] : [0, 50]).map((offset) => ({
+          offset, limit: 500, order: "asc",
+        })));
+        await page.keyboard.press("Escape");
+        await expect(sheet).toHaveCount(0);
+      } finally {
+        releaseOldPage();
+      }
+    });
+  }
 
 });
 

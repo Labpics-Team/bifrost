@@ -188,7 +188,12 @@ export const logsApi = baseApi.injectEndpoints({
 			providesTags: ["Logs"],
 		}),
 
-		getLogSessionById: builder.infiniteQuery<LogSessionDetailResponse, { sessionId: string; order: "asc" | "desc" }, number>({
+		// openingId scopes cache ownership only; it is never sent to the server.
+		getLogSessionById: builder.infiniteQuery<
+			LogSessionDetailResponse,
+			{ sessionId: string; order: "asc" | "desc"; openingId: string },
+			number
+		>({
 			infiniteQueryOptions: {
 				initialPageParam: 0,
 				getNextPageParam: (lastPage, _pages, lastPageParam) =>
