@@ -9020,6 +9020,10 @@ func (bifrost *Bifrost) completeAbandonedTrace(ctx *schemas.BifrostContext) {
 	}
 	// Completing before the transport attaches its plugin logs would drop them.
 	tracer.AwaitTransportHandoff(traceID)
+	// Cancellation can return the caller before the provider records its final
+	// timings. Refresh the root attributes before exporting this deferred trace.
+	ctx.StampUpstreamLatency()
+	ctx.StampStreamOverhead()
 	if rootHandle := tracer.GetSpanHandleByID(traceID, nil); rootHandle != nil {
 		tracer.EndSpan(rootHandle, schemas.SpanStatusError, "client disconnected before response")
 	}
