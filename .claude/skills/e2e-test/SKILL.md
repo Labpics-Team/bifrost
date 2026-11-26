@@ -512,6 +512,9 @@ For a new feature, create these files:
 - NEVER use brittle CSS selectors or chained parent locators (`.locator('..')`)
 - Methods should be async and use semantic waits
 - Include `goto()`, CRUD methods, and a `cleanup` method
+- Before checking whether an item exists, wait for the completed list state, including a successfully loaded empty list. An enabled create button or a visible table shell does not establish that state.
+
+The template assumes that `feature-row-*` contains actual items from a completed list load and `feature-empty-state` is rendered only after a successful empty response. These states are mutually exclusive; loading and error placeholders must not match either locator. Adapt the locators to the feature's rendered list states.
 
 **Template:**
 ```typescript
@@ -529,6 +532,8 @@ export class FeaturePage extends BasePage {
   // Main page elements
   readonly createBtn: Locator
   readonly table: Locator
+  readonly rows: Locator
+  readonly emptyState: Locator
 
   // Sheet/form elements
   readonly sheet: Locator
@@ -542,6 +547,8 @@ export class FeaturePage extends BasePage {
     // Use getByTestId for all locators
     this.createBtn = page.getByTestId('create-feature-btn')
     this.table = page.getByTestId('feature-table')
+    this.rows = page.getByTestId(/^feature-row-/)
+    this.emptyState = page.getByTestId('feature-empty-state')
     this.sheet = page.getByTestId('feature-sheet')
     this.nameInput = page.getByTestId('feature-name-input')
     this.saveBtn = page.getByTestId('feature-save-btn')
@@ -550,7 +557,11 @@ export class FeaturePage extends BasePage {
 
   async goto(): Promise<void> {
     await this.page.goto('/workspace/<feature>')
-    await expect(this.createBtn).toBeEnabled()
+    await this.waitForListReady()
+  }
+
+  private async waitForListReady(): Promise<void> {
+    await expect(this.rows.first().or(this.emptyState)).toBeVisible()
   }
 
   async createFeature(config: FeatureConfig): Promise<void> {
@@ -569,6 +580,7 @@ export class FeaturePage extends BasePage {
   }
 
   async featureExists(name: string): Promise<boolean> {
+    await this.waitForListReady()
     const row = this.page.getByTestId(`feature-row-${name}`)
     return (await row.count()) > 0
   }
