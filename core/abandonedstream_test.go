@@ -728,7 +728,7 @@ func TestStreamCancelledBeforeFirstByteRunsPostHooks(t *testing.T) {
 			t.Cleanup(func() { client.requestQueues.Store(schemas.OpenAI, realPq) })
 			var wg sync.WaitGroup
 			wg.Add(1)
-			go client.requestWorker(upstream, cfg, pq, &wg)
+			go client.requestWorker(upstream, cfg, pq, &wg, "")
 
 			for i := range n {
 				ctx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
@@ -817,7 +817,7 @@ func TestClaimedStreamErrorAlreadyEndedRunsPostHooksOnce(t *testing.T) {
 	t.Cleanup(func() { client.requestQueues.Store(schemas.OpenAI, realPq) })
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go client.requestWorker(&billedStartupErrorStreamProvider{Provider: openai.NewOpenAIProvider(cfg, NewNoOpLogger())}, cfg, pq, &wg)
+	go client.requestWorker(&billedStartupErrorStreamProvider{Provider: openai.NewOpenAIProvider(cfg, NewNoOpLogger())}, cfg, pq, &wg, "")
 
 	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
 	stream, bifrostErr := client.ChatCompletionStreamRequest(ctx, &schemas.BifrostChatRequest{Provider: schemas.OpenAI, Model: "gpt-4o-mini",
@@ -861,7 +861,7 @@ func BenchmarkRequestWorkerStreamAttempt(b *testing.B) {
 	pq := &ProviderQueue{queue: make(chan *ChannelMessage, 1), done: make(chan struct{})}
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go client.requestWorker(upstream, cfg, pq, &wg)
+	go client.requestWorker(upstream, cfg, pq, &wg, "")
 	request := &schemas.BifrostChatRequest{Provider: schemas.OpenAI, Model: "gpt-4o-mini",
 		Input: []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: new("hi")}}}}
 	tracer := client.getTracer()
