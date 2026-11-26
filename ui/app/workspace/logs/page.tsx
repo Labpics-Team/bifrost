@@ -137,6 +137,11 @@ export default function LogsPage() {
 
 	// The URL owns the active record, even when it is outside the current page.
 	const selectedLogId = urlState.selected_log || null;
+	// URL navigation, including Back, selects one overlay and discards an earlier session.
+	const activeSessionId = selectedLogId ? null : selectedSessionId;
+	useEffect(() => {
+		if (selectedLogId) handleSessionSheetOpenChange(false);
+	}, [selectedLogId, handleSessionSheetOpenChange]);
 	const polling = urlState.polling;
 	// Grouped view collapses fallback chains under their root. Disabled while a
 	// session filter is active — that view is already scoped to one chain/session.
@@ -1045,21 +1050,20 @@ export default function LogsPage() {
 							/>
 						</div>
 					</div>
-
-					<SessionDetailsSheet
-						sessionId={selectedSessionId}
-						highlightedLogId={sessionHighlightedLogId}
-						open={selectedSessionId !== null}
-						onOpenChange={handleSessionSheetOpenChange}
-						onLogClick={(log) => {
-							setSelectedSessionId(null);
-							setUrlState({ selected_log: log.id }, { history: "replace" });
-						}}
-						onFilterByParentRequestId={handleFilterByParentRequestId}
-					/>
 				</div>
 			)}
-			{/* A URL-selected detail stays available when the scoped list is empty. */}
+			{/* Selected log and session panels are independent of the scoped list. */}
+			<SessionDetailsSheet
+				sessionId={activeSessionId}
+				highlightedLogId={sessionHighlightedLogId}
+				open={activeSessionId !== null}
+				onOpenChange={handleSessionSheetOpenChange}
+				onLogClick={(log) => {
+					setSelectedSessionId(null);
+					setUrlState({ selected_log: log.id }, { history: "replace" });
+				}}
+				onFilterByParentRequestId={handleFilterByParentRequestId}
+			/>
 			<LogDetailSheet
 				logId={selectedLogId}
 				log={selectedLogFromData}

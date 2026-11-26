@@ -8,19 +8,17 @@ import { ProviderIconType, RenderProviderIcon } from "@/lib/constants/icons";
 import type { ProviderName } from "@/lib/constants/logs";
 import { getRequestTypeLabel, RequestTypeColors, Status, StatusBarColors } from "@/lib/constants/logs";
 import { getErrorMessage } from "@/lib/store";
-import { useGetLogSessionSummaryByIdQuery, useLazyGetLogSessionByIdQuery } from "@/lib/store/apis/logsApi";
+import { useGetLogSessionByIdInfiniteQuery, useGetLogSessionSummaryByIdQuery } from "@/lib/store/apis/logsApi";
 import { LogEntry } from "@/lib/types/logs";
 import { cn } from "@/lib/utils";
 import { format } from "date-fns";
 import { dateFnsLocale } from "@/lib/i18n/dateLocale";
 import { ArrowDown, ArrowUp, Loader2 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 import { useTranslation } from "react-i18next";
 import { LogMessageCell } from "../views/columns";
 import { getLocale } from "@/lib/i18n";
-
-const SESSION_LOG_PAGE_SIZE = 500;
 
 const HIGHLIGHTED_ROW =
 	"border-l-2 border-l-sky-500 bg-sky-500/[0.08] shadow-[inset_0_0_0_1px_rgba(56,189,248,0.18)] hover:bg-sky-500/[0.24] hover:shadow-[inset_0_0_0_1px_rgba(56,189,248,0.38)] dark:hover:bg-sky-400/[0.18]";
@@ -67,20 +65,47 @@ export function SessionDetailsSheet({
 }: SessionDetailsSheetProps) {
 	const { t, i18n } = useTranslation("observability");
 	const dateLocale = dateFnsLocale(i18n.language);
-	const [triggerGetSession] = useLazyGetLogSessionByIdQuery();
-	const [sessionLogs, setSessionLogs] = useState<LogEntry[]>([]);
-	const [loadingSession, setLoadingSession] = useState(false);
-	const [totalCount, setTotalCount] = useState(0);
-	const [fetchedCount, setFetchedCount] = useState(0);
-	const fetchedCountRef = useRef(fetchedCount);
-	const totalCountRef = useRef(totalCount);
-	const [hasMore, setHasMore] = useState(false);
 	const [sortOrder, setSortOrder] = useState<"asc" | "desc">("asc");
-	const { data: sessionSummary } = useGetLogSessionSummaryByIdQuery(sessionId || "", {
+	const {
+		currentData: sessionPages,
+		isFetching: loadingSession,
+		isError: sessionFailed,
+		error: sessionError,
+		hasNextPage,
+		fetchNextPage,
+	} = useGetLogSessionByIdInfiniteQuery(
+		{ sessionId: sessionId || "", order: sortOrder },
+		{ skip: !open || !sessionId, refetchOnMountOrArgChange: true },
+	);
+	const { currentData: sessionSummary } = useGetLogSessionSummaryByIdQuery(sessionId || "", {
 		skip: !open || !sessionId,
 		pollingInterval: 5000,
 		refetchOnMountOrArgChange: true,
 	});
+	const sessionLogs = useMemo(() => {
+		const seen = new Map<string, LogEntry>();
+		for (const page of sessionPages?.pages ?? []) {
+			for (const log of page.logs) seen.set(log.id, log);
+		}
+		return Array.from(seen.values()).sort((a, b) =>
+			sortOrder === "asc"
+				? new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+				: new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+		);
+	}, [sessionPages, sortOrder]);
+	const hasMore = !!sessionPages && hasNextPage;
+
+	useEffect(() => {
+		if (open && sessionId && sessionFailed) {
+			toast.error(t("logs.session.loadFailed"), { description: getErrorMessage(sessionError) });
+		}
+	}, [open, sessionId, sessionFailed, sessionError, t]);
+
+	useEffect(() => {
+		if (open && sessionId && !loadingSession && !sessionFailed && sessionPages?.pages[0]?.count === 0) {
+			onOpenChange(false);
+		}
+	}, [open, sessionId, loadingSession, sessionFailed, sessionPages, onOpenChange]);
 
 	const summaryCards: SummaryCard[] = useMemo(
 		() => [
@@ -121,75 +146,6 @@ export function SessionDetailsSheet({
 		],
 		[sessionSummary, sessionLogs.length, t, dateLocale],
 	);
-
-	const sortSessionLogs = useCallback(
-		(logs: LogEntry[]) =>
-			[...logs].sort((a, b) =>
-				sortOrder === "asc"
-					? new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
-					: new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
-			),
-		[sortOrder],
-	);
-
-	const loadSessionPage = useCallback(
-		async (offset: number, reset = false) => {
-			if (!sessionId) return;
-			setLoadingSession(true);
-			try {
-				const result = await triggerGetSession({
-					sessionId,
-					pagination: { limit: SESSION_LOG_PAGE_SIZE, offset, order: sortOrder },
-				});
-				if (result.error) {
-					toast.error(t("logs.session.loadFailed"), {
-						description: getErrorMessage(result.error),
-					});
-					return;
-				}
-				if (result.data) {
-					if (reset && result.data.count === 0) {
-						onOpenChange(false);
-						return;
-					}
-					setTotalCount(result.data.count);
-					setHasMore(result.data.has_more);
-					setFetchedCount(offset + result.data.returned_count);
-					setSessionLogs((prev) => {
-						const next = reset ? result.data!.logs : [...prev, ...result.data!.logs];
-						const seen = new Map<string, LogEntry>();
-						for (const log of next) {
-							seen.set(log.id, log);
-						}
-						return sortSessionLogs(Array.from(seen.values()));
-					});
-				}
-			} finally {
-				setLoadingSession(false);
-			}
-		},
-		[onOpenChange, sessionId, sortOrder, sortSessionLogs, triggerGetSession],
-	);
-
-	useEffect(() => {
-		fetchedCountRef.current = fetchedCount;
-	}, [fetchedCount]);
-	useEffect(() => {
-		totalCountRef.current = totalCount;
-	}, [totalCount]);
-
-	useEffect(() => {
-		if (!open || !sessionId) {
-			return;
-		}
-		setSessionLogs([]);
-		setFetchedCount(0);
-		setTotalCount(0);
-		fetchedCountRef.current = 0;
-		totalCountRef.current = 0;
-		setHasMore(false);
-		loadSessionPage(0, true);
-	}, [open, sessionId, sortOrder, loadSessionPage]);
 
 	return (
 		<Sheet open={open} onOpenChange={onOpenChange}>
@@ -280,7 +236,9 @@ export function SessionDetailsSheet({
 									<TableRow
 										key={log.id}
 										className={cn("cursor-pointer transition-colors", log.id === highlightedLogId ? HIGHLIGHTED_ROW : "hover:bg-muted/40")}
-										onClick={() => onLogClick?.(log)}
+										onClick={() => {
+											if (open && sessionId) onLogClick?.(log);
+										}}
 									>
 										<TableCell>
 											<div className={`h-6 w-1 rounded-sm ${StatusBarColors[log.status as Status]}`} />
@@ -323,12 +281,7 @@ export function SessionDetailsSheet({
 
 				{hasMore ? (
 					<div className="flex justify-center">
-						<Button
-							variant="outline"
-							data-testid="session-details-load-more-btn"
-							onClick={() => loadSessionPage(fetchedCount)}
-							disabled={loadingSession}
-						>
+						<Button variant="outline" data-testid="session-details-load-more-btn" onClick={() => fetchNextPage()} disabled={loadingSession}>
 							{loadingSession ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
 							{t("logs.session.loadMore")}
 						</Button>

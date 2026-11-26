@@ -29,6 +29,8 @@ import { baseApi } from "./baseApi";
 import { GetLogByIdArg, normalizeGetLogByIdArg } from "./logsApi.utils";
 import { RoutingRule } from "@/lib/types/routingRules";
 
+const SESSION_LOG_PAGE_SIZE = 500;
+
 // Helper function to build filter params
 function buildFilterParams(filters: LogFilters): Record<string, string | number> {
 	const params: Record<string, string | number> = {};
@@ -186,21 +188,18 @@ export const logsApi = baseApi.injectEndpoints({
 			providesTags: ["Logs"],
 		}),
 
-		getLogSessionById: builder.query<
-			LogSessionDetailResponse,
-			{
-				sessionId: string;
-				pagination: Pick<Pagination, "limit" | "offset" | "order">;
-			}
-		>({
-			query: ({ sessionId, pagination }) => ({
-				url: `/logs/sessions/${encodeURIComponent(sessionId)}`,
-				params: {
-					limit: pagination.limit,
-					offset: pagination.offset,
-					order: pagination.order,
-				},
+		getLogSessionById: builder.infiniteQuery<LogSessionDetailResponse, { sessionId: string; order: "asc" | "desc" }, number>({
+			infiniteQueryOptions: {
+				initialPageParam: 0,
+				getNextPageParam: (lastPage, _pages, lastPageParam) =>
+					lastPage.has_more && lastPage.returned_count > 0 ? lastPageParam + lastPage.returned_count : undefined,
+			},
+			query: ({ queryArg, pageParam }) => ({
+				url: `/logs/sessions/${encodeURIComponent(queryArg.sessionId)}`,
+				params: { limit: SESSION_LOG_PAGE_SIZE, offset: pageParam, order: queryArg.order },
 			}),
+			// Evict unused pages without a retention interval; in-flight requests may still finish.
+			keepUnusedDataFor: 0,
 			providesTags: ["Logs"],
 		}),
 
@@ -530,7 +529,7 @@ export const {
 	useGetLogSessionSummaryByIdQuery,
 	useGetDroppedRequestsQuery,
 	useGetAvailableFilterDataQuery,
-	useLazyGetLogSessionByIdQuery,
+	useGetLogSessionByIdInfiniteQuery,
 	useLazyGetLogsQuery,
 	useLazyGetLogsStatsQuery,
 	useLazyGetLogsHistogramQuery,
