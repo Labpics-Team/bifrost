@@ -55,6 +55,16 @@ func TestRoutingModelsHTTPAdmission(t *testing.T) {
 	for _, name := range []string{"B", "A"} {
 		require.NoError(t, routes.GetRuleStore().UpsertRule(context.Background(), &tables.TableRoutingRule{ID: name, Scope: "global", CelExpression: `model == "` + name + `"`, Targets: []tables.TableRoutingTarget{{Provider: bifrost.Ptr("openai"), Model: bifrost.Ptr("physical"), Weight: 1}}}))
 	}
+	// The same HTTP catalog must exclude declarations that are not public
+	// terminal names and targets the caller cannot access.
+	for _, rule := range []tables.TableRoutingRule{
+		{ID: "denied-provider", Scope: "global", CelExpression: `model == "Denied"`, Targets: []tables.TableRoutingTarget{{Provider: bifrost.Ptr("anthropic"), Model: bifrost.Ptr("physical"), Weight: 1}}},
+		{ID: "conditional", Scope: "global", CelExpression: `model == "Conditional" && request_type == "chat_completion"`, Targets: []tables.TableRoutingTarget{{Provider: bifrost.Ptr("openai"), Model: bifrost.Ptr("physical"), Weight: 1}}},
+		{ID: "disabled", Scope: "global", CelExpression: `model == "Disabled"`, Enabled: bifrost.Ptr(false), Targets: []tables.TableRoutingTarget{{Provider: bifrost.Ptr("openai"), Model: bifrost.Ptr("physical"), Weight: 1}}},
+		{ID: "chained", Scope: "global", CelExpression: `model == "Chained"`, ChainRule: true, Targets: []tables.TableRoutingTarget{{Provider: bifrost.Ptr("openai"), Model: bifrost.Ptr("physical"), Weight: 1}}},
+	} {
+		require.NoError(t, routes.GetRuleStore().UpsertRule(context.Background(), &rule))
+	}
 	plugins := []schemas.BasePlugin{gov, routes}
 	config.BasePlugins.Store(&plugins)
 	s := &BifrostHTTPServer{Config: config, Ctx: schemas.NewBifrostContext(context.Background(), time.Time{})}
@@ -82,8 +92,16 @@ func TestRoutingModelsHTTPAdmission(t *testing.T) {
 	require.NotEmpty(t, result.NextPageToken)
 	status, body = read("sk-bf-active", "?page_size=1&page_token="+result.NextPageToken, true)
 	require.Equal(t, 200, status, string(body))
+	result = schemas.BifrostListModelsResponse{}
 	require.NoError(t, json.Unmarshal(body, &result))
 	require.Equal(t, []schemas.Model{{ID: "B"}}, result.Data)
+	require.Empty(t, result.NextPageToken)
+	status, body = read("sk-bf-active", "", true)
+	require.Equal(t, 200, status, string(body))
+	result = schemas.BifrostListModelsResponse{}
+	require.NoError(t, json.Unmarshal(body, &result))
+	require.Equal(t, []schemas.Model{{ID: "A"}, {ID: "B"}}, result.Data)
+	require.Empty(t, result.NextPageToken)
 	for _, tc := range []struct {
 		key    string
 		header bool
