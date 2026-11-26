@@ -84,10 +84,7 @@ jobs:
               apk add --no-cache gcc musl-dev sqlite-dev binutils binutils-gold git python3
               git config --global --add safe.directory /src
               python3 -m unittest discover -s ci -p "test_*.py"
-              python3 ci/verify.py workspace
-              python3 ci/verify.py format
-              python3 ci/verify.py unit
-              python3 ci/verify.py test
+              python3 ci/verify.py all
             '
       - name: Remove the verifier container
         if: always()

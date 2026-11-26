@@ -262,10 +262,7 @@ routing plugin; настройки, dashboard и recent incidents доступн
 [ci/verify.py](ci/verify.py). На машине с Go и Python:
 
 ```sh
-python3 ci/verify.py workspace
-python3 ci/verify.py format
-python3 ci/verify.py unit
-python3 ci/verify.py test
+python3 ci/verify.py all
 ```
 
 `unit` выполняет полные short-наборы пакетов, изменённых относительно объявленной
@@ -276,7 +273,13 @@ python3 ci/verify.py test
 `test` выполняет обязательные регрессии; отсутствующий, пропущенный или упавший
 обязательный тест не считается успешной проверкой. Для Qdrant-регрессий нужен
 изолированный тестовый Qdrant. `semanticcache` выполняет весь локальный корпус
-с `-short`. CI задаёт fixture и toolchain в
+с `-short`. Команда `all` проверяет workspace и форматирование, запускает
+short-пакеты одним штатным `go test` (параллельность определяется Go),
+проверяет успешный результат каждого пакета и выполняет обязательные регрессии.
+Если обязательный проход уже выполняет весь short-корпус пакета, повторный
+short-запуск исключается; целевые non-short проверки сохраняются. Команды
+`workspace`, `format`, `unit` и `test` доступны для отдельных проверок.
+CI задаёт fixture и toolchain в
 [workflow](.github/workflows/labpics.yml). Ключи LLM-провайдеров не используются.
 Этот workflow проверяет изменённые Go-пакеты и обязательные контракты. Он
 не собирает и не публикует production-образ и не обновляет работающий сервис.
