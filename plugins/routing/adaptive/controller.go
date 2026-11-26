@@ -517,8 +517,8 @@ func (c *Controller) complete(a *attempt, failure schemas.FailureClass, retryAft
 	}
 	r.LastSeen = now
 	if r.ProbeID == a.probeID && a.probeID != 0 {
+		// End admission, retaining the generation to reject older outcomes.
 		r.ProbeUntil = time.Time{}
-		r.ProbeID = 0
 	}
 	if failure == schemas.FailureClassCancelled || failure == schemas.FailureClassCallerFault {
 		c.mu.Unlock()
@@ -534,6 +534,7 @@ func (c *Controller) complete(a *attempt, failure schemas.FailureClass, retryAft
 		c.providerChecks[providerID] = providerCheck{until: now.Add(recoveryInterval)}
 	}
 	before := c.stateLocked(r, now)
+	cooldownElapsed := !r.FailedUntil.IsZero() && !r.failed(now)
 	r.Samples++
 	sample := 0.0
 	if failure != "" {
@@ -564,11 +565,15 @@ func (c *Controller) complete(a *attempt, failure schemas.FailureClass, retryAft
 		}
 	}
 	after := c.stateLocked(r, now)
-	incidentNeedsUpdate := false
+	// A real outcome may arrive after expiry but before maintenance records
+	// the transition. Capture expiry before a success clears FailedUntil.
+	incidentNeedsUpdate := cooldownElapsed
 	scopes := [3]routeID{r.routeID, {Provider: r.Provider, KeyID: r.KeyID}, {Provider: r.Provider, Model: r.Model}}
 	for _, scope := range scopes {
 		if i := c.incidents[scope]; i != nil {
-			incidentNeedsUpdate = incidentNeedsUpdate || i.Status == "waiting_for_traffic"
+			// A model's history must match its own state. Whole-key and provider
+			// incidents aggregate several models/keys and can legitimately differ.
+			incidentNeedsUpdate = incidentNeedsUpdate || i.Status == "waiting_for_traffic" || scope == r.routeID && i.State != after
 			i.LastSeen = now
 			if request := requestID(a.ctx); request != "" {
 				i.LastRequestID = request
@@ -595,9 +600,9 @@ func (c *Controller) stateLocked(r *route, now time.Time) string {
 	switch {
 	case c.holdLocked(r.routeID, now) != nil:
 		return "held"
-	case !r.FailedUntil.IsZero():
+	case r.failed(now):
 		return "failed"
-	case r.Recovering && r.Recoveries < 5:
+	case r.recovering():
 		return "recovering"
 	case r.Samples == 0:
 		return "unknown"

@@ -46,6 +46,17 @@ func latencyFactor(ratio float64) float64 {
 	return 0.5 + 0.5/math.Sqrt(max(1, ratio))
 }
 
+// A transient cooldown excludes traffic only until its deadline. Expiry is not
+// a successful observation: the key stays recovering until real outcomes earn
+// back its share, even when restored from an older checkpoint.
+func (r *route) failed(now time.Time) bool {
+	return r.FailedUntil.After(now)
+}
+
+func (r *route) recovering() bool {
+	return !r.FailedUntil.IsZero() || r.Recovering && r.Recoveries < 5
+}
+
 func (r *route) score(peerBaseline float64) float64 {
 	// Errors dominate substantial degradation. Latency is relative to both
 	// the eligible peers and this key's own recent performance. Keep load
@@ -54,7 +65,7 @@ func (r *route) score(peerBaseline float64) float64 {
 	w := math.Max(0.05, math.Pow(1-r.ErrorRate, 3))
 	w *= latencyFactor(r.latencyRatio(peerBaseline))
 	w *= 1 - 0.2*float64(r.Inflight)/(1+float64(r.Inflight))
-	if r.Recovering && r.Recoveries < 5 {
+	if r.recovering() {
 		w *= 0.1 + 0.18*float64(r.Recoveries)
 	}
 	return w
@@ -68,7 +79,7 @@ func (c *Controller) keyWeightLocked(id routeID, now time.Time, peerBaseline flo
 	if r == nil {
 		return 1
 	}
-	if !r.FailedUntil.IsZero() {
+	if r.failed(now) {
 		return 0
 	}
 	return r.score(peerBaseline)
@@ -78,12 +89,11 @@ func (c *Controller) keyWeightLocked(id routeID, now time.Time, peerBaseline flo
 // the existing probe lease. Ranking alone can otherwise starve a route after
 // its first success, before it has earned a healthy score again.
 func (c *Controller) recoveryDueLocked(r *route, now time.Time) bool {
-	if r == nil || r.ProbeUntil.After(now) || c.holdLocked(r.routeID, now) != nil {
+	if r == nil || r.failed(now) || r.ProbeUntil.After(now) || c.holdLocked(r.routeID, now) != nil {
 		return false
 	}
-	if !r.FailedUntil.IsZero() {
-		return !r.FailedUntil.After(now)
-	}
-	return r.Inflight == 0 && now.Sub(r.LastSeen) >= recoveryInterval &&
-		(r.Recovering || r.ErrorRate > 0.05 || r.latencyRatio(0) >= degradedLatencyRatio)
+	// Load affects the score, but a stalled physical request must not prevent
+	// future observations after the current admission lease expires.
+	return now.Sub(r.LastSeen) >= recoveryInterval &&
+		(r.recovering() || r.ErrorRate > 0.05 || r.latencyRatio(0) >= degradedLatencyRatio)
 }

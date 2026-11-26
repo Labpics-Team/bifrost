@@ -98,7 +98,7 @@ func (a *adaptiveAffinity) ResolveKey(ctx *schemas.BifrostContext, provider sche
 			a.mu.Unlock()
 			return schemas.Key{}, false
 		}
-		if hold != nil || adaptiveKeys && r != nil && !r.FailedUntil.IsZero() {
+		if hold != nil || adaptiveKeys && r != nil && r.failed(now) {
 			if eligible == nil {
 				eligible = make([]schemas.Key, 0, len(keys)-1)
 				eligible = append(eligible, keys[:i]...)

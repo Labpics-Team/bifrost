@@ -218,7 +218,7 @@ func (c *Controller) Restore(ctx context.Context) error {
 	c.mu.Lock()
 	c.persistenceResultLocked(nil)
 	c.mu.Unlock()
-	return nil
+	return c.reconcileCooldowns(ctx)
 }
 
 // Checkpoint saves only bounded telemetry. Conditions are committed atomically
@@ -274,6 +274,9 @@ func (c *Controller) maintain(ctx context.Context) error {
 		}
 	}
 	c.flushDiagnostics()
+	if err := c.reconcileCooldowns(ctx); err != nil {
+		return err
+	}
 	now = c.now()
 	err := c.transition(ctx, func() transition {
 		t := transition{}

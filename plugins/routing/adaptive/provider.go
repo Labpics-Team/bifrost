@@ -93,9 +93,8 @@ func (c *Controller) reserveProbe(ctx *schemas.BifrostContext, d direction) bool
 		return c.reserveProviderCheckLocked(ctx, r.routeID, now)
 	}
 	c.probeSequence++
-	// A replacement check supersedes earlier outcomes even after its disposable
-	// lease is cleared. Attempts and incident writers already fence this epoch.
-	r.Epoch++
+	// Only older checks are superseded. Ordinary recovery traffic keeps its
+	// lifecycle epoch and its real outcomes, even while a check is replaced.
 	r.ProbeID = c.probeSequence
 	r.ProbeUntil = now.Add(5 * time.Minute)
 	c.setProbeReservationLocked(ctx, probeReservation{routeID: r.routeID, token: r.ProbeID})

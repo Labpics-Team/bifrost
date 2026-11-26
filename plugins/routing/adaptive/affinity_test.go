@@ -300,3 +300,27 @@ func BenchmarkAdaptiveSessionAffinity(b *testing.B) {
 		})
 	}
 }
+
+func TestAdaptiveNativeAffinityKeepsRecoveringKeyDuringLiveRequest(t *testing.T) {
+	c, now := providerController()
+	for range 3 {
+		observe(c, "p1", "m", "a", responseError(503))
+	}
+	*now = c.routes[routeID{"p1", "m", "a"}].FailedUntil
+	kv, err := kvstore.New(kvstore.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kv.Close()
+	affinity := c.SessionAffinity(bifrost.NewSessionAffinity(kv, bifrost.NewDefaultLogger(schemas.LogLevelError)))
+	ctx := testContext()
+	ctx.SetValue(schemas.BifrostContextKeySessionID, "recovering-key")
+	if err := kv.SetWithTTL(bifrost.SessionStateKey(ctx, bifrost.SessionStateKindKey, "p1", "m"), "a", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	a := c.BeginProviderAttempt(testContext(), schemas.ProviderAttemptInfo{Provider: "p1", Model: "m", KeyID: "a"})
+	defer a.End()
+	if key, ok := affinity.ResolveKey(ctx, "p1", "m", testKeys); !ok || key.ID != "a" {
+		t.Fatalf("recovering key lost native affinity while a real request was in flight: %s %v", key.ID, ok)
+	}
+}

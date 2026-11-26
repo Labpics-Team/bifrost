@@ -143,7 +143,7 @@ func TestAdaptiveProviderRecoversFromTransientFailureOnRealTraffic(t *testing.T)
 	}
 }
 
-func TestAdaptiveProviderRecoveryProbeKeepsOtherRequestsOnHealthyAlternative(t *testing.T) {
+func TestAdaptiveProviderRecoveryPreservesNativeRouting(t *testing.T) {
 	for _, provider := range []schemas.ModelProvider{"", "p1"} {
 		name := "bare model"
 		if provider != "" {
@@ -167,8 +167,14 @@ func TestAdaptiveProviderRecoveryProbeKeepsOtherRequestsOnHealthyAlternative(t *
 				t.Fatal(err)
 			}
 			p, model, fallbacks := probe.GetRequestFields()
-			if p != "p1" || len(fallbacks) != 1 || fallbacks[0].Provider != "p2" {
-				t.Fatalf("due check lost its healthy fallback: %s %+v", p, fallbacks)
+			if p != "p1" {
+				t.Fatalf("recovering provider was skipped: %s", p)
+			}
+			if provider == "" && (len(fallbacks) != 1 || fallbacks[0].Provider != "p2") {
+				t.Fatalf("due check lost its healthy fallback: %+v", fallbacks)
+			}
+			if provider != "" && len(fallbacks) != 0 {
+				t.Fatalf("recovering named provider added unrequested fallbacks: %+v", fallbacks)
 			}
 			key, err := c.SelectKey(ctx, keys, p, model)
 			if err != nil {
@@ -185,11 +191,11 @@ func TestAdaptiveProviderRecoveryProbeKeepsOtherRequestsOnHealthyAlternative(t *
 				t.Fatal(err)
 			}
 			p, _, fallbacks = other.GetRequestFields()
-			if p != "p2" {
-				t.Fatalf("provider received ordinary traffic while its recovery check was in flight: %s", p)
+			if provider == "" && (p != "p2" || len(fallbacks) != 1 || fallbacks[0].Provider != "p1") {
+				t.Fatalf("ordinary traffic lost the healthiest provider or usable recovery fallback: %s %+v", p, fallbacks)
 			}
-			if provider == "" && len(fallbacks) != 0 {
-				t.Fatalf("in-flight check was offered as a healthy fallback: %+v", fallbacks)
+			if provider != "" && (p != "p1" || len(fallbacks) != 0) {
+				t.Fatalf("recovering named provider was redirected or given unrequested fallbacks: %s %+v", p, fallbacks)
 			}
 
 			attempt.Observe(&schemas.BifrostResponse{}, nil)
@@ -682,7 +688,7 @@ func TestAdaptiveProviderRecoveryPreservesStaticKeyAndAdmission(t *testing.T) {
 			status[row.KeyID] = row
 		}
 	}
-	if got := status["a"]; got.Samples != 3 || got.ErrorRate != 1 || got.State != "failed" {
+	if got := status["a"]; got.Samples != 3 || got.ErrorRate != 1 || got.State != "recovering" {
 		t.Fatalf("unattempted key received recovery: %+v", got)
 	}
 	if got := status["b"]; got.Samples != 4 || got.ErrorRate >= 1 || got.State != "recovering" || got.Inflight != 0 {
@@ -766,7 +772,7 @@ func TestAdaptiveProviderRecoveryAbandonedAttemptReleasesAdmission(t *testing.T)
 					continue
 				}
 				observed++
-				if row.Samples != 3 || row.ErrorRate != 1 || row.State != "failed" || row.Inflight != 0 {
+				if row.Samples != 3 || row.ErrorRate != 1 || row.State != "recovering" || row.Inflight != 0 {
 					t.Fatalf("abandoned or different attempt changed original key health: %+v", row)
 				}
 			}

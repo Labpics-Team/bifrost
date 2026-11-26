@@ -89,7 +89,7 @@ func (c *Controller) reservationCurrentLocked(reserved probeReservation, now tim
 		return h.ID == reserved.conditionID && h.ProbeID == reserved.token
 	}
 	r := c.routes[reserved.routeID]
-	return reserved.conditionID == "" && r != nil && r.ProbeID == reserved.token
+	return reserved.conditionID == "" && r != nil && r.ProbeID == reserved.token && !r.ProbeUntil.IsZero()
 }
 
 type transition struct {
@@ -279,8 +279,6 @@ func incidentEvent(i *Incident, kind, request, message string, now time.Time) In
 }
 
 func setIncidentState(i *Incident, state string, now time.Time, request string) {
-	i.State = state
-	i.UpdatedAt = now
 	i.LastSeen = now
 	if request != "" {
 		i.LastRequestID = request
@@ -288,6 +286,14 @@ func setIncidentState(i *Incident, state string, now time.Time, request string) 
 			i.FirstRequestID = request
 		}
 	}
+	setIncidentLifecycleState(i, state, now)
+}
+
+// Lifecycle time is separate from the last real observation. A cooldown can
+// reopen admission, but cannot supply request evidence or establish recovery.
+func setIncidentLifecycleState(i *Incident, state string, now time.Time) {
+	i.State = state
+	i.UpdatedAt = now
 	rank := map[string]int{"unknown": 0, "healthy": 0, "recovering": 1, "degraded": 2, "failed": 3, "held": 4}
 	if rank[state] >= rank[i.WorstState] {
 		i.WorstState = state
@@ -353,7 +359,8 @@ func requestID(ctx *schemas.BifrostContext) string {
 
 func (c *Controller) attemptCurrentLocked(a *attempt) bool {
 	r := a.route
-	return c.routes[r.routeID] == r && c.keyStates[routeID{Provider: r.Provider, KeyID: r.KeyID}] == a.key && a.key.epoch == a.keyEpoch && r.Epoch == a.modelEpoch && c.providerRevisions[r.Provider] == a.providerRevision
+	return c.routes[r.routeID] == r && c.keyStates[routeID{Provider: r.Provider, KeyID: r.KeyID}] == a.key && a.key.epoch == a.keyEpoch && r.Epoch == a.modelEpoch && c.providerRevisions[r.Provider] == a.providerRevision &&
+		(a.probeID == 0 || a.holdID != "" || r.ProbeID == a.probeID)
 }
 
 func (c *Controller) releaseCompletedLeaseLocked(a *attempt) {
@@ -504,7 +511,17 @@ func (c *Controller) updateHealthIncident(a *attempt, request string, now time.T
 		}
 		t := transition{}
 		for _, i := range incidents {
-			if i.State == state && i.Status != "waiting_for_traffic" {
+			scopeState := state
+			if i.Model == "" && i.KeyID != "" {
+				// This optional lifecycle path runs only for an open whole-key
+				// incident. A real outcome for one model cannot clear its siblings.
+				scope := incidentRoute(i)
+				scopeState = c.keyHealthStatesLocked(map[routeID]bool{scope: true}, now)[scope].state()
+				if scopeState == "" {
+					continue
+				}
+			}
+			if i.State == scopeState && i.Status != "waiting_for_traffic" {
 				i.LastSeen = now
 				i.LastRequestID = request
 				c.incidents[incidentRoute(i)] = i
@@ -515,9 +532,9 @@ func (c *Controller) updateHealthIncident(a *attempt, request string, now time.T
 			if i.FailureClass == "" {
 				i.FailureClass = string(r.FailureClass)
 			}
-			setIncidentState(i, state, now, request)
+			setIncidentState(i, scopeState, now, request)
 			t.incidents = append(t.incidents, i)
-			t.events = append(t.events, incidentEvent(i, "state_changed", request, fmt.Sprintf("Observed route state changed to %s.", state), now))
+			t.events = append(t.events, incidentEvent(i, "state_changed", request, fmt.Sprintf("Observed route state changed to %s.", scopeState), now))
 		}
 		return t
 	})
@@ -541,12 +558,18 @@ func (c *Controller) updateProviderIncident(a *attempt, request string, now time
 	c.mu.Unlock()
 	keys, err := c.keys(context.Background(), provider)
 	if err != nil {
+		c.deferDiagnostic(a, request, now, false, true)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	retry := false
 	err = c.tryDiagnosticTransition(ctx, func() transition {
-		if c.revision != revision || c.resetSequence != generation || c.providerRevisions[provider] != providerRevision || !c.attemptCurrentLocked(a) {
+		if !c.attemptCurrentLocked(a) {
+			return transition{}
+		}
+		if c.revision != revision || c.resetSequence != generation || c.providerRevisions[provider] != providerRevision {
+			retry = true
 			return transition{}
 		}
 		id := routeID{Provider: provider, Model: model}
@@ -554,33 +577,9 @@ func (c *Controller) updateProviderIncident(a *attempt, request string, now time
 		if i == nil && (!c.config.load().HistoryEnabled || len(c.incidents) >= maxOptionalIncidents) {
 			return transition{}
 		}
-		eligible, unavailable := 0, 0
-		degraded, recovering := false, false
-		for _, key := range keys {
-			if key.Enabled != nil && !*key.Enabled || !c.supports(provider, key, model) {
-				continue
-			}
-			eligible++
-			rid := routeID{provider, model, key.ID}
-			if c.weightLocked(rid, now) == 0 {
-				unavailable++
-			}
-			if r := c.routes[rid]; r != nil {
-				state := c.stateLocked(r, now)
-				degraded = degraded || state == "degraded"
-				recovering = recovering || state == "recovering"
-			}
-		}
-		if eligible == 0 {
+		state := c.providerHealthStateLocked(provider, model, keys, now)
+		if state == "" {
 			return transition{}
-		}
-		state := "healthy"
-		if unavailable == eligible {
-			state = "failed"
-		} else if unavailable > 0 || degraded {
-			state = "degraded"
-		} else if recovering {
-			state = "recovering"
 		}
 		if i == nil && state == "healthy" {
 			return transition{}
@@ -594,7 +593,7 @@ func (c *Controller) updateProviderIncident(a *attempt, request string, now time
 		setIncidentState(i, state, now, request)
 		return transition{incidents: []*Incident{i}, events: []IncidentEvent{incidentEvent(i, "state_changed", request, fmt.Sprintf("Provider health for this model changed to %s.", state), now)}}
 	})
-	if err != nil {
+	if err != nil || retry {
 		c.deferDiagnostic(a, request, now, false, true)
 	}
 }

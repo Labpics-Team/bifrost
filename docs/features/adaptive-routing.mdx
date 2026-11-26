@@ -68,8 +68,9 @@ A provider already named by the caller, a rule or a virtual key remains selected
 by default. The optional append, redirect and prune settings adjust this policy.
 For a named provider, pruning applies only when appending alternatives is enabled
 or the request was actually redirected, following the native settings contract.
-A due check of a named provider keeps healthy fallbacks even when appending
-alternatives to ordinary named traffic is off. If every explicitly configured
+A due held-key check on a named provider keeps healthy fallbacks even when
+appending alternatives to ordinary named traffic is off. A named recovering
+provider keeps its requests; adding alternatives still follows the append setting. If every explicitly configured
 fallback is failing, redirecting can use the healthy compatible, allowed global
 pool. A managed provider without an eligible key is excluded; native keyless
 providers remain supported.
@@ -91,13 +92,20 @@ successful streams measure the first response, not the duration of generation.
 
 For an unnamed request the highest-scored provider is selected, with usable
 alternatives ordered by score. Keys within a provider are selected by weight.
-A due hold or expired failure cooldown gets a single real checking request
-ahead of healthy alternatives. A degraded or recovering route that has not
-received an attempt for 30 seconds can use the same lease for one fresh
-observation. The next attempt resets that interval. This local recovery boost
+A transient failure excludes a key for a short cooldown. When that wait ends,
+the key returns to Recovering with a reduced ordinary traffic share, without
+counting a success or changing its observed metrics. Held keys remain excluded
+until a real check or an explicit release resolves the hold.
+A due hold gets a single real checking request ahead of healthy alternatives.
+A degraded or recovering route that has not received an attempt for 30 seconds
+can use the same lease for one fresh observation. This priority lease does not
+exclude ordinary traffic from a recovering key. The next attempt resets that interval. This local recovery boost
 continues until real responses establish health, so the first successful check
-does not leave a provider stuck behind its healthy alternative. The lease
-prevents a burst of checks; healthy fallbacks remain available.
+does not leave a provider stuck behind its healthy alternative. One active
+admission lease limits priority checks; healthy fallbacks remain available.
+After five minutes an unreported check can be replaced. Its old physical request
+may still be running, but its late outcome cannot override the newer check;
+ordinary requests keep contributing their own outcomes.
 When adaptive key selection is off, a non-held recovery check reserves only the
 provider and model. Configured weights and native key affinity still choose the
 key. Only the key that actually serves the request receives a health observation;
@@ -132,7 +140,11 @@ The native `config.db` holds conditions, lifecycle incidents and their events.
 A condition's next-check time is an admission time, never an expiry time. Due
 conditions survive restart, telemetry eviction and idle cleanup until a real
 check, an operator action or a configuration change resolves them. Reading
-`/api/adaptive-routing/status` does not mutate any routing state.
+`/api/adaptive-routing/status` does not mutate any routing state. Non-held
+transient cooldowns become usable immediately at their deadline. Existing
+maintenance records the corresponding `state_changed` incident transition and its cooldown reason
+without adding a request, a success, a sample, or a new last-observed time.
+A timer can return an incident to Recovering, but cannot mark it resolved.
 
 Each attempt captures the actual selected key's configuration fingerprint, the
 provider worker's configuration revision and its condition/probe generations.

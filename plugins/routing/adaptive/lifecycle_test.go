@@ -349,11 +349,16 @@ func adaptiveHealthyTrafficDuringSQLiteWait(t *testing.T, due, routeProvider boo
 					served <- err
 					return
 				}
-				if chosen, _, _ := req.GetRequestFields(); chosen != "p2" {
-					served <- fmt.Errorf("expected healthy provider p2, got %s", chosen)
+				want := schemas.ModelProvider("p2")
+				if provider == "p1" && status == 503 && due {
+					want = "p1" // A recovering named provider retains its requests.
+				}
+				chosen, _, _ := req.GetRequestFields()
+				if chosen != want || ctx.Value(probeContextKey{}) != nil {
+					served <- fmt.Errorf("expected ordinary provider %s while writer is busy, got %s", want, chosen)
 					return
 				}
-				observeWithContext(c, ctx, "p2", "m", "b", nil)
+				observeWithContext(c, ctx, chosen, "m", "b", nil)
 			}
 			served <- nil
 			return
@@ -361,9 +366,9 @@ func adaptiveHealthyTrafficDuringSQLiteWait(t *testing.T, due, routeProvider boo
 		for _, model := range []string{"m", "new-model"} {
 			ctx := testContext()
 			key, err := c.SelectKey(ctx, testKeys, "p1", model)
-			// A transient failure only affects m. A new model can use either
-			// key, while a credential refusal holds a across every model.
-			mustUseB := status == 401 || model == "m"
+			// A transient cooldown only affects m until it expires. A held
+			// credential remains excluded across every model.
+			mustUseB := status == 401 || model == "m" && !due
 			if err != nil || key.ID != "a" && key.ID != "b" || mustUseB && key.ID != "b" {
 				served <- fmt.Errorf("expected healthy key for %s after %d, got %s: %v", model, status, key.ID, err)
 				return
