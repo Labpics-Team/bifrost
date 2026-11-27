@@ -30,7 +30,7 @@ func TestConvertMCPToolToBifrostSchema_EmptyParameters(t *testing.T) {
 	}
 
 	// Convert the tool
-	bifrostTool := convertMCPToolToBifrostSchema(mcpTool, defaultLogger)
+	bifrostTool := mustConvertMCPTool(t, mcpTool, defaultLogger)
 
 	// Verify the function was created
 	if bifrostTool.Function == nil {
@@ -79,7 +79,7 @@ func TestConvertMCPToolToBifrostSchema_WithAnnotations(t *testing.T) {
 		},
 	}
 
-	bifrostTool := convertMCPToolToBifrostSchema(mcpTool, defaultLogger)
+	bifrostTool := mustConvertMCPTool(t, mcpTool, defaultLogger)
 
 	// Annotations must be on ChatTool, not buried in Function
 	require.NotNil(t, bifrostTool.Annotations, "Annotations should be set on ChatTool")
@@ -114,7 +114,7 @@ func TestConvertMCPToolToBifrostSchema_NilAnnotationsWhenAllZero(t *testing.T) {
 		Annotations: mcp.ToolAnnotation{}, // All zero values — Title empty, all hints nil
 	}
 
-	bifrostTool := convertMCPToolToBifrostSchema(mcpTool, defaultLogger)
+	bifrostTool := mustConvertMCPTool(t, mcpTool, defaultLogger)
 
 	assert.Nil(t, bifrostTool.Annotations,
 		"Annotations should be nil when all MCP annotation fields are zero")
@@ -143,7 +143,7 @@ func TestConvertMCPToolToBifrostSchema_WithParameters(t *testing.T) {
 	}
 
 	// Convert the tool
-	bifrostTool := convertMCPToolToBifrostSchema(mcpTool, defaultLogger)
+	bifrostTool := mustConvertMCPTool(t, mcpTool, defaultLogger)
 
 	// Verify the function was created
 	if bifrostTool.Function == nil {
@@ -203,7 +203,7 @@ func TestConvertMCPToolToBifrostSchema_PreservesDefs(t *testing.T) {
 		},
 	}
 
-	bifrostTool := convertMCPToolToBifrostSchema(mcpTool, defaultLogger)
+	bifrostTool := mustConvertMCPTool(t, mcpTool, defaultLogger)
 	require.NotNil(t, bifrostTool.Function)
 	require.NotNil(t, bifrostTool.Function.Parameters)
 	require.NotNil(t, bifrostTool.Function.Parameters.Defs, "$defs must be preserved on conversion")
@@ -1031,4 +1031,43 @@ func TestCheckToolExecutionPermitted_RechecksUnattendedApproval(t *testing.T) {
 	config.ToolsToAutoExecute = schemas.WhiteList{"search"}
 	ctx.SetValue(schemas.MCPContextKeyIncludeTools, []string{"other-tool"})
 	assert.ErrorContains(t, checkToolExecutionPermitted(ctx, &state, "tavily-search", m.logger), "filtered by request context")
+}
+
+func mustConvertMCPTool(t *testing.T, tool *mcp.Tool, logger schemas.Logger) schemas.ChatTool {
+	t.Helper()
+	converted, err := convertMCPToolToBifrostSchema(tool, logger)
+	require.NoError(t, err)
+	return converted
+}
+
+// The outer union is where serde-tagged and untagged MCP contracts put their
+// operation-specific arguments. The SDK retains it in AdditionalFields.
+func TestMCPInputSchemaCompleteContract(t *testing.T) {
+	const input = `{"type":"object","$schema":"https://json-schema.org/draft/2020-12/schema","oneOf":[{"properties":{"url":{"type":"string"}},"required":["url"]},{"properties":{"query":{"$ref":"#/$defs/Query"}},"required":["query"]}],"$defs":{"Query":{"type":"string"}},"unevaluatedProperties":false,"dependentRequired":{"url":["mode"]}}`
+	var discovered mcp.Tool
+	require.NoError(t, json.Unmarshal([]byte(`{"name":"retrieve","inputSchema":`+input+`}`), &discovered))
+	raw := mcp.NewToolWithRawSchema("retrieve", "retrieve", json.RawMessage(input))
+	for _, tool := range []mcp.Tool{discovered, raw} {
+		converted := mustConvertMCPTool(t, &tool, defaultLogger)
+		var want, got map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal([]byte(input), &want))
+		b, err := json.Marshal(converted.Function.Parameters)
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(b, &got))
+		for key, value := range want {
+			require.Contains(t, got, key)
+			assert.JSONEq(t, string(value), string(got[key]), key)
+		}
+		// Discovery is persisted as a ChatTool; the contract must survive reload.
+		wire, err := json.Marshal(converted)
+		require.NoError(t, err)
+		var restored schemas.ChatTool
+		require.NoError(t, json.Unmarshal(wire, &restored))
+		restoredWire, err := json.Marshal(restored.Function.Parameters)
+		require.NoError(t, err)
+		assert.JSONEq(t, string(b), string(restoredWire))
+	}
+	invalid := mcp.NewToolWithRawSchema("invalid", "", json.RawMessage(`{"type":"array"}`))
+	_, err := convertMCPToolToBifrostSchema(&invalid, defaultLogger)
+	require.Error(t, err)
 }

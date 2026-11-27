@@ -1406,8 +1406,13 @@ func retrieveExternalToolsDetailed(ctx context.Context, client *client.Client, c
 			continue
 		}
 
-		// Convert MCP tool schema to Bifrost format
-		bifrostTool := convertMCPToolToBifrostSchema(&mcpTool, logger)
+		// Never publish a tool whose argument contract could not be represented.
+		bifrostTool, err := convertMCPToolToBifrostSchema(&mcpTool, logger)
+		if err != nil {
+			logger.Warn("%s Skipping MCP tool %q: %v", MCPLogPrefix, mcpTool.Name, err)
+			skipped = append(skipped, schemas.SkippedMCPTool{OriginalName: mcpTool.Name, Reason: err.Error()})
+			continue
+		}
 		// Prefix tool name with client name to make it permanent (using '-' as separator)
 		// Keep the original tool name (don't sanitize) so we can call the MCP server correctly
 		prefixedToolName := fmt.Sprintf("%s-%s", clientName, mcpTool.Name)
@@ -1568,37 +1573,25 @@ func shouldSkipToolForRequest(ctx context.Context, clientName, toolName string) 
 }
 
 // convertMCPToolToBifrostSchema converts an MCP tool definition to Bifrost format.
-func convertMCPToolToBifrostSchema(mcpTool *mcp.Tool, logger schemas.Logger) schemas.ChatTool {
-	var properties *schemas.OrderedMap
-	if len(mcpTool.InputSchema.Properties) > 0 {
-		// Fix array schemas on the source map before copying to OrderedMap
-		FixArraySchemas(mcpTool.InputSchema.Properties, logger)
-
-		// mcp-go decodes properties into a Go map, so the server's key order is
-		// already lost here. Sort the keys: ranging over the map would give a
-		// different order on each tools/list sync, which changes the tool JSON
-		// sent to providers (breaking prompt caching) and the tools hash.
-		properties = schemas.OrderedMapFromMap(mcpTool.InputSchema.Properties)
-	} else {
-		// For tools with no parameters, initialize an empty properties map
-		// This is required by some providers (e.g., OpenAI) which expect
-		// object schemas to always have a properties field, even if empty
-		properties = schemas.NewOrderedMap()
+func convertMCPToolToBifrostSchema(mcpTool *mcp.Tool, logger schemas.Logger) (schemas.ChatTool, error) {
+	input := mcpTool.InputSchema
+	if len(mcpTool.RawInputSchema) != 0 {
+		if err := json.Unmarshal(mcpTool.RawInputSchema, &input); err != nil {
+			return schemas.ChatTool{}, fmt.Errorf("decode MCP input schema: %w", err)
+		}
 	}
-
-	// Preserve JSON Schema definitions ($defs). The MCP SDK already folds legacy
-	// "definitions" into Defs on unmarshal, so we only need to handle Defs here.
-	// Without this, any $ref pointing at #/$defs/... rides along inside Properties
-	// while the definitions it targets are dropped, leaving a dangling $ref that
-	// providers reject (e.g. Vertex Gemini returns INVALID_ARGUMENT).
-	var defs *schemas.OrderedMap
-	if len(mcpTool.InputSchema.Defs) > 0 {
-		// Normalize array schemas inside each definition, mirroring the fix applied
-		// to Properties above.
-		FixArraySchemas(mcpTool.InputSchema.Defs, logger)
-
-		// Sorted for the same reason as properties above.
-		defs = schemas.OrderedMapFromMap(mcpTool.InputSchema.Defs)
+	if input.Type != "object" {
+		return schemas.ChatTool{}, fmt.Errorf("MCP input schema must have type object")
+	}
+	// Keep the existing canonical order and provider array repair, but convert the
+	// complete schema rather than selecting a subset of its keywords.
+	input.PropertyOrder = nil
+	FixArraySchemas(input.Properties, logger)
+	FixArraySchemas(input.Defs, logger)
+	FixArraySchemas(map[string]any{"": input.AdditionalFields}, logger)
+	parameters, err := schemas.ConvertViaJSON[schemas.ToolFunctionParameters](input)
+	if err != nil {
+		return schemas.ChatTool{}, fmt.Errorf("convert MCP input schema: %w", err)
 	}
 
 	// Preserve MCP tool annotations if any are set.
@@ -1627,16 +1620,11 @@ func convertMCPToolToBifrostSchema(mcpTool *mcp.Tool, logger schemas.Logger) sch
 		Function: &schemas.ChatToolFunction{
 			Name:        mcpTool.Name,
 			Description: schemas.Ptr(mcpTool.Description),
-			Parameters: &schemas.ToolFunctionParameters{
-				Type:       mcpTool.InputSchema.Type,
-				Properties: properties,
-				Required:   mcpTool.InputSchema.Required,
-				Defs:       defs,
-			},
+			Parameters:  &parameters,
 		},
 		Annotations: annotations,
 		MCP:         toolMetadata(mcpTool),
-	}
+	}, nil
 }
 
 // toolMetadata is the title, icons and output schema mcpTool declares, or nil when it declares none.

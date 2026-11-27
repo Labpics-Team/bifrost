@@ -51,7 +51,8 @@ func TestConvertToolFunctionParametersToMCPInputSchemaPreservesDefs(t *testing.T
 		),
 	}
 
-	inputSchema := convertToolFunctionParametersToMCPInputSchema(params)
+	inputSchema, err := convertToolFunctionParametersToMCPInputSchema(params)
+	require.NoError(t, err)
 
 	require.Contains(t, inputSchema.Defs, "Preferences")
 	data, err := json.Marshal(inputSchema)
@@ -71,7 +72,8 @@ func TestConvertToolFunctionParametersToMCPInputSchemaPreservesLegacyDefinitions
 		),
 	}
 
-	inputSchema := convertToolFunctionParametersToMCPInputSchema(params)
+	inputSchema, err := convertToolFunctionParametersToMCPInputSchema(params)
+	require.NoError(t, err)
 
 	require.Contains(t, inputSchema.Defs, "Preferences")
 	data, err := json.Marshal(inputSchema)
@@ -2654,5 +2656,28 @@ func TestMCPGateway_ServerGivenNamesForPerCallerClients(t *testing.T) {
 	assert.Equal(t, []string{"notes-search as alice", "notes-export as bob", "notes-refresh as gina"}, tm.reachedBifrost())
 	for name := range listedTools(t, h, as("alice", "")) {
 		assert.NotEqual(t, "", coremcp.ToolClientName(name), "tools/list carries no server-given name: %q", name)
+	}
+}
+
+func TestMCPGatewayInputSchemaCompleteContract(t *testing.T) {
+	const input = `{"type":"object","properties":{},"oneOf":[{"required":["url"],"properties":{"url":{"type":"string"}}},{"required":["query"],"properties":{"query":{"$ref":"#/$defs/Query"}}}],"$defs":{"Query":{"type":"string"}},"unevaluatedProperties":false,"$schema":"https://json-schema.org/draft/2020-12/schema"}`
+	var params schemas.ToolFunctionParameters
+	require.NoError(t, json.Unmarshal([]byte(input), &params))
+	tool, err := gatewayTool(schemas.ChatTool{
+		Type:     schemas.ChatToolTypeFunction,
+		Function: &schemas.ChatToolFunction{Name: "source-retrieve", Parameters: &params},
+	})
+	require.NoError(t, err)
+	wire, err := json.Marshal(tool)
+	require.NoError(t, err)
+	var result struct {
+		InputSchema map[string]json.RawMessage `json:"inputSchema"`
+	}
+	require.NoError(t, json.Unmarshal(wire, &result))
+	var want map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(input), &want))
+	for key, value := range want {
+		require.Contains(t, result.InputSchema, key)
+		assert.JSONEq(t, string(value), string(result.InputSchema[key]), key)
 	}
 }

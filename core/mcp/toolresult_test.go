@@ -115,19 +115,19 @@ func TestConvertMCPTool_KeepsTitleIconsAndOutputSchema(t *testing.T) {
 	}]())
 	tool.Title = "Weather"
 	tool.Icons = []mcp.Icon{{Src: "https://example.com/weather.png", MIMEType: "image/png"}}
-	converted := convertMCPToolToBifrostSchema(&tool, &MockLogger{})
+	converted := mustConvertMCPTool(t, &tool, &MockLogger{})
 	require.NotNil(t, converted.MCP)
 	assert.Equal(t, "Weather", converted.MCP.Title)
 	assert.Equal(t, tool.Icons, converted.MCP.Icons)
 	assert.Contains(t, string(converted.MCP.OutputSchema), `"temp"`)
 
 	plain := mcp.NewTool("echo")
-	assert.Nil(t, convertMCPToolToBifrostSchema(&plain, &MockLogger{}).MCP)
+	assert.Nil(t, mustConvertMCPTool(t, &plain, &MockLogger{}).MCP)
 
 	// A type-less output schema is kept, and no "type" is added.
 	var untyped mcp.Tool
 	require.NoError(t, json.Unmarshal([]byte(`{"name":"answer","inputSchema":{"type":"object"},"outputSchema":{"properties":{"answer":{"type":"string"}}}}`), &untyped))
-	converted = convertMCPToolToBifrostSchema(&untyped, &MockLogger{})
+	converted = mustConvertMCPTool(t, &untyped, &MockLogger{})
 	require.NotNil(t, converted.MCP, "the output schema must not be dropped")
 	var schema map[string]any
 	require.NoError(t, json.Unmarshal(converted.MCP.OutputSchema, &schema))
