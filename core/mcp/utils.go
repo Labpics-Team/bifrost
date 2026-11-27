@@ -1588,7 +1588,8 @@ func convertMCPToolToBifrostSchema(mcpTool *mcp.Tool, logger schemas.Logger) (sc
 	input.PropertyOrder = nil
 	FixArraySchemas(input.Properties, logger)
 	FixArraySchemas(input.Defs, logger)
-	FixArraySchemas(map[string]any{"": input.AdditionalFields}, logger)
+	fixArraySchema(input.AdditionalProperties, logger)
+	fixArraySchema(input.AdditionalFields, logger)
 	parameters, err := schemas.ConvertViaJSON[schemas.ToolFunctionParameters](input)
 	if err != nil {
 		return schemas.ChatTool{}, fmt.Errorf("convert MCP input schema: %w", err)
@@ -2044,78 +2045,38 @@ func StripClientPrefix(prefixedToolName, clientName string) string {
 	return prefixedToolName
 }
 
-// FixArraySchemas recursively fixes array schemas by ensuring they have an 'items' field.
-// This prevents validation errors like "array schema missing items" when tools are registered.
-// It handles nested arrays (array-of-array) and recurses into items regardless of type.
-//
-// Parameters:
-//   - properties: The properties map to fix
+// FixArraySchemas repairs array schemas in a map of named subschemas.
 func FixArraySchemas(properties map[string]interface{}, logger schemas.Logger) {
-	for key, value := range properties {
-		// Check if the value is a map (representing a schema object)
-		if schemaMap, ok := value.(map[string]interface{}); ok {
-			// Check if this is an array type
-			if schemaType, ok := schemaMap["type"].(string); ok && schemaType == "array" {
-				// Check if 'items' is missing
-				if _, hasItems := schemaMap["items"]; !hasItems {
-					// Add a default 'items' schema (unconstrained)
-					schemaMap["items"] = map[string]interface{}{}
-					logger.Debug("%s Fixed array schema for property '%s': added missing 'items' field", MCPLogPrefix, key)
-				}
-				// Recurse into items regardless of type (object or array)
-				if itemsMap, ok := schemaMap["items"].(map[string]interface{}); ok {
-					itemsType, _ := itemsMap["type"].(string)
-					switch itemsType {
-					case "array":
-						// Handle nested arrays (array-of-array)
-						FixArraySchemas(map[string]interface{}{"": itemsMap}, logger)
-					case "object":
-						// Recurse into object properties
-						if itemsProps, ok := itemsMap["properties"].(map[string]interface{}); ok {
-							FixArraySchemas(itemsProps, logger)
-						}
-					}
-				}
-			}
+	for _, schema := range properties {
+		fixArraySchema(schema, logger)
+	}
+}
 
-			// Recursively fix nested object properties
-			if schemaType, ok := schemaMap["type"].(string); ok && schemaType == "object" {
-				if nestedProps, ok := schemaMap["properties"].(map[string]interface{}); ok {
-					FixArraySchemas(nestedProps, logger)
-				}
+// Visit only JSON Schema subschema positions, never instance data in const,
+// enum, default or examples. Composition members need not declare a type.
+func fixArraySchema(value any, logger schemas.Logger) {
+	schema, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	if typ, _ := schema["type"].(string); typ == "array" {
+		if _, exists := schema["items"]; !exists {
+			schema["items"] = map[string]any{}
+			logger.Debug("%s Fixed array schema: added missing 'items' field", MCPLogPrefix)
+		}
+	}
+	for _, key := range []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas", "dependencies"} {
+		if children, ok := schema[key].(map[string]any); ok {
+			FixArraySchemas(children, logger)
+		}
+	}
+	for _, key := range []string{"items", "additionalProperties", "additionalItems", "contains", "not", "if", "then", "else", "propertyNames", "unevaluatedItems", "unevaluatedProperties", "contentSchema", "prefixItems", "anyOf", "oneOf", "allOf"} {
+		if children, ok := schema[key].([]any); ok {
+			for _, child := range children {
+				fixArraySchema(child, logger)
 			}
-
-			// Handle anyOf, oneOf, allOf
-			for _, unionKey := range []string{"anyOf", "oneOf", "allOf"} {
-				if unionArray, ok := schemaMap[unionKey].([]interface{}); ok {
-					for _, unionItem := range unionArray {
-						if unionMap, ok := unionItem.(map[string]interface{}); ok {
-							if unionType, ok := unionMap["type"].(string); ok && unionType == "array" {
-								if _, hasItems := unionMap["items"]; !hasItems {
-									unionMap["items"] = map[string]interface{}{}
-									logger.Debug("%s Fixed array schema in %s for property '%s': added missing 'items' field", MCPLogPrefix, unionKey, key)
-								}
-								// Recurse into items regardless of type
-								if itemsMap, ok := unionMap["items"].(map[string]interface{}); ok {
-									itemsType, _ := itemsMap["type"].(string)
-									switch itemsType {
-									case "array":
-										// Handle nested arrays
-										FixArraySchemas(map[string]interface{}{"": itemsMap}, logger)
-									case "object":
-										if itemsProps, ok := itemsMap["properties"].(map[string]interface{}); ok {
-											FixArraySchemas(itemsProps, logger)
-										}
-									}
-								}
-							}
-							if nestedProps, ok := unionMap["properties"].(map[string]interface{}); ok {
-								FixArraySchemas(nestedProps, logger)
-							}
-						}
-					}
-				}
-			}
+		} else {
+			fixArraySchema(schema[key], logger)
 		}
 	}
 }

@@ -5,6 +5,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -559,10 +560,10 @@ func gatewayTool(tool schemas.ChatTool) (mcp.Tool, error) {
 	}
 
 	serverTool := mcp.Tool{
-		Name:        tool.Function.Name,
-		Description: description,
-		InputSchema: inputSchema,
-		Annotations: toolAnnotation,
+		Name:           tool.Function.Name,
+		Description:    description,
+		RawInputSchema: inputSchema,
+		Annotations:    toolAnnotation,
 	}
 	if tool.MCP != nil {
 		serverTool.Title, serverTool.Icons, serverTool.RawOutputSchema = tool.MCP.Title, tool.MCP.Icons, tool.MCP.OutputSchema
@@ -1144,13 +1145,14 @@ func getVKFromRequest(ctx *fasthttp.RequestCtx) string {
 	return vk
 }
 
-func convertToolFunctionParametersToMCPInputSchema(params *schemas.ToolFunctionParameters) (mcp.ToolInputSchema, error) {
+func convertToolFunctionParametersToMCPInputSchema(params *schemas.ToolFunctionParameters) (json.RawMessage, error) {
 	if params == nil {
-		return mcp.ToolInputSchema{Type: "object", Properties: make(map[string]any)}, nil
+		return json.RawMessage(`{"type":"object","properties":{}}`), nil
 	}
-	// The MCP SDK models the common keywords and retains the rest in
-	// AdditionalFields. Its decoder also handles the legacy definitions alias.
-	return schemas.ConvertViaJSON[mcp.ToolInputSchema](params)
+	// The SDK's raw-schema contract publishes the same JSON as the model
+	// declaration, without decoding numbers through float64 a second time.
+	// Keep the legacy definitions vocabulary and local references intact.
+	return json.Marshal(params)
 }
 
 // Streamable HTTP transport over fasthttp

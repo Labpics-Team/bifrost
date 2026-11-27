@@ -1071,3 +1071,19 @@ func TestMCPInputSchemaCompleteContract(t *testing.T) {
 	_, err := convertMCPToolToBifrostSchema(&invalid, defaultLogger)
 	require.Error(t, err)
 }
+
+func TestMCPInputSchemaArrayRepairInSubschemas(t *testing.T) {
+	const input = `{"type":"object","additionalProperties":{"type":"array"},"oneOf":[{"anyOf":[{"properties":{"nested":{"type":"array"}}}]}],"properties":{"literal":{"const":{"type":"array"}}},"$defs":{"map":{"type":"object","additionalProperties":{"type":"array"}}}}`
+	const want = `{"type":"object","additionalProperties":{"type":"array","items":{}},"oneOf":[{"anyOf":[{"properties":{"nested":{"type":"array","items":{}}}}]}],"properties":{"literal":{"const":{"type":"array"}}},"$defs":{"map":{"type":"object","additionalProperties":{"type":"array","items":{}}}}}`
+	var discovered mcp.Tool
+	require.NoError(t, json.Unmarshal([]byte(`{"name":"retrieve","inputSchema":`+input+`}`), &discovered))
+	converted := mustConvertMCPTool(t, &discovered, defaultLogger)
+	wire, err := json.Marshal(converted.Function.Parameters)
+	require.NoError(t, err)
+	var expected, actual map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(want), &expected))
+	require.NoError(t, json.Unmarshal(wire, &actual))
+	for key, value := range expected {
+		assert.JSONEq(t, string(value), string(actual[key]), key)
+	}
+}
