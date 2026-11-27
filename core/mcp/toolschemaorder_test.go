@@ -79,7 +79,7 @@ func TestConvertMCPToolToBifrostSchema_PropertyOrderIsDeterministic(t *testing.T
 			var wantParams, wantNormalized, wantTool []byte
 			for i := 0; i < 200; i++ {
 				mcpTool := decodeSchemaOrderTool(t, "search", tc.inputSchema)
-				chatTool := convertMCPToolToBifrostSchema(&mcpTool, defaultLogger)
+				chatTool := mustConvertMCPTool(t, &mcpTool, defaultLogger)
 				require.NotNil(t, chatTool.Function)
 				params := chatTool.Function.Parameters
 				require.NotNil(t, params)
@@ -107,7 +107,7 @@ func TestConvertMCPToolToBifrostSchema_PropertyOrderIsDeterministic(t *testing.T
 // order: mcp-go does not keep the server's order, so keys are sorted.
 func TestConvertMCPToolToBifrostSchema_SortsPropertiesAndDefs(t *testing.T) {
 	mcpTool := decodeSchemaOrderTool(t, "search", schemaOrderInputSchema)
-	params := convertMCPToolToBifrostSchema(&mcpTool, defaultLogger).Function.Parameters
+	params := mustConvertMCPTool(t, &mcpTool, defaultLogger).Function.Parameters
 
 	propKeys := params.Properties.Keys()
 	assert.True(t, slices.IsSorted(propKeys), "properties keys not sorted: %v", propKeys)
@@ -132,7 +132,7 @@ func TestComputeToolsHash_StableAcrossRediscovery(t *testing.T) {
 	var want string
 	for i := 0; i < 200; i++ {
 		mcpTool := decodeSchemaOrderTool(t, "search", schemaOrderInputSchema)
-		tools := map[string]schemas.ChatTool{"search": convertMCPToolToBifrostSchema(&mcpTool, defaultLogger)}
+		tools := map[string]schemas.ChatTool{"search": mustConvertMCPTool(t, &mcpTool, defaultLogger)}
 		got := computeDiscoveryHash(&schemas.MCPDiscovery{Tools: tools})
 		if i == 0 {
 			want = got

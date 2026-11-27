@@ -5,6 +5,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -466,6 +467,11 @@ func (h *MCPServerHandler) serverTools(availableTools []schemas.ChatTool) ([]ser
 			continue
 		}
 
+		listed, err := gatewayTool(tool)
+		if err != nil {
+			logger.Warn("[mcp-server] skipping tool %q: %v", tool.Function.Name, err)
+			continue
+		}
 		// Capture tool name for closure
 		toolName := tool.Function.Name
 		declaresOutputSchema := tool.MCP != nil && len(tool.MCP.OutputSchema) > 0
@@ -483,7 +489,7 @@ func (h *MCPServerHandler) serverTools(availableTools []schemas.ChatTool) ([]ser
 		}
 		_, aggregateMeta := toolMeta(tool)
 		index = indexTool(index, tool, aggregateMeta)
-		tools = append(tools, server.ServerTool{Tool: gatewayTool(tool), Handler: handler})
+		tools = append(tools, server.ServerTool{Tool: listed, Handler: handler})
 	}
 	return tools, index
 }
@@ -529,14 +535,17 @@ func (h *MCPServerHandler) runTool(ctx context.Context, toolName string, declare
 }
 
 // gatewayTool is the MCP form of a Bifrost tool, as tools/list sends it.
-func gatewayTool(tool schemas.ChatTool) mcp.Tool {
+func gatewayTool(tool schemas.ChatTool) (mcp.Tool, error) {
 	// Convert description from *string to string
 	description := ""
 	if tool.Function.Description != nil {
 		description = *tool.Function.Description
 	}
 
-	inputSchema := convertToolFunctionParametersToMCPInputSchema(tool.Function.Parameters)
+	inputSchema, err := convertToolFunctionParametersToMCPInputSchema(tool.Function.Parameters)
+	if err != nil {
+		return mcp.Tool{}, err
+	}
 
 	// Map Bifrost annotations back to MCP tool annotations
 	var toolAnnotation mcp.ToolAnnotation
@@ -551,16 +560,16 @@ func gatewayTool(tool schemas.ChatTool) mcp.Tool {
 	}
 
 	serverTool := mcp.Tool{
-		Name:        tool.Function.Name,
-		Description: description,
-		InputSchema: inputSchema,
-		Annotations: toolAnnotation,
+		Name:           tool.Function.Name,
+		Description:    description,
+		RawInputSchema: inputSchema,
+		Annotations:    toolAnnotation,
 	}
 	if tool.MCP != nil {
 		serverTool.Title, serverTool.Icons, serverTool.RawOutputSchema = tool.MCP.Title, tool.MCP.Icons, tool.MCP.OutputSchema
 	}
 	serverTool.Meta, _ = toolMeta(tool)
-	return serverTool
+	return serverTool, nil
 }
 
 // gatewayToolResult is what /mcp answers for a tool message: the upstream's own result while no plugin
@@ -686,7 +695,12 @@ func (h *MCPServerHandler) narrowListedTools(ctx context.Context, _ any, _ *mcp.
 			switch {
 			case perCaller.holdsTool(tool.Name):
 				if ok {
-					kept = append(kept, callersGatewayTool(available[own], aggregate))
+					listed, err := callersGatewayTool(available[own], aggregate)
+					if err != nil {
+						logger.Warn("[mcp-server] skipping caller tool %q: %v", tool.Name, err)
+						continue
+					}
+					kept = append(kept, listed)
 				}
 			case ok || !narrowed:
 				kept = append(kept, tool)
@@ -1131,45 +1145,14 @@ func getVKFromRequest(ctx *fasthttp.RequestCtx) string {
 	return vk
 }
 
-func convertToolFunctionParametersToMCPInputSchema(params *schemas.ToolFunctionParameters) mcp.ToolInputSchema {
+func convertToolFunctionParametersToMCPInputSchema(params *schemas.ToolFunctionParameters) (json.RawMessage, error) {
 	if params == nil {
-		return mcp.ToolInputSchema{
-			Type:       "object",
-			Properties: make(map[string]any),
-		}
+		return json.RawMessage(`{"type":"object","properties":{}}`), nil
 	}
-
-	inputSchema := mcp.ToolInputSchema{
-		Type:     params.Type,
-		Required: params.Required,
-	}
-
-	if params.Properties != nil {
-		props := make(map[string]any, params.Properties.Len())
-		params.Properties.Range(func(key string, value interface{}) bool {
-			props[key] = value
-			return true
-		})
-		inputSchema.Properties = props
-	}
-
-	if params.Defs != nil {
-		defs := make(map[string]any, params.Defs.Len())
-		params.Defs.Range(func(key string, value interface{}) bool {
-			defs[key] = value
-			return true
-		})
-		inputSchema.Defs = defs
-	} else if params.Definitions != nil {
-		defs := make(map[string]any, params.Definitions.Len())
-		params.Definitions.Range(func(key string, value interface{}) bool {
-			defs[key] = value
-			return true
-		})
-		inputSchema.Defs = defs
-	}
-
-	return inputSchema
+	// The SDK's raw-schema contract publishes the same JSON as the model
+	// declaration, without decoding numbers through float64 a second time.
+	// Keep the legacy definitions vocabulary and local references intact.
+	return json.Marshal(params)
 }
 
 // Streamable HTTP transport over fasthttp

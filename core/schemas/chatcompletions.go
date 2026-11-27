@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -695,7 +696,23 @@ type ToolFunctionParameters struct {
 	keyOrder JSONKeyOrder `json:"-"`
 	// explicitEmptyObject tracks a client-supplied raw {} schema.
 	explicitEmptyObject bool `json:"-"`
+	// JSON Schema is an open vocabulary. Keep keywords not modeled by the
+	// provider-facing fields so discovery, storage and transport cannot silently
+	// weaken a tool contract.
+	additionalSchemaKeywords map[string]json.RawMessage
 }
+
+var toolFunctionParameterKeys = func() map[string]struct{} {
+	keys := make(map[string]struct{})
+	typ := reflect.TypeOf(ToolFunctionParameters{})
+	for i := 0; i < typ.NumField(); i++ {
+		name, _, _ := strings.Cut(typ.Field(i).Tag.Get("json"), ",")
+		if name != "" && name != "-" {
+			keys[name] = struct{}{}
+		}
+	}
+	return keys
+}()
 
 // MarshalJSON serializes ToolFunctionParameters while preserving the original
 // top-level key order when available. A client-supplied raw `{}` stays `{}`;
@@ -713,6 +730,15 @@ func (t ToolFunctionParameters) MarshalJSON() ([]byte, error) {
 	data, err := MarshalSorted(Alias(t))
 	if err != nil {
 		return nil, err
+	}
+	if len(t.additionalSchemaKeywords) != 0 {
+		extra, err := MarshalSorted(t.additionalSchemaKeywords)
+		if err != nil {
+			return nil, err
+		}
+		// Both values are JSON objects; their keys are disjoint by construction.
+		data = append(data[:len(data)-1], ',')
+		data = append(data, extra[1:]...)
 	}
 	return t.keyOrder.Apply(data)
 }
@@ -749,6 +775,21 @@ func (t *ToolFunctionParameters) UnmarshalJSON(data []byte) error {
 		t.explicitEmptyObject = false
 	}
 	t.keyOrder.Capture(data)
+	for _, key := range t.keyOrder.keys {
+		if _, modeled := toolFunctionParameterKeys[key]; modeled {
+			continue
+		}
+		// Ordinary schemas pay no second decoding cost.
+		var extras map[string]json.RawMessage
+		if err := Unmarshal(data, &extras); err != nil {
+			return err
+		}
+		for name := range toolFunctionParameterKeys {
+			delete(extras, name)
+		}
+		t.additionalSchemaKeywords = extras
+		break
+	}
 	return nil
 }
 
@@ -847,7 +888,7 @@ func (t *ToolFunctionParameters) hasDefinedSchemaFields() bool {
 	if t.Minimum != nil || t.Maximum != nil {
 		return true
 	}
-	return t.Title != nil || t.Default != nil || t.Nullable != nil
+	return t.Title != nil || t.Default != nil || t.Nullable != nil || len(t.additionalSchemaKeywords) != 0
 }
 
 type AdditionalPropertiesStruct struct {

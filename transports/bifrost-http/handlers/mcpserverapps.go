@@ -144,14 +144,17 @@ func applyAppTools(ctx context.Context, index *gatewayToolIndex, result *mcp.Lis
 
 // callersGatewayTool is a per-caller tool as tools/list sends it: on aggregate /mcp its _meta names
 // its ui:// resources namespaced by client, as applyAppTools does for shared tools.
-func callersGatewayTool(tool schemas.ChatTool, aggregate bool) mcp.Tool {
-	listed := gatewayTool(tool)
+func callersGatewayTool(tool schemas.ChatTool, aggregate bool) (mcp.Tool, error) {
+	listed, err := gatewayTool(tool)
+	if err != nil {
+		return mcp.Tool{}, err
+	}
 	if aggregate {
 		if _, namespaced := toolMeta(tool); namespaced != nil {
 			listed.Meta = namespaced
 		}
 	}
-	return listed
+	return listed, nil
 }
 
 // indexPerCallerNames records the server-given name of each per-caller placeholder tool, allocating

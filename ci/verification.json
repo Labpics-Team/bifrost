@@ -70,6 +70,8 @@
       "TestLoadOIDCOnlyConfig"
     ],
     "github.com/maximhq/bifrost/transports/v2/bifrost-http/handlers": [
+      "TestMCPGatewayInputSchemaCompleteContract",
+      "TestMCPGatewayInputSchemaExactNumbers",
       "TestNativeBetaHeaders",
       "TestTracingMiddleware_StreamingRootSpanEndsAfterLLMSpan",
       "TestTracingMiddleware_RootSpanCarriesStableHTTPSemconv",
@@ -289,6 +291,8 @@
       "TestAdaptiveKeylessProviderUsesObservedHealth"
     ],
     "github.com/maximhq/bifrost/core/mcp": [
+      "TestMCPInputSchemaCompleteContract",
+      "TestMCPInputSchemaArrayRepairInSubschemas",
       "TestStreamingMCPDeclarationOwnership",
       "TestCheckToolExecutionPermitted_RechecksUnattendedApproval"
     ]

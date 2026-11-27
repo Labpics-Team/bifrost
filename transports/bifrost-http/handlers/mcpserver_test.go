@@ -51,32 +51,29 @@ func TestConvertToolFunctionParametersToMCPInputSchemaPreservesDefs(t *testing.T
 		),
 	}
 
-	inputSchema := convertToolFunctionParametersToMCPInputSchema(params)
-
-	require.Contains(t, inputSchema.Defs, "Preferences")
-	data, err := json.Marshal(inputSchema)
+	inputSchema, err := convertToolFunctionParametersToMCPInputSchema(params)
 	require.NoError(t, err)
-	assert.Contains(t, string(data), `"$defs"`)
-	assert.Contains(t, string(data), `"$ref":"#/$defs/Preferences"`)
+
+	assert.Contains(t, string(inputSchema), `"$defs"`)
+	assert.Contains(t, string(inputSchema), `"$ref":"#/$defs/Preferences"`)
 }
 
-func TestConvertToolFunctionParametersToMCPInputSchemaPreservesLegacyDefinitionsAsDefs(t *testing.T) {
+func TestConvertToolFunctionParametersToMCPInputSchemaPreservesLegacyDefinitions(t *testing.T) {
 	params := &schemas.ToolFunctionParameters{
 		Type: "object",
 		Properties: schemas.NewOrderedMapFromPairs(
-			schemas.KV("preferences", map[string]any{"$ref": "#/$defs/Preferences"}),
+			schemas.KV("preferences", map[string]any{"$ref": "#/definitions/Preferences"}),
 		),
 		Definitions: schemas.NewOrderedMapFromPairs(
 			schemas.KV("Preferences", map[string]any{"type": "object"}),
 		),
 	}
 
-	inputSchema := convertToolFunctionParametersToMCPInputSchema(params)
-
-	require.Contains(t, inputSchema.Defs, "Preferences")
-	data, err := json.Marshal(inputSchema)
+	inputSchema, err := convertToolFunctionParametersToMCPInputSchema(params)
 	require.NoError(t, err)
-	assert.Contains(t, string(data), `"$defs"`)
+
+	assert.Contains(t, string(inputSchema), `"definitions"`)
+	assert.Contains(t, string(inputSchema), `"$ref":"#/definitions/Preferences"`)
 }
 
 // Forwarding upstream MCP `instructions` on the gateway's own initialize response.
@@ -2655,4 +2652,69 @@ func TestMCPGateway_ServerGivenNamesForPerCallerClients(t *testing.T) {
 	for name := range listedTools(t, h, as("alice", "")) {
 		assert.NotEqual(t, "", coremcp.ToolClientName(name), "tools/list carries no server-given name: %q", name)
 	}
+}
+
+func TestMCPGatewayInputSchemaCompleteContract(t *testing.T) {
+	const input = `{"type":"object","properties":{},"oneOf":[{"required":["url"],"properties":{"url":{"type":"string"}}},{"required":["query"],"properties":{"query":{"$ref":"#/$defs/Query"}}}],"$defs":{"Query":{"type":"string"}},"unevaluatedProperties":false,"$schema":"https://json-schema.org/draft/2020-12/schema"}`
+	var params schemas.ToolFunctionParameters
+	require.NoError(t, json.Unmarshal([]byte(input), &params))
+	tool, err := gatewayTool(schemas.ChatTool{
+		Type:     schemas.ChatToolTypeFunction,
+		Function: &schemas.ChatToolFunction{Name: "source-retrieve", Parameters: &params},
+	})
+	require.NoError(t, err)
+	wire, err := json.Marshal(tool)
+	require.NoError(t, err)
+	var result struct {
+		InputSchema map[string]json.RawMessage `json:"inputSchema"`
+	}
+	require.NoError(t, json.Unmarshal(wire, &result))
+	var want map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(input), &want))
+	for key, value := range want {
+		require.Contains(t, result.InputSchema, key)
+		assert.JSONEq(t, string(value), string(result.InputSchema[key]), key)
+	}
+}
+
+func TestMCPGatewayInputSchemaExactNumbers(t *testing.T) {
+	params := &schemas.ToolFunctionParameters{
+		Type: "object",
+		Properties: schemas.NewOrderedMapFromPairs(
+			schemas.KV("id", map[string]any{"type": "integer", "const": int64(9007199254740993)}),
+		),
+	}
+	tool, err := gatewayTool(schemas.ChatTool{
+		Type:     schemas.ChatToolTypeFunction,
+		Function: &schemas.ChatToolFunction{Name: "exact", Parameters: params},
+	})
+	require.NoError(t, err)
+	wire, err := json.Marshal(tool)
+	require.NoError(t, err)
+	var result struct {
+		InputSchema json.RawMessage `json:"inputSchema"`
+	}
+	require.NoError(t, json.Unmarshal(wire, &result))
+	model, err := json.Marshal(params)
+	require.NoError(t, err)
+	assert.Equal(t, string(model), string(result.InputSchema))
+	assert.Contains(t, string(result.InputSchema), "9007199254740993")
+}
+
+func BenchmarkMCPGatewayInputSchema(b *testing.B) {
+	var params schemas.ToolFunctionParameters
+	require.NoError(b, json.Unmarshal([]byte(`{"type":"object","properties":{"timeout":{"type":"integer"},"sources":{"type":"array","items":{"$ref":"#/$defs/Source"}}},"oneOf":[{"properties":{"url":{"type":"string"}},"required":["url"]},{"properties":{"query":{"type":"string"}},"required":["query"]}],"$defs":{"Source":{"type":"object","properties":{"url":{"type":"string"},"title":{"type":"string"}}}}}`), &params))
+	tool := schemas.ChatTool{Type: schemas.ChatToolTypeFunction, Function: &schemas.ChatToolFunction{Name: "retrieve", Parameters: &params}}
+	b.Run("raw", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			listed, err := gatewayTool(tool)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if _, err := json.Marshal(listed); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
